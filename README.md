@@ -1,5 +1,6 @@
 # Quince
 [![GoDoc](https://godoc.org/github.com/goburrow/quic?status.svg)](https://godoc.org/github.com/goburrow/quic)
+![](https://github.com/goburrow/quic/workflows/Go/badge.svg)
 
 QUIC transport protocol (https://github.com/quicwg/base-drafts/) implementation in Go, inspired by Cloudflare Quiche.
 The goal is to provide low level APIs for applications or protocols using QUIC as a transport. 
