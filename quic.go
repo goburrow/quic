@@ -13,7 +13,7 @@ import (
 
 const (
 	maxDatagramSize = transport.MaxIPv6PacketSize
-	bufferSize      = 2048
+	bufferSize      = 1536
 	maxTokenLen     = 64 + transport.MaxCIDLength
 )
 

@@ -199,6 +199,11 @@ func TestFrameStreamsBlocked(t *testing.T) {
 	testFrame(t, f, "165234")
 }
 
+func TestFrameHandshakeDone(t *testing.T) {
+	f := &handshakeDoneFrame{}
+	testFrame(t, f, "1e")
+}
+
 func TestFuzzFrame(t *testing.T) {
 	b := make([]byte, 1024)
 	out := make([]byte, len(b))
@@ -224,6 +229,7 @@ func TestFuzzFrame(t *testing.T) {
 		&streamDataBlockedFrame{},
 		&streamsBlockedFrame{},
 		&connectionCloseFrame{},
+		&handshakeDoneFrame{},
 	}
 	for i := 0; i < 10000; i++ {
 		_, err := rand.Read(b)

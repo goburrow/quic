@@ -10,7 +10,7 @@ const (
 	// MaxCIDLength is the maximum length of a Connection ID
 	MaxCIDLength = 20
 	// ProtocolVersion is the supported QUIC version
-	ProtocolVersion = 0xff000018
+	ProtocolVersion = 0xff000000 + 27
 
 	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#path-maximum-transmission-unit-pmtu
 
@@ -41,7 +41,7 @@ func NewConfig() *Config {
 	return &Config{
 		Version: ProtocolVersion,
 		Params: Parameters{
-			IdleTimeout:      60 * time.Second,
+			MaxIdleTimeout:   60 * time.Second,
 			AckDelayExponent: 3,
 			MaxAckDelay:      25 * time.Millisecond,
 		},

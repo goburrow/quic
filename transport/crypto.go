@@ -168,3 +168,45 @@ func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 	}
 	return nil
 }
+
+var retryIntegrityKey = []byte{
+	0x4d, 0x32, 0xec, 0xdb, 0x2a, 0x21, 0x33, 0xc8,
+	0x41, 0xe4, 0x04, 0x3d, 0xf2, 0x7d, 0x44, 0x30,
+}
+
+var retryIntegrityNonce = []byte{
+	0x4d, 0x16, 0x11, 0xd0, 0x55, 0x13, 0xa5, 0x52,
+	0xc5, 0x87, 0xd5, 0x75,
+}
+
+var retryIntegrityAEAD cipher.AEAD
+
+func newRetryIntegrityAEAD() (cipher.AEAD, error) {
+	if retryIntegrityAEAD == nil {
+		aes, err := aes.NewCipher(retryIntegrityKey)
+		if err != nil {
+			return nil, err
+		}
+		gcm, err := cipher.NewGCM(aes)
+		if err != nil {
+			return nil, err
+		}
+		retryIntegrityAEAD = gcm
+	}
+	return retryIntegrityAEAD, nil
+}
+
+// computeRetryIntegrity append retry integrity tag to given pseudo retry packet.
+// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry-packet-integrity
+func computeRetryIntegrity(pseudo []byte) ([]byte, error) {
+	aead, err := newRetryIntegrityAEAD()
+	if err != nil {
+		return nil, err
+	}
+	if cap(pseudo)-len(pseudo) < aead.Overhead() {
+		// Avoid allocating
+		return nil, errShortBuffer
+	}
+	b := aead.Seal(pseudo, retryIntegrityNonce, nil, pseudo)
+	return b, nil
+}

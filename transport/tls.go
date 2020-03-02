@@ -2,7 +2,6 @@ package transport
 
 import (
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -10,8 +9,8 @@ import (
 )
 
 const (
-	parameterOriginalCID uint16 = iota // 0
-	parameterIdleTimeout
+	parameterOriginalCID = iota // 0
+	parameterMaxIdleTimeout
 	parameterStatelessResetToken
 	parameterMaxPacketSize
 	parameterInitialMaxData
@@ -27,9 +26,9 @@ const (
 // Parameters is QUIC transport parameters.
 // See https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#transport-parameters
 type Parameters struct {
-	OriginalCID         []byte
-	IdleTimeout         time.Duration
-	StatelessResetToken []byte
+	OriginalCID         []byte // Server only
+	MaxIdleTimeout      time.Duration
+	StatelessResetToken []byte // Server only
 	MaxPacketSize       uint64
 
 	InitialMaxData                 uint64
@@ -45,8 +44,6 @@ type Parameters struct {
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#transport-parameter-encoding
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |      Sequence Length (16)     |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                  Transport Parameter 1 (*)                  ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                  Transport Parameter 2 (*)                  ...
@@ -56,71 +53,63 @@ type Parameters struct {
 // |                  Transport Parameter N (*)                  ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 func (s *Parameters) marshal() []byte {
-	b := make(tlsExtension, 2, 128)
+	b := make(tlsExtension, 0, 128)
 	if len(s.OriginalCID) > 0 {
-		b.addUint16(parameterOriginalCID)
-		b.addBytes(s.OriginalCID)
+		b.writeVarint(parameterOriginalCID)
+		b.writeBytes(s.OriginalCID)
 	}
-	if s.IdleTimeout > 0 {
-		b.addUint16(parameterIdleTimeout)
-		b.addVarint(uint64(s.IdleTimeout / time.Millisecond))
+	if s.MaxIdleTimeout > 0 {
+		b.writeVarint(parameterMaxIdleTimeout)
+		b.writeUint(uint64(s.MaxIdleTimeout / time.Millisecond))
 	}
 	if len(s.StatelessResetToken) > 0 {
-		b.addUint16(parameterStatelessResetToken)
-		b.addBytes(s.StatelessResetToken)
+		b.writeVarint(parameterStatelessResetToken)
+		b.writeBytes(s.StatelessResetToken)
 	}
 	if s.MaxPacketSize > 0 {
-		b.addUint16(parameterMaxPacketSize)
-		b.addVarint(s.MaxPacketSize)
+		b.writeVarint(parameterMaxPacketSize)
+		b.writeUint(s.MaxPacketSize)
 	}
 	if s.InitialMaxData > 0 {
-		b.addUint16(parameterInitialMaxData)
-		b.addVarint(s.InitialMaxData)
+		b.writeVarint(parameterInitialMaxData)
+		b.writeUint(s.InitialMaxData)
 	}
 	if s.InitialMaxStreamDataBidiLocal > 0 {
-		b.addUint16(parameterInitialMaxStreamDataBidiLocal)
-		b.addVarint(s.InitialMaxStreamDataBidiLocal)
+		b.writeVarint(parameterInitialMaxStreamDataBidiLocal)
+		b.writeUint(s.InitialMaxStreamDataBidiLocal)
 	}
 	if s.InitialMaxStreamDataBidiRemote > 0 {
-		b.addUint16(parameterInitialMaxStreamDataBidiRemote)
-		b.addVarint(s.InitialMaxStreamDataBidiRemote)
+		b.writeVarint(parameterInitialMaxStreamDataBidiRemote)
+		b.writeUint(s.InitialMaxStreamDataBidiRemote)
 	}
 	if s.InitialMaxStreamDataUni > 0 {
-		b.addUint16(parameterInitialMaxStreamDataUni)
-		b.addVarint(s.InitialMaxStreamDataUni)
+		b.writeVarint(parameterInitialMaxStreamDataUni)
+		b.writeUint(s.InitialMaxStreamDataUni)
 	}
 	if s.InitialMaxStreamsBidi > 0 {
-		b.addUint16(parameterInitialMaxStreamsBidi)
-		b.addVarint(s.InitialMaxStreamsBidi)
+		b.writeVarint(parameterInitialMaxStreamsBidi)
+		b.writeUint(s.InitialMaxStreamsBidi)
 	}
 	if s.InitialMaxStreamsUni > 0 {
-		b.addUint16(parameterInitialMaxStreamsUni)
-		b.addVarint(s.InitialMaxStreamsUni)
+		b.writeVarint(parameterInitialMaxStreamsUni)
+		b.writeUint(s.InitialMaxStreamsUni)
 	}
 	if s.AckDelayExponent > 0 {
-		b.addUint16(parameterAckDelayExponent)
-		b.addVarint(s.AckDelayExponent)
+		b.writeVarint(parameterAckDelayExponent)
+		b.writeUint(s.AckDelayExponent)
 	}
 	if s.MaxAckDelay > 0 {
-		b.addUint16(parameterMaxAckDelay)
-		b.addVarint(uint64(s.MaxAckDelay / time.Millisecond))
+		b.writeVarint(parameterMaxAckDelay)
+		b.writeUint(uint64(s.MaxAckDelay / time.Millisecond))
 	}
-	binary.BigEndian.PutUint16(b, uint16(len(b)-2))
 	return b
 }
 
 func (s *Parameters) unmarshal(data []byte) bool {
 	b := tlsExtension(data)
-	var param uint16
-	// Check length
-	if !b.readUint16(&param) {
-		return false
-	}
-	if len(b) != int(param) {
-		return false
-	}
+	var param uint64
 	for !b.empty() {
-		if !b.readUint16(&param) {
+		if !b.readVarint(&param) {
 			return false
 		}
 		switch param {
@@ -128,58 +117,58 @@ func (s *Parameters) unmarshal(data []byte) bool {
 			if !b.readBytes(&s.OriginalCID) {
 				return false
 			}
-		case parameterIdleTimeout:
+		case parameterMaxIdleTimeout:
 			var v uint64
-			if !b.readVarint(&v) {
+			if !b.readUint(&v) {
 				return false
 			}
-			s.IdleTimeout = time.Duration(v) * time.Millisecond
+			s.MaxIdleTimeout = time.Duration(v) * time.Millisecond
 		case parameterStatelessResetToken:
 			if !b.readBytes(&s.StatelessResetToken) {
 				return false
 			}
 		case parameterMaxPacketSize:
-			if !b.readVarint(&s.MaxPacketSize) {
+			if !b.readUint(&s.MaxPacketSize) {
 				return false
 			}
 		case parameterInitialMaxData:
-			if !b.readVarint(&s.InitialMaxData) {
+			if !b.readUint(&s.InitialMaxData) {
 				return false
 			}
 		case parameterInitialMaxStreamDataBidiLocal:
-			if !b.readVarint(&s.InitialMaxStreamDataBidiLocal) {
+			if !b.readUint(&s.InitialMaxStreamDataBidiLocal) {
 				return false
 			}
 		case parameterInitialMaxStreamDataBidiRemote:
-			if !b.readVarint(&s.InitialMaxStreamDataBidiRemote) {
+			if !b.readUint(&s.InitialMaxStreamDataBidiRemote) {
 				return false
 			}
 		case parameterInitialMaxStreamDataUni:
-			if !b.readVarint(&s.InitialMaxStreamDataUni) {
+			if !b.readUint(&s.InitialMaxStreamDataUni) {
 				return false
 			}
 		case parameterInitialMaxStreamsBidi:
-			if !b.readVarint(&s.InitialMaxStreamsBidi) {
+			if !b.readUint(&s.InitialMaxStreamsBidi) {
 				return false
 			}
 		case parameterInitialMaxStreamsUni:
-			if !b.readVarint(&s.InitialMaxStreamsUni) {
+			if !b.readUint(&s.InitialMaxStreamsUni) {
 				return false
 			}
 		case parameterAckDelayExponent:
-			if !b.readVarint(&s.AckDelayExponent) {
+			if !b.readUint(&s.AckDelayExponent) {
 				return false
 			}
 		case parameterMaxAckDelay:
 			var v uint64
-			if !b.readVarint(&v) {
+			if !b.readUint(&v) {
 				return false
 			}
 			s.MaxAckDelay = time.Duration(v) * time.Millisecond
 		default:
 			// Unsupported parameter
-			var v uint16
-			if !b.readUint16(&v) || !b.skip(int(v)) {
+			var v uint64
+			if !b.readVarint(&v) || !b.skip(int(v)) {
 				return false
 			}
 		}
@@ -187,61 +176,81 @@ func (s *Parameters) unmarshal(data []byte) bool {
 	return true
 }
 
+// Each transport parameter is encoded as an (identifier, length, value) tuple.
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                 Transport Parameter ID (i)                  ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |               Transport Parameter Length (i)                ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                Transport Parameter Value (*)                ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 type tlsExtension []byte
 
-func (s *tlsExtension) addUint16(v uint16) {
-	*s = append(*s, uint8(v>>8), uint8(v))
-}
-
-func (s *tlsExtension) readUint16(v *uint16) bool {
-	b := *s
-	if len(b) < 2 {
-		return false
-	}
-	*v = binary.BigEndian.Uint16(b)
-	*s = b[2:]
-	return true
-}
-
+// readVarint reads next variable-length integer.
 func (s *tlsExtension) readVarint(v *uint64) bool {
-	var n uint16
-	if !s.readUint16(&n) {
-		return false
-	}
 	b := *s
-	if len(b) < int(n) {
+	if len(b) == 0 {
 		return false
 	}
-	if getVarint(b, v) != int(n) {
+	n := getVarint(b, v)
+	if n <= 0 {
 		return false
 	}
 	*s = b[n:]
 	return true
 }
 
+// readUint64 reads varint with length prefix.
+func (s *tlsExtension) readUint(v *uint64) bool {
+	var n uint64
+	if !s.readVarint(&n) {
+		return false
+	}
+	if n > 0 {
+		b := *s
+		m := getVarint(b, v)
+		if m <= 0 || uint64(m) != n {
+			return false
+		}
+		*s = b[n:]
+	}
+	return true
+}
+
+// readUint64 reads bytes with length prefix.
 func (s *tlsExtension) readBytes(v *[]byte) bool {
-	var n uint16
-	if !s.readUint16(&n) {
+	var n uint64
+	if !s.readVarint(&n) {
 		return false
 	}
-	b := *s
-	if len(b) < int(n) {
-		return false
+	if n > 0 {
+		b := *s
+		if len(b) < int(n) {
+			return false
+		}
+		*v = b[:n]
+		*s = b[n:]
 	}
-	*v = b[:n]
-	*s = b[n:]
 	return true
 }
 
-func (s *tlsExtension) addBytes(v []byte) {
-	s.addUint16(uint16(len(v)))
-	*s = append(*s, v...)
+// writeVarint appends integer.
+func (s *tlsExtension) writeVarint(v uint64) {
+	n := varintLen(v)
+	*s = appendVarint(*s, v, n)
 }
 
-func (s *tlsExtension) addVarint(v uint64) {
+// writeVarint appends integer with length prefix.
+func (s *tlsExtension) writeUint(v uint64) {
 	n := varintLen(v)
-	s.addUint16(uint16(n))
+	s.writeVarint(uint64(n))
 	*s = appendVarint(*s, v, n)
+}
+
+// writeBytes appends bytes with length prefix.
+func (s *tlsExtension) writeBytes(v []byte) {
+	s.writeVarint(uint64(len(v)))
+	*s = append(*s, v...)
 }
 
 func (s *tlsExtension) skip(n int) bool {

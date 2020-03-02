@@ -11,8 +11,9 @@ import (
 
 func TestTransportParams(t *testing.T) {
 	tp := Parameters{
-		IdleTimeout:         30 * time.Millisecond,
-		StatelessResetToken: []byte{0x44, 0x9a, 0xee, 0xf4, 0x72, 0x62, 0x6f, 0x18, 0xa5, 0xbb, 0xa2, 0xd5, 0x1a, 0xe4, 0x73, 0xbe},
+		OriginalCID:         []byte{0x01, 0x02, 0x03, 0x04, 0x05},
+		MaxIdleTimeout:      30 * time.Millisecond,
+		StatelessResetToken: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a},
 		MaxPacketSize:       1200,
 
 		InitialMaxData:                 1440000,
@@ -22,18 +23,18 @@ func TestTransportParams(t *testing.T) {
 		InitialMaxStreamsBidi:          8,
 		InitialMaxStreamsUni:           8,
 	}
-	b := testdata.DecodeHex(`0049000100011e00020010449aeef472626f18a5bba2d51ae473be0003000244
-		b0000400048015f9000005000480015f900006000480015f9000070004800400
-		0000080001080009000108`)
+	b := testdata.DecodeHex(`
+0005010203040501011e020a0102030405060708090a030244b004048015f900
+050480015f90060480015f90070480040000080108090108`)
 	encoded := tp.marshal()
 	if !bytes.Equal(b, encoded) {
-		t.Fatalf("encode: actual=%x\nwant=%x", encoded, b)
+		t.Fatalf("marshal transport parameters\nexpect=%x\nactual=%x", b, encoded)
 	}
 	tp2 := Parameters{}
 	if !tp2.unmarshal(b) {
 		t.Fatal("could not unmarshal")
 	}
 	if !reflect.DeepEqual(&tp, &tp2) {
-		t.Fatalf("unmarshal:\nactual=%#v\n  want=%#v", &tp, &tp2)
+		t.Fatalf("unmarshal transport parameters:\nexpect=%#v\nactual=%#v", &tp, &tp2)
 	}
 }

@@ -3,15 +3,16 @@ package transport
 import "fmt"
 
 const (
-	frameTypePadding            = 0x00
-	frameTypePing               = 0x01
-	frameTypeAck                = 0x02
-	frameTypeResetStream        = 0x04
-	frameTypeStopSending        = 0x05
-	frameTypeCrypto             = 0x06
-	frameTypeNewToken           = 0x07
-	frameTypeStream             = 0x08
-	frameTypeStreamEnd          = 0x0f
+	frameTypePadding     = 0x00
+	frameTypePing        = 0x01
+	frameTypeAck         = 0x02
+	frameTypeResetStream = 0x04
+	frameTypeStopSending = 0x05
+	frameTypeCrypto      = 0x06
+	frameTypeNewToken    = 0x07
+	frameTypeStream      = 0x08
+	frameTypeStreamEnd   = 0x0f
+
 	frameTypeMaxData            = 0x10
 	frameTypeMaxStreamData      = 0x11
 	frameTypeMaxStreamsBidi     = 0x12
@@ -23,6 +24,7 @@ const (
 
 	frameTypeConnectionClose  = 0x1c
 	frameTypeApplicationClose = 0x1d
+	frameTypeHanshakeDone     = 0x1e
 )
 
 const (
@@ -810,6 +812,30 @@ func (s *newTokenFrame) decode(b []byte) (int, error) {
 
 func (s *newTokenFrame) String() string {
 	return fmt.Sprintf("newToken{token=%x}", s.token)
+}
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-handshake_done-frame
+type handshakeDoneFrame struct {
+}
+
+func (s *handshakeDoneFrame) encodedLen() int {
+	return 1
+}
+
+func (s *handshakeDoneFrame) encode(b []byte) (int, error) {
+	if len(b) < 1 {
+		return 0, errShortBuffer
+	}
+	b[0] = frameTypeHanshakeDone
+	return 1, nil
+}
+
+func (s *handshakeDoneFrame) decode(b []byte) (int, error) {
+	return 1, nil
+}
+
+func (s *handshakeDoneFrame) String() string {
+	return "handshakeDone{}"
 }
 
 func encodeFrames(b []byte, frames []frame) (int, error) {

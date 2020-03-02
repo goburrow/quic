@@ -39,7 +39,7 @@ func main() {
 func newConfig() *transport.Config {
 	c := transport.NewConfig()
 	c.Params.MaxPacketSize = transport.MaxIPv6PacketSize
-	c.Params.IdleTimeout = 5 * time.Second
+	c.Params.MaxIdleTimeout = 5 * time.Second
 	c.Params.InitialMaxData = 100000
 	c.Params.InitialMaxStreamDataBidiLocal = 100000
 	c.Params.InitialMaxStreamDataBidiRemote = 100000

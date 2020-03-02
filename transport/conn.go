@@ -43,6 +43,7 @@ type Conn struct {
 	didRetry              bool
 	didVersionNegotiation bool
 	ackElicitingSent      bool // Whether an ACK-eliciting packet has been sent since last receiving a packet.
+	handshakeConfirmed    bool // On server, it's handshakeDone frame sent. On client, it's the frame received
 	derivedInitialSecrets bool
 
 	closeFrame *connectionCloseFrame // Error to be send to peer
@@ -205,15 +206,19 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
-	bodyLen, err := p.decodeBody(b[p.headerLen:])
+	_, err := p.decodeBody(b[p.headerLen:])
+	if err != nil {
+		return 0, err
+	}
+	// Verify token and integrity tag
+	if len(p.token) == 0 {
+		return 0, errInvalidPacket
+	}
+	err = verifyRetryIntegrity(b, s.dcid)
 	if err != nil {
 		return 0, err
 	}
 	debug("received packet %v", p)
-	// Original DCID must be equal to client's DCID.
-	if !bytes.Equal(p.originalDestinationCID, s.dcid) || len(p.token) == 0 {
-		return len(b), nil
-	}
 	s.token = append(s.token[:0], p.token...)
 	s.didRetry = true
 	// Update CIDs and crypto: dcid => odcid, header.scid => dcid
@@ -228,11 +233,11 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 	s.packetNumberSpaces[packetSpaceInitial].reset()
 	s.handshake.reset()
 	s.handshake.setTransportParams(&s.localParams)
-	return p.headerLen + bodyLen, nil
+	return len(b), nil // p.headerLen + bodyLen + retryIntegrityTagLen
 }
 
 func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error) {
-	if !bytes.Equal(p.header.DCID, s.scid) || (s.gotPeerCID && !bytes.Equal(p.header.SCID, s.dcid)) {
+	if s.gotPeerCID && (!bytes.Equal(p.header.DCID, s.scid) || !bytes.Equal(p.header.SCID, s.dcid)) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
@@ -299,8 +304,8 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 	// Mark this packet received
 	pnSpace.onPacketReceived(p.packetNumber, now)
 
-	if s.localParams.IdleTimeout > 0 {
-		s.idleTimer = now.Add(s.localParams.IdleTimeout)
+	if s.localParams.MaxIdleTimeout > 0 {
+		s.idleTimer = now.Add(s.localParams.MaxIdleTimeout)
 	}
 	// An Handshake packet has been received from the client and has been successfully processed,
 	// so we can drop the initial state and consider the client's address to be verified.
@@ -326,6 +331,7 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 			return errInvalidFrame
 		}
 		var err error
+		// TODO: Check allowed frames for current packet type
 		switch {
 		case typ == frameTypePadding:
 			var f paddingFrame
@@ -358,6 +364,8 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 			n, err = s.recvFrameStreamsBlocked(b)
 		case typ == frameTypeConnectionClose || typ == frameTypeApplicationClose:
 			n, err = s.recvFrameConnClose(b, space, now)
+		case typ == frameTypeHanshakeDone:
+			n, err = s.recvFrameHandshakeDone(b)
 		default:
 			return newError(FrameEncodingError, "unsupported frame 0x%x", typ)
 		}
@@ -391,10 +399,14 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 	s.recovery.onAckReceived(ranges, ackDelay, space, now)
 	if !s.packetNumberSpaces[space].firstPacketAcked {
 		s.packetNumberSpaces[space].firstPacketAcked = true
+		// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-handshake-confirmed
 		// When we receive an ACK for a 1-RTT packet after handshake completion,
 		// it means the handshake has been confirmed.
 		if space == packetSpaceApplication && s.state == stateEstablished {
 			s.dropPacketSpace(packetSpaceHandshake)
+			if s.isClient && !s.handshakeConfirmed {
+				s.handshakeConfirmed = true
+			}
 		}
 	}
 	return n, nil
@@ -561,6 +573,24 @@ func (s *Conn) recvFrameConnClose(b []byte, space packetSpace, now time.Time) (i
 	debug("receiving frame 0x%x: %s", b[0], &f)
 	s.state = stateClosing
 	s.setDraining(now)
+	return n, nil
+}
+
+func (s *Conn) recvFrameHandshakeDone(b []byte) (int, error) {
+	var f handshakeDoneFrame
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	if !s.isClient {
+		return 0, errInvalidPacket
+	}
+	debug("received frame 0x%x: %v", b[0], &f)
+	if s.state == stateEstablished && !s.handshakeConfirmed {
+		// Drop client's handshake state when it received done from server
+		s.dropPacketSpace(packetSpaceHandshake)
+		s.handshakeConfirmed = true
+	}
 	return n, nil
 }
 
@@ -774,6 +804,8 @@ func (s *Conn) processLostPackets(space packetSpace) {
 			s.packetNumberSpaces[space].cryptoStream.send.push(f.data, f.offset, false)
 		case *streamFrame:
 			s.lostFrameStream(f)
+		case *handshakeDoneFrame:
+			s.handshakeConfirmed = false
 		}
 	})
 }
@@ -810,6 +842,15 @@ func (s *Conn) sendFrames(op *outgoingPacket, space packetSpace, left int, now t
 			left -= n
 		}
 		if space == packetSpaceApplication {
+			if f := s.sendFrameHandshakeDone(); f != nil {
+				n := f.encodedLen()
+				if left >= n {
+					op.addFrame(f)
+					payloadLen += n
+					left -= n
+					s.handshakeConfirmed = true
+				}
+			}
 			// MaxData
 			if f := s.sendFrameMaxData(); f != nil {
 				n := f.encodedLen()
@@ -847,8 +888,8 @@ func (s *Conn) onPacketSent(op *outgoingPacket, space packetSpace) {
 	// (Re)start the idle timer if we are sending the first ACK-eliciting
 	// packet since last receiving a packet.
 	if op.ackEliciting {
-		if !s.ackElicitingSent && s.localParams.IdleTimeout > 0 {
-			s.idleTimer = op.timeSent.Add(s.localParams.IdleTimeout)
+		if !s.ackElicitingSent && s.localParams.MaxIdleTimeout > 0 {
+			s.idleTimer = op.timeSent.Add(s.localParams.MaxIdleTimeout)
 		}
 		s.ackElicitingSent = true
 	}
@@ -991,6 +1032,13 @@ func (s *Conn) sendFrameMaxData() *maxDataFrame {
 		}
 	}
 	return nil
+}
+
+func (s *Conn) sendFrameHandshakeDone() *handshakeDoneFrame {
+	if s.isClient || s.state != stateEstablished || s.handshakeConfirmed {
+		return nil
+	}
+	return &handshakeDoneFrame{}
 }
 
 func (s *Conn) lostFrameStream(f *streamFrame) {

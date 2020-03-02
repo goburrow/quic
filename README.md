@@ -8,9 +8,13 @@ The goal is to provide low level APIs for applications or protocols using QUIC a
 TLS 1.3 support is based on standard Go TLS package (https://github.com/golang/go/tree/master/src/crypto/tls),
 licensed under the 3-clause BSD license.
 
-## Debugging
+## Testing
 
+Build command:
 ```
+cd cmd/quince
+go build
+
 # To enable tracing
 go build -tags debug
 
@@ -18,15 +22,25 @@ go build -tags debug
 go build -tags debug -gcflags '-m' > debug.txt 2>&1
 ```
 
-## Testing
+```
+# Client
+./quince client quic.tech:4433
+
+# Server
+./quince server
+```
+
+Add `SSLKEYLOGFILE=key.log` to have TLS keys logged to file.
+
+Testing with Quiche:
 
 ```
-# Test server with Quiche client
-SSLKEYLOGFILE=quince_key.log ./quince server
-SSLKEYLOGFILE=keys.log RUST_LOG=trace ./target/release/examples/client --wire-version ff000018 --no-verify https://127.0.0.1:4433
-
-# Test client
-./quince client quic.tech:4433
+cd /path/to/quiche/tools/apps
+cargo build --release
+# Client
+RUST_LOG=trace ./target/release/quiche-client --no-verify https://127.0.0.1:4433
+# Server
+RUST_LOG=trace ./target/release/quiche-server
 ```
 
 ## Fuzzing

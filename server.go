@@ -64,7 +64,7 @@ func (s *Server) recv(p *packet, h *transport.Header) {
 		// TODO: Check first packet must be Initial
 		if h.Version != transport.ProtocolVersion {
 			// Negotiate version
-			s.logger.Log(LevelDebug, "%s negotiate version: %s", p.addr, h)
+			s.logger.Log(LevelDebug, "%s negotiate version %d: %s", p.addr, transport.ProtocolVersion, h)
 			s.negotiate(p.addr, h.SCID, h.DCID)
 			freePacket(p)
 			return

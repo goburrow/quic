@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"time"
@@ -212,9 +213,8 @@ type packet struct {
 	header    Header
 	headerLen int // decoded header length (set by decodeHeader)
 
-	supportedVersions      []uint32 // Only in Version negotiation
-	token                  []byte   // Only in Initial and Retry
-	originalDestinationCID []byte   // Only in Retry
+	supportedVersions []uint32 // Only in Version negotiation
+	token             []byte   // Only in Initial and Retry
 
 	packetNumber uint64
 	payloadLen   int
@@ -325,12 +325,9 @@ func (s *packet) packetNumberOffset(b []byte, headerLen int) (int, error) {
 
 func (s *packet) String() string {
 	switch s.typ {
-	case packetTypeInitial:
+	case packetTypeInitial, packetTypeRetry:
 		return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x token=%x number=%d",
 			s.typ, s.header.Version, s.header.DCID, s.header.SCID, s.token, s.packetNumber)
-	case packetTypeRetry:
-		return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x odcid=%x token=%x number=%d",
-			s.typ, s.header.Version, s.header.DCID, s.header.SCID, s.originalDestinationCID, s.token, s.packetNumber)
 	case packetTypeShort:
 		return fmt.Sprintf("type=%s dcid=%x number=%d",
 			s.typ, s.header.DCID, s.packetNumber)
@@ -554,6 +551,8 @@ func packetLongDecode(s *packet, b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
+const retryIntegrityTagLen = 16
+
 // +-+-+-+-+-+-+-+-+
 // |1|1| 3 | Unused|
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -567,46 +566,54 @@ func packetLongDecode(s *packet, b []byte) (int, error) {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                 Source Connection ID (0..160)               ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// | ODCID Len (8) |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |          Original Destination Connection ID (0..160)        ...
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                        Retry Token (*)                      ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                                                               |
+// +                                                               +
+// |                                                               |
+// +                   Retry Integrity Tag (128)                   +
+// |                                                               |
+// +                                                               +
+// |                                                               |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 func packetRetryEncodedLen(s *packet) int {
 	return s.header.encodedLenLong() +
-		1 + len(s.originalDestinationCID) +
-		len(s.token)
+		len(s.token) + retryIntegrityTagLen
 }
 
+// packetRetryEncode does not add Integrity tag.
 func packetRetryEncode(s *packet, b []byte) (int, error) {
-	if len(s.originalDestinationCID) > MaxCIDLength {
-		return 0, errors.New("Original destination CID too long")
-	}
 	enc := newCodec(b)
-	if !enc.writeByte(byte(len(s.originalDestinationCID))) ||
-		!enc.write(s.originalDestinationCID) ||
-		!enc.write(s.token) {
+	if !enc.write(s.token) {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
 }
 
+// packetRetryDecode does not decode Integrity tag.
 func packetRetryDecode(s *packet, b []byte) (int, error) {
 	dec := newCodec(b)
-	var length uint8
-	if !dec.readByte(&length) || length > MaxCIDLength {
+	tokenLen := dec.len() - retryIntegrityTagLen
+	if tokenLen < 0 {
 		return 0, errInvalidPacket
 	}
-	if s.originalDestinationCID = dec.read(int(length)); s.originalDestinationCID == nil {
-		return 0, errInvalidPacket
-	}
-	s.token = b[dec.offset():]
-	return len(b), nil
+	s.token = dec.read(tokenLen)
+	return dec.offset(), nil
 }
 
 // Retry writes retry packet to b.
 func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
+	if len(odcid) > MaxCIDLength {
+		return 0, errInvalidPacket
+	}
+	// Use the provided buffer to write Retry Pseudo-Packet, which is computed by taking the transmitted Retry packet,
+	// removing the Retry Integrity Tag and prepending the ODCID.
+	// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry-packet-integrity
+	enc := newCodec(b)
+	if !enc.writeByte(byte(len(odcid))) || !enc.write(odcid) {
+		return 0, errShortBuffer
+	}
+	offset := enc.offset()
 	p := &packet{
 		typ: packetTypeRetry,
 		header: Header{
@@ -614,10 +621,46 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 			DCID:    dcid,
 			SCID:    scid,
 		},
-		originalDestinationCID: odcid,
-		token:                  token,
+		token: token,
 	}
-	return p.encode(b)
+	n, err := p.encode(b[offset:])
+	if err != nil {
+		return 0, err
+	}
+	out, err := computeRetryIntegrity(b[:offset+n])
+	if err != nil {
+		return 0, err
+	}
+	if len(out) != offset+n+retryIntegrityTagLen {
+		return 0, fmt.Errorf("invalid integrity tag length generated: %d", len(out)-offset-n)
+	}
+	n = copy(b, out[:offset])
+	return n, nil
+}
+
+// verifyRetryIntegrity verifies integrity tag in retry packet b given the original destination CID odcid.
+func verifyRetryIntegrity(b, odcid []byte) error {
+	if len(b) < retryIntegrityTagLen {
+		return errInvalidPacket
+	}
+	pseudo := make([]byte, len(b)+len(odcid)+1)
+	pseudo[0] = byte(len(odcid))
+	copy(pseudo[1:], odcid)
+	copy(pseudo[1+len(odcid):], b[:len(b)-retryIntegrityTagLen])
+
+	out, err := computeRetryIntegrity(pseudo[:len(pseudo)-retryIntegrityTagLen])
+	if err != nil {
+		return err
+	}
+	if len(out) < retryIntegrityTagLen {
+		return errInvalidPacket
+	}
+	inTag := b[len(b)-retryIntegrityTagLen:]
+	outTag := out[len(out)-retryIntegrityTagLen:]
+	if !bytes.Equal(inTag, outTag) {
+		return errInvalidPacket
+	}
+	return nil
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#short-header

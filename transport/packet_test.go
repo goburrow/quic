@@ -1,18 +1,30 @@
 package transport
 
 import (
+	"bytes"
 	"math/rand"
 	"testing"
 
 	"github.com/goburrow/quic/testdata"
 )
 
-func TestPacketRetry(t *testing.T) {
-	const retry = `f0ff00001714cf523cb1dbb6986ec9341d241c83429cc7f9355d14e108632729
-	75569d367d4851697f7b4720a53c3d14230381a86c50f85978b8e5fa736baaa8
-	0cd6e0cc7175696368657f000001230381a86c50f85978b8e5fa736baaa80cd6
-	e0cc`
-	b := testdata.DecodeHex(retry)
+// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry
+func TestPacketRetryDecode(t *testing.T) {
+	b := testdata.DecodeHex(`
+ffff00001b0008f067a5502a4262b574 6f6b656ea523cb5ba524695f6569f293
+a1359d8e`)
+	dcid := testdata.DecodeHex(`8394c8f03e515708`)
+	testPacketRetryDecode(t, b, dcid)
+
+	b = testdata.DecodeHex(`
+f0ff0000191480d0ee4a5b5c1304ef66b296a396b80588c88bce1462d7046715
+45f5640bbfdbaf4b53aec8ec968e667175696368657f0000015754d2fb3c3815
+fc19245b182a20db2f1dc243825f3db6b00a0c5557f288344fe7a27505`)
+	dcid = testdata.DecodeHex(`5754d2fb3c3815fc19245b182a20db2f1dc24382`)
+	testPacketRetryDecode(t, b, dcid)
+}
+
+func testPacketRetryDecode(t *testing.T, b, dcid []byte) {
 	p := packet{}
 	hLen, err := p.decodeHeader(b)
 	if err != nil {
@@ -21,18 +33,36 @@ func TestPacketRetry(t *testing.T) {
 	if p.typ != packetTypeRetry {
 		t.Fatalf("expect type retry, actual %d", p.typ)
 	}
-	if p.header.Version != 0xff000017 {
-		t.Fatalf("expect version %x, actual %x", 0xff000017, p.header.Version)
-	}
 	bLen, err := p.decodeBody(b[hLen:])
 	if err != nil {
 		t.Fatal(err)
 	}
 	n := hLen + bLen
-	if n != len(b) {
-		t.Fatalf("expect decoded length %d, actual %d", len(b), n)
+	if n != len(b)-retryIntegrityTagLen {
+		t.Fatalf("expect decoded length %d, actual %d", len(b)-retryIntegrityTagLen, n)
 	}
-	t.Logf("%s", &p.header)
+	t.Logf("%s", &p)
+	err = verifyRetryIntegrity(b, dcid)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPacketRetryEncode(t *testing.T) {
+	b := make([]byte, 128)
+	dcid := testdata.DecodeHex(`f067a5502a4262b5`)
+	odcid := testdata.DecodeHex(`8394c8f03e515708`)
+	token := testdata.DecodeHex(`746f6b656e`)
+	n, err := Retry(b, dcid, nil, odcid, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := testdata.DecodeHex(`
+ffff00001b0008f067a5502a4262b574 6f6b656ea523cb5ba524695f6569f293
+a1359d8e`)
+	if bytes.Equal(expected, b[:n]) {
+		t.Fatalf("expect: %x\nactual: %x", expected, b[:n])
+	}
 }
 
 func TestDecodePacketNumber(t *testing.T) {
