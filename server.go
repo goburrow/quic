@@ -10,24 +10,44 @@ import (
 // Server is a server-side QUIC connection.
 type Server struct {
 	localConn
+
+	addrValid AddressValidator
 }
 
 // NewServer creates a new QUIC server.
-func NewServer(config *transport.Config, handler Handler) *Server {
+func NewServer(config *transport.Config) *Server {
 	return &Server{
 		localConn: localConn{
 			config:  config,
 			logger:  leveledLogger(LevelInfo),
 			peers:   make(map[string]*remoteConn),
-			handler: handler,
+			handler: noopHandler{},
 		},
 	}
 }
 
+// SetHandler sets QUIC connection callbacks.
+func (s *Server) SetHandler(v Handler) {
+	s.handler = v
+}
+
+// SetAddressValidator sets validation for QUIC connections address.
+func (s *Server) SetAddressValidator(v AddressValidator) {
+	s.addrValid = v
+}
+
+// SetLogger sets transaction logger.
+func (s *Server) SetLogger(v Logger) {
+	s.logger = v
+}
+
+// Listen starts listening on UDP network address addr.
 func (s *Server) Listen(addr string) error {
 	return s.listen(addr)
 }
 
+// Serve handles incoming requests from a socket connection.
+// Listen must be successfully called prior to Serve when given socket is nil.
 func (s *Server) Serve(socket net.PacketConn) error {
 	if socket != nil {
 		s.socket = socket
@@ -38,46 +58,61 @@ func (s *Server) Serve(socket net.PacketConn) error {
 	for {
 		p := newPacket()
 		n, addr, err := s.socket.ReadFrom(p.buf[:])
+		if n > 0 {
+			// Process returned data first before considering error
+			p.data = p.buf[:n]
+			p.addr = addr
+			s.logger.Log(LevelDebug, "%s got %d bytes\n%x", addr, n, p.data)
+			s.recv(p)
+		}
 		if err != nil {
+			// Stop on socket error.
+			// FIXME: Check if the error is timeout when read deadline is set
 			return err
 		}
-		p.data = p.buf[:n]
-		p.addr = addr
-		s.logger.Log(LevelDebug, "%s got %d bytes\n%x", addr, n, p.data)
-		h, err := transport.DecodeHeader(p.data, transport.MaxCIDLength)
-		if err != nil {
-			// Ignore invalid packet
-			s.logger.Log(LevelDebug, "%s parse header: %v", addr, err)
-			freePacket(p)
-			continue
-		}
-		s.logger.Log(LevelDebug, "%s receiving packet %s", addr, h)
-		s.recv(p, h)
 	}
 }
 
-func (s *Server) recv(p *packet, h *transport.Header) {
+func (s *Server) recv(p *packet) {
+	h := &transport.Header{}
+	_, err := h.Decode(p.data, transport.MaxCIDLength)
+	if err != nil {
+		s.logger.Log(LevelDebug, "%s could not decode packet: %v", p.addr, err)
+		freePacket(p)
+		return
+	}
+	s.logger.Log(LevelDebug, "%s got %s", p.addr, h)
 	s.peersMu.RLock()
 	c, ok := s.peers[string(h.DCID)]
 	s.peersMu.RUnlock()
 	if !ok {
-		// TODO: Check first packet must be Initial
+		// Server must ensure the any datagram packet containing Initial packet being at least 1200 bytes
+		if h.Type != 0 || len(p.data) < transport.MinInitialPacketSize {
+			s.logger.Log(LevelDebug, "%s dropped invalid initial packet: %s", p.addr, h)
+			freePacket(p)
+			return
+		}
 		if h.Version != transport.ProtocolVersion {
 			// Negotiate version
-			s.logger.Log(LevelDebug, "%s negotiate version %d: %s", p.addr, transport.ProtocolVersion, h)
-			s.negotiate(p.addr, h.SCID, h.DCID)
+			s.negotiate(p.addr, h)
 			freePacket(p)
 			return
 		}
-		// Server must ensure the any datagram packet containing Initial packet being at least 1200 bytes
-		if len(p.data) < transport.MinInitialPacketSize {
-			// TODO: Put this check back to transport package
-			s.logger.Log(LevelDebug, "%s dropped initial packet: %s", p.addr, h)
-			freePacket(p)
-			return
+		var odcid []byte
+		if s.addrValid != nil {
+			if len(h.Token) == 0 {
+				s.retry(p.addr, h)
+				freePacket(p)
+				return
+			}
+			odcid = s.verifyToken(p.addr, h.Token)
+			if len(odcid) == 0 {
+				s.logger.Log(LevelInfo, "%s invalid retry token: %v", p.addr, h)
+				freePacket(p)
+				return
+			}
 		}
-		var err error
-		c, err = s.newConn(p.addr, h.DCID, nil)
+		c, err = s.newConn(p.addr, h.DCID, odcid)
 		if err != nil {
 			s.logger.Log(LevelError, "%s create connection: %v", err)
 			freePacket(p)
@@ -92,7 +127,7 @@ func (s *Server) recv(p *packet, h *transport.Header) {
 		}
 		s.peers[string(c.scid[:])] = c
 		s.peersMu.Unlock()
-		s.logger.Log(LevelDebug, "%s new connection scid=%x", p.addr, c.scid)
+		s.logger.Log(LevelDebug, "%s new connection scid=%x odcid=%x", p.addr, c.scid, odcid)
 		if err = s.handler.Created(c); err != nil {
 			s.peersMu.Lock()
 			delete(s.peers, string(c.scid[:]))
@@ -106,18 +141,48 @@ func (s *Server) recv(p *packet, h *transport.Header) {
 	c.recv <- p
 }
 
-func (s *Server) negotiate(addr net.Addr, dcid, scid []byte) {
+func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 	p := newPacket()
 	defer freePacket(p)
-	n, err := transport.NegotiateVersion(p.buf[:], dcid, scid)
+	n, err := transport.NegotiateVersion(p.buf[:], h.SCID, h.DCID)
 	if err != nil {
-		s.logger.Log(LevelError, "%s negotiate version: %v", addr, err)
+		s.logger.Log(LevelError, "%s negotiate: %s %v", addr, h, err)
 		return
 	}
 	_, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.Log(LevelError, "%s negotiate version: %v", addr, err)
+		s.logger.Log(LevelError, "%s negotiate: %s %v", addr, h, err)
+		return
 	}
+	s.logger.Log(LevelDebug, "%s negotiate: newversion=%d %s", addr, transport.ProtocolVersion, h)
+}
+
+func (s *Server) retry(addr net.Addr, h *transport.Header) {
+	p := newPacket()
+	defer freePacket(p)
+	// newCID is a new DCID client shoud send in next Initial packet
+	var newCID [transport.MaxCIDLength]byte
+	if err := s.rand(newCID[:]); err != nil {
+		s.logger.Log(LevelError, "%s retry: %s %v", addr, h, err)
+		return
+	}
+	// Set token to current header so it will be logged
+	h.Token = s.addrValid.Generate([]byte(addr.String()), h.DCID)
+	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, h.Token)
+	if err != nil {
+		s.logger.Log(LevelError, "%s retry: %s %v", addr, h, err)
+		return
+	}
+	_, err = s.socket.WriteTo(p.buf[:n], addr)
+	if err != nil {
+		s.logger.Log(LevelError, "%s retry: %s %v", addr, h, err)
+		return
+	}
+	s.logger.Log(LevelDebug, "%s retry: %v newcid=%x", addr, h, newCID)
+}
+
+func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
+	return s.addrValid.Validate([]byte(addr.String()), token)
 }
 
 func (s *Server) newConn(addr net.Addr, scid, odcid []byte) (*remoteConn, error) {
@@ -129,7 +194,8 @@ func (s *Server) newConn(addr net.Addr, scid, odcid []byte) (*remoteConn, error)
 	if len(scid) == len(c.scid) {
 		copy(c.scid[:], scid)
 	} else {
-		// Generate id for new connection
+		// Generate id for new connection since short packets don't include CID length so
+		// we use MaxCIDLength for all connections
 		if err = s.rand(c.scid[:]); err != nil {
 			return nil, err
 		}
@@ -140,6 +206,7 @@ func (s *Server) newConn(addr net.Addr, scid, odcid []byte) (*remoteConn, error)
 	return c, nil
 }
 
+// Close tries to send Close frame to all connected clients and closes its socket.
 func (s *Server) Close() error {
 	s.peersMu.RLock()
 	for _, c := range s.peers {
@@ -148,4 +215,11 @@ func (s *Server) Close() error {
 	s.peersMu.RUnlock()
 	// TODO: wait and close socket
 	return nil
+}
+
+// AddressValidator generates and validates server retry token.
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#token-integrity
+type AddressValidator interface {
+	Generate(addr, odcid []byte) []byte
+	Validate(addr, token []byte) []byte
 }

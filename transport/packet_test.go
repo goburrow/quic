@@ -26,43 +26,93 @@ fc19245b182a20db2f1dc243825f3db6b00a0c5557f288344fe7a27505`)
 
 func testPacketRetryDecode(t *testing.T, b, dcid []byte) {
 	p := packet{}
-	hLen, err := p.decodeHeader(b)
+	n, err := decodeUnencryptedPacket(b, &p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.typ != packetTypeRetry {
 		t.Fatalf("expect type retry, actual %d", p.typ)
 	}
-	bLen, err := p.decodeBody(b[hLen:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	n := hLen + bLen
 	if n != len(b)-retryIntegrityTagLen {
 		t.Fatalf("expect decoded length %d, actual %d", len(b)-retryIntegrityTagLen, n)
 	}
 	t.Logf("%s", &p)
-	err = verifyRetryIntegrity(b, dcid)
-	if err != nil {
-		t.Fatal(err)
+	if !verifyRetryIntegrity(b, dcid) {
+		t.Fatalf("verify retry integrity failed\n%x", b)
 	}
 }
 
 func TestPacketRetryEncode(t *testing.T) {
 	b := make([]byte, 128)
-	dcid := testdata.DecodeHex(`f067a5502a4262b5`)
+	scid := testdata.DecodeHex(`f067a5502a4262b5`)
 	odcid := testdata.DecodeHex(`8394c8f03e515708`)
 	token := testdata.DecodeHex(`746f6b656e`)
-	n, err := Retry(b, dcid, nil, odcid, token)
+	n, err := Retry(b, nil, scid, odcid, token)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// XXX: To test with the example in spec, the header flags must be 0xff
 	expected := testdata.DecodeHex(`
-ffff00001b0008f067a5502a4262b574 6f6b656ea523cb5ba524695f6569f293
-a1359d8e`)
-	if bytes.Equal(expected, b[:n]) {
+f0ff00001b0008f067a5502a4262b574 6f6b656e825b2c42a3bfbe8d0c441edd
+376f531b`)
+	if !bytes.Equal(expected, b[:n]) {
 		t.Fatalf("expect: %x\nactual: %x", expected, b[:n])
 	}
+}
+
+func TestPacketRetry(t *testing.T) {
+	b := make([]byte, 512)
+	dcid := randomBytes(MaxCIDLength)
+	scid := randomBytes(MaxCIDLength)
+	odcid := randomBytes(MaxCIDLength)
+	token := randomBytes(100)
+
+	n, err := Retry(b, dcid, scid, odcid, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := packet{}
+	m, err := decodeUnencryptedPacket(b[:n], &p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != m+retryIntegrityTagLen {
+		t.Fatalf("expect length %d, actual %d", n, m+retryIntegrityTagLen)
+	}
+	if p.typ != packetTypeRetry {
+		t.Fatalf("expect type retry, actual %d", p.typ)
+	}
+	if !bytes.Equal(dcid, p.header.dcid) {
+		t.Fatalf("expect dcid %x, actual %x", dcid, p.header.dcid)
+	}
+	if !bytes.Equal(scid, p.header.scid) {
+		t.Fatalf("expect scid %x, actual %x", scid, p.header.scid)
+	}
+	if !bytes.Equal(token, p.token) {
+		t.Fatalf("expect dcid %x, actual %x", token, p.token)
+	}
+}
+
+func randomBytes(maxLength int) []byte {
+	n := rand.Intn(maxLength + 1)
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func decodeUnencryptedPacket(b []byte, p *packet) (int, error) {
+	hLen, err := p.decodeHeader(b)
+	if err != nil {
+		return 0, err
+	}
+	bLen, err := p.decodeBody(b[hLen:])
+	if err != nil {
+		return 0, err
+	}
+	return hLen + bLen, nil
 }
 
 func TestDecodePacketNumber(t *testing.T) {
@@ -131,7 +181,7 @@ c9be6c7803567321829dd85853396269`
 	}
 	pnSpace := packetNumberSpace{}
 	pnSpace.init()
-	aead, err := newInitialAEAD(p.header.DCID)
+	aead, err := newInitialAEAD(p.header.dcid)
 	if err != nil {
 		t.Fatal(err)
 	}

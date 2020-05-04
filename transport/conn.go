@@ -139,7 +139,7 @@ func (s *Conn) deriveInitialKeyMaterial(cid []byte) error {
 
 func (s *Conn) recv(b []byte, now time.Time) (int, error) {
 	p := packet{
-		header: Header{
+		header: packetHeader{
 			dcil: uint8(len(s.scid)),
 		},
 	}
@@ -167,7 +167,7 @@ func (s *Conn) recv(b []byte, now time.Time) (int, error) {
 func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet) (int, error) {
 	// VN packet can only be sent by server
 	if !s.isClient || s.didVersionNegotiation || s.state != stateInitial ||
-		!bytes.Equal(p.header.DCID, s.scid) || !bytes.Equal(p.header.SCID, s.dcid) {
+		!bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
@@ -202,7 +202,7 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 	// Retry packet can only be sent by server
 	// Packet's SCID must not be equal to the client's DCID.
 	if !s.isClient || s.didRetry || s.state != stateInitial ||
-		!bytes.Equal(p.header.DCID, s.scid) || bytes.Equal(p.header.SCID, s.dcid) {
+		!bytes.Equal(p.header.dcid, s.scid) || bytes.Equal(p.header.scid, s.dcid) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
@@ -211,19 +211,15 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 		return 0, err
 	}
 	// Verify token and integrity tag
-	if len(p.token) == 0 {
+	if len(p.token) == 0 || !verifyRetryIntegrity(b, s.dcid) {
 		return 0, errInvalidPacket
-	}
-	err = verifyRetryIntegrity(b, s.dcid)
-	if err != nil {
-		return 0, err
 	}
 	debug("received packet %v", p)
 	s.token = append(s.token[:0], p.token...)
 	s.didRetry = true
 	// Update CIDs and crypto: dcid => odcid, header.scid => dcid
 	s.odcid = append(s.odcid[:0], s.dcid...)
-	s.dcid = append(s.dcid[:0], p.header.SCID...)
+	s.dcid = append(s.dcid[:0], p.header.scid...)
 	if err = s.deriveInitialKeyMaterial(s.dcid); err != nil {
 		return 0, err
 	}
@@ -237,28 +233,28 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 }
 
 func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error) {
-	if s.gotPeerCID && (!bytes.Equal(p.header.DCID, s.scid) || !bytes.Equal(p.header.SCID, s.dcid)) {
+	if s.gotPeerCID && (!bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid)) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
 	if s.isClient && !s.gotPeerCID {
 		// Replace the randomly generated destination connection ID with
 		// the one supplied by the server.
-		s.dcid = append(s.dcid[:0], p.header.SCID...)
+		s.dcid = append(s.dcid[:0], p.header.scid...)
 		s.gotPeerCID = true
 	}
 	if !s.derivedInitialSecrets { // Server side
-		if err := s.deriveInitialKeyMaterial(p.header.DCID); err != nil {
+		if err := s.deriveInitialKeyMaterial(p.header.dcid); err != nil {
 			return 0, err
 		}
-		s.dcid = append(s.dcid[:0], p.header.SCID...)
+		s.dcid = append(s.dcid[:0], p.header.scid...)
 		s.gotPeerCID = true
 	}
 	return s.recvPacket(b, p, packetSpaceInitial, now)
 }
 
 func (s *Conn) recvPacketHandshake(b []byte, p *packet, now time.Time) (int, error) {
-	if !bytes.Equal(p.header.DCID, s.scid) || !bytes.Equal(p.header.SCID, s.dcid) {
+	if !bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
@@ -266,7 +262,7 @@ func (s *Conn) recvPacketHandshake(b []byte, p *packet, now time.Time) (int, err
 }
 
 func (s *Conn) recvPacketShort(b []byte, p *packet, now time.Time) (int, error) {
-	if !bytes.Equal(p.header.DCID, s.scid) {
+	if !bytes.Equal(p.header.dcid, s.scid) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
@@ -682,10 +678,10 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 	avail := minInt(s.maxPacketSize(), len(b))
 	p := packet{
 		typ: packetTypeFromSpace(space),
-		header: Header{
-			Version: s.version,
-			DCID:    s.dcid,
-			SCID:    s.scid,
+		header: packetHeader{
+			version: s.version,
+			dcid:    s.dcid,
+			scid:    s.scid,
 		},
 		token:        s.token,
 		packetNumber: pnSpace.nextPacketNumber,
@@ -785,8 +781,8 @@ func (s *Conn) writeSpace() packetSpace {
 }
 
 func (s *Conn) maxPacketSize() int {
-	if s.state >= stateEstablished && s.peerParams.MaxPacketSize > 0 {
-		n := int(s.peerParams.MaxPacketSize)
+	if s.state >= stateEstablished && s.peerParams.MaxUDPPayloadSize > 0 {
+		n := int(s.peerParams.MaxUDPPayloadSize)
 		if n >= MinInitialPacketSize && n <= MaxPacketSize {
 			return n
 		}

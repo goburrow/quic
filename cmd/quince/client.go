@@ -15,6 +15,7 @@ func clientCommand(args []string) error {
 	cmd := flag.NewFlagSet("client", flag.ExitOnError)
 	listenAddr := cmd.String("listen", "0.0.0.0:0", "listen on the given IP:port")
 	insecure := cmd.Bool("insecure", false, "skip verifying server certificate")
+	logLevel := cmd.Int("v", quic.LevelInfo, "log verbose level: 0=Off, 1=Error, 2=Info, 3=Debug")
 	cmd.Parse(args)
 
 	addr := cmd.Arg(0)
@@ -27,7 +28,9 @@ func clientCommand(args []string) error {
 	config.TLS.ServerName = serverName(addr)
 	config.TLS.InsecureSkipVerify = *insecure
 	handler := clientHandler{}
-	client := quic.NewClient(config, &handler)
+	client := quic.NewClient(config)
+	client.SetHandler(&handler)
+	client.SetLogger(quic.LeveledLogger(*logLevel))
 	if err := client.Listen(*listenAddr); err != nil {
 		return err
 	}

@@ -32,6 +32,16 @@ type Handler interface {
 	Closed(Conn)
 }
 
+type noopHandler struct{}
+
+func (s noopHandler) Created(Conn) error {
+	return nil
+}
+
+func (s noopHandler) Serve(Conn) {}
+
+func (s noopHandler) Closed(Conn) {}
+
 // remoteConn implements Conn.
 type remoteConn struct {
 	scid [transport.MaxCIDLength]byte

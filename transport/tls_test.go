@@ -14,7 +14,7 @@ func TestTransportParams(t *testing.T) {
 		OriginalCID:         []byte{0x01, 0x02, 0x03, 0x04, 0x05},
 		MaxIdleTimeout:      30 * time.Millisecond,
 		StatelessResetToken: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a},
-		MaxPacketSize:       1200,
+		MaxUDPPayloadSize:   1200,
 
 		InitialMaxData:                 1440000,
 		InitialMaxStreamDataBidiLocal:  90000,

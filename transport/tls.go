@@ -12,7 +12,7 @@ const (
 	parameterOriginalCID = iota // 0
 	parameterMaxIdleTimeout
 	parameterStatelessResetToken
-	parameterMaxPacketSize
+	parameterMaxUDPPayloadSize
 	parameterInitialMaxData
 	parameterInitialMaxStreamDataBidiLocal // 5
 	parameterInitialMaxStreamDataBidiRemote
@@ -29,7 +29,7 @@ type Parameters struct {
 	OriginalCID         []byte // Server only
 	MaxIdleTimeout      time.Duration
 	StatelessResetToken []byte // Server only
-	MaxPacketSize       uint64
+	MaxUDPPayloadSize   uint64
 
 	InitialMaxData                 uint64
 	InitialMaxStreamDataBidiLocal  uint64
@@ -66,9 +66,9 @@ func (s *Parameters) marshal() []byte {
 		b.writeVarint(parameterStatelessResetToken)
 		b.writeBytes(s.StatelessResetToken)
 	}
-	if s.MaxPacketSize > 0 {
-		b.writeVarint(parameterMaxPacketSize)
-		b.writeUint(s.MaxPacketSize)
+	if s.MaxUDPPayloadSize > 0 {
+		b.writeVarint(parameterMaxUDPPayloadSize)
+		b.writeUint(s.MaxUDPPayloadSize)
 	}
 	if s.InitialMaxData > 0 {
 		b.writeVarint(parameterInitialMaxData)
@@ -127,8 +127,8 @@ func (s *Parameters) unmarshal(data []byte) bool {
 			if !b.readBytes(&s.StatelessResetToken) {
 				return false
 			}
-		case parameterMaxPacketSize:
-			if !b.readUint(&s.MaxPacketSize) {
+		case parameterMaxUDPPayloadSize:
+			if !b.readUint(&s.MaxUDPPayloadSize) {
 				return false
 			}
 		case parameterInitialMaxData:
@@ -200,7 +200,7 @@ func (s *tlsExtension) readVarint(v *uint64) bool {
 	return true
 }
 
-// readUint64 reads varint with length prefix.
+// readUint reads varint with length prefix.
 func (s *tlsExtension) readUint(v *uint64) bool {
 	var n uint64
 	if !s.readVarint(&n) {
@@ -217,7 +217,7 @@ func (s *tlsExtension) readUint(v *uint64) bool {
 	return true
 }
 
-// readUint64 reads bytes with length prefix.
+// readBytes reads bytes with length prefix.
 func (s *tlsExtension) readBytes(v *[]byte) bool {
 	var n uint64
 	if !s.readVarint(&n) {

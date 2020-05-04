@@ -50,7 +50,8 @@ a8988f2a7da7191fb31ac04fc69c0b10517e2cdb14d4fcd842a8fc30db8237eb
 4aa0e56ad06e03f8be66878c4617849a`
 	config := newConfig()
 	b := testdata.DecodeHex(clientInitial)
-	h, err := DecodeHeader(b, 0)
+	h := Header{}
+	_, err := h.Decode(b, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

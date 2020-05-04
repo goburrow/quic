@@ -14,6 +14,8 @@ func serverCommand(args []string) error {
 	listenAddr := cmd.String("listen", "localhost:4433", "listen on the given IP:port")
 	certFile := cmd.String("cert", "cert.crt", "TLS certificate path")
 	keyFile := cmd.String("key", "cert.key", "TLS certificate key path")
+	logLevel := cmd.Int("v", quic.LevelInfo, "log verbose level: 0=Off, 1=Error, 2=Info, 3=Debug")
+	enableRetry := cmd.Bool("retry", false, "enable address validation using Retry packet")
 	cmd.Parse(args)
 
 	config := newConfig()
@@ -24,7 +26,16 @@ func serverCommand(args []string) error {
 		}
 		config.TLS.Certificates = []tls.Certificate{cert}
 	}
-	server := quic.NewServer(config, &serverHandler{})
+	server := quic.NewServer(config)
+	server.SetHandler(&serverHandler{})
+	server.SetLogger(quic.LeveledLogger(*logLevel))
+	if *enableRetry {
+		val, err := transport.NewAddressValidator()
+		if err != nil {
+			return err
+		}
+		server.SetAddressValidator(val)
+	}
 	if err := server.Listen(*listenAddr); err != nil {
 		return err
 	}

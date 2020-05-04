@@ -1,10 +1,13 @@
 package transport
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"time"
 
 	"github.com/goburrow/quic/tls13"
 )
@@ -169,10 +172,9 @@ func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 	return nil
 }
 
-var retryIntegrityKey = []byte{
-	0x4d, 0x32, 0xec, 0xdb, 0x2a, 0x21, 0x33, 0xc8,
-	0x41, 0xe4, 0x04, 0x3d, 0xf2, 0x7d, 0x44, 0x30,
-}
+// Retry Packet Integrity
+
+const retryIntegrityTagLen = 16
 
 var retryIntegrityNonce = []byte{
 	0x4d, 0x16, 0x11, 0xd0, 0x55, 0x13, 0xa5, 0x52,
@@ -181,32 +183,114 @@ var retryIntegrityNonce = []byte{
 
 var retryIntegrityAEAD cipher.AEAD
 
-func newRetryIntegrityAEAD() (cipher.AEAD, error) {
+func newRetryIntegrityAEAD() cipher.AEAD {
 	if retryIntegrityAEAD == nil {
+		var retryIntegrityKey = []byte{
+			0x4d, 0x32, 0xec, 0xdb, 0x2a, 0x21, 0x33, 0xc8,
+			0x41, 0xe4, 0x04, 0x3d, 0xf2, 0x7d, 0x44, 0x30,
+		}
 		aes, err := aes.NewCipher(retryIntegrityKey)
 		if err != nil {
-			return nil, err
+			panic("retry packet integrity AEAD: " + err.Error())
 		}
 		gcm, err := cipher.NewGCM(aes)
 		if err != nil {
-			return nil, err
+			panic("retry packet integrity AEAD: " + err.Error())
 		}
 		retryIntegrityAEAD = gcm
 	}
-	return retryIntegrityAEAD, nil
+	return retryIntegrityAEAD
 }
 
 // computeRetryIntegrity append retry integrity tag to given pseudo retry packet.
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry-packet-integrity
 func computeRetryIntegrity(pseudo []byte) ([]byte, error) {
-	aead, err := newRetryIntegrityAEAD()
-	if err != nil {
-		return nil, err
-	}
+	aead := newRetryIntegrityAEAD()
 	if cap(pseudo)-len(pseudo) < aead.Overhead() {
 		// Avoid allocating
 		return nil, errShortBuffer
 	}
 	b := aead.Seal(pseudo, retryIntegrityNonce, nil, pseudo)
 	return b, nil
+}
+
+// verifyRetryIntegrity verifies integrity tag in retry packet b given the original destination CID odcid.
+func verifyRetryIntegrity(b, odcid []byte) bool {
+	if len(b) < retryIntegrityTagLen {
+		return false
+	}
+	pseudo := make([]byte, len(b)+len(odcid)+1)
+	pseudo[0] = byte(len(odcid))
+	copy(pseudo[1:], odcid)
+	copy(pseudo[1+len(odcid):], b[:len(b)-retryIntegrityTagLen])
+
+	out, err := computeRetryIntegrity(pseudo[:len(pseudo)-retryIntegrityTagLen])
+	if err != nil || len(out) < retryIntegrityTagLen {
+		return false
+	}
+	inTag := b[len(b)-retryIntegrityTagLen:]
+	outTag := out[len(out)-retryIntegrityTagLen:]
+	return bytes.Equal(inTag, outTag)
+}
+
+// AddressValidator is a simple implementation for client address validation.
+// It encrypts client original CID using AES-GSM AEAD with a randomly-generated key.
+type AddressValidator struct {
+	aead   cipher.AEAD
+	timeFn func() time.Time
+}
+
+// NewAddressValidator creates a new AddressValidator or returns error when failed to
+// generate secret or AEAD.
+func NewAddressValidator() (*AddressValidator, error) {
+	var key [16]byte
+	_, err := rand.Read(key[:])
+	if err != nil {
+		return nil, err
+	}
+	blk, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(blk)
+	if err != nil {
+		return nil, err
+	}
+	return &AddressValidator{
+		aead:   aead,
+		timeFn: time.Now,
+	}, nil
+}
+
+// Generate encrypts odcid using current time as nonce and addr as additional data.
+func (s *AddressValidator) Generate(addr, odcid []byte) []byte {
+	now := s.timeFn().Unix()
+	nonce := make([]byte, s.aead.NonceSize())
+	binary.BigEndian.PutUint32(nonce, uint32(now))
+
+	token := make([]byte, 4+len(odcid)+s.aead.Overhead())
+	binary.BigEndian.PutUint32(token, uint32(now))
+	s.aead.Seal(token[4:4], nonce, odcid, addr)
+	return token
+}
+
+// Validate decrypts token and returns odcid.
+func (s *AddressValidator) Validate(addr, token []byte) []byte {
+	if len(token) < 4 {
+		return nil
+	}
+	const validity = 10 // Second
+	now := s.timeFn().Unix()
+	issued := int64(binary.BigEndian.Uint32(token))
+	if issued < now-validity || issued > now {
+		// TODO: Fix overflow when time > MAX_U32
+		return nil
+	}
+	nonce := make([]byte, s.aead.NonceSize())
+	copy(nonce, token[:4])
+	odcid, err := s.aead.Open(nil, nonce, token[4:], addr)
+	if err != nil {
+		return nil
+	}
+	return odcid
 }

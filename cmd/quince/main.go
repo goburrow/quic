@@ -38,7 +38,7 @@ func main() {
 
 func newConfig() *transport.Config {
 	c := transport.NewConfig()
-	c.Params.MaxPacketSize = transport.MaxIPv6PacketSize
+	c.Params.MaxUDPPayloadSize = transport.MaxIPv6PacketSize
 	c.Params.MaxIdleTimeout = 5 * time.Second
 	c.Params.InitialMaxData = 100000
 	c.Params.InitialMaxStreamDataBidiLocal = 100000
@@ -47,7 +47,7 @@ func newConfig() *transport.Config {
 	c.Params.InitialMaxStreamsBidi = 10
 	c.Params.InitialMaxStreamsUni = 10
 	c.TLS = &tls.Config{
-		NextProtos:   []string{"hq-24", "http/0.9"},
+		NextProtos:   []string{"hq-27", "http/0.9"},
 		KeyLogWriter: newKeyLogWriter(),
 	}
 	return c

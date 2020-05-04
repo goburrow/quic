@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/goburrow/quic/testdata"
 )
@@ -74,7 +75,7 @@ acde6758312622d4fa675b39f728e062 d2bee680d8f41a597c262648bb18bcfc
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.header.Flags = b[0]
+	p.header.flags = b[0]
 	n, err := p.decodeBody(b[headerLen:])
 	payload, err := aead.client.decryptPayload(b[:headerLen+n+p.payloadLen], p.packetNumber, p.payloadLen)
 	if err != nil {
@@ -118,7 +119,7 @@ cfc79825df566dc5430b9a045a120013 0100002e00330024001d00209d3c940d
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.header.Flags = b[0]
+	p.header.flags = b[0]
 	n, err := p.decodeBody(b[headerLen:])
 	payload, err := aead.server.decryptPayload(b[:headerLen+n+p.payloadLen], p.packetNumber, p.payloadLen)
 	if err != nil {
@@ -149,5 +150,81 @@ ffff00001b0008f067a5502a4262b574 6f6b656ea523cb5ba524695f6569f293
 a1359d8e`)
 	if !bytes.Equal(expect, actual) {
 		t.Fatalf("integrity tag\nexpect: %x\nactual: %x", expect, actual)
+	}
+	if !verifyRetryIntegrity(expect, odcid) {
+		t.Fatalf("verify retry integrity failed: %x", expect)
+	}
+}
+
+func BenchmarkRetryIntegrity(b *testing.B) {
+	odcid := testdata.DecodeHex(`8394c8f03e515708`)
+	pseudoPacket := make([]byte, 0, 128)
+	pseudoPacket = append(pseudoPacket, testdata.DecodeHex(`00208394c8f03e515708ffff00001b0008f067a5502a4262b5746f6b656e`)...)
+	retryPacket := testdata.DecodeHex(`
+ffff00001b0008f067a5502a4262b574 6f6b656ea523cb5ba524695f6569f293
+a1359d8e`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := computeRetryIntegrity(pseudoPacket)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if !verifyRetryIntegrity(retryPacket, odcid) {
+			b.Fatal("verify retry integrity failed")
+		}
+	}
+}
+
+func TestAddressValidator(t *testing.T) {
+	addr1 := []byte("1.2.3.4:90")
+	addr2 := []byte("5.6.7.8:90")
+	odcid := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 0}
+	s, err := NewAddressValidator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s.timeFn = func() time.Time {
+		return now
+	}
+	token := s.Generate(addr1, odcid)
+	t.Logf("token: %d %x", len(token), token)
+	cid := s.Validate(addr1, token)
+	if !bytes.Equal(odcid, cid) {
+		t.Fatalf("expect cid: %x\nactual: %x", odcid, cid)
+	}
+	// Still valid
+	now = now.Add(10 * time.Second)
+	cid = s.Validate(addr1, token)
+	if !bytes.Equal(odcid, cid) {
+		t.Fatalf("expect cid: %x\nactual: %x", odcid, cid)
+	}
+	// Wrong address
+	cid = s.Validate(addr2, token)
+	if cid != nil {
+		t.Fatalf("expect cid: <nil>\nactual: %x", cid)
+	}
+	// Expired
+	now = now.Add(1 * time.Second)
+	cid = s.Validate(addr2, token)
+	if cid != nil {
+		t.Fatalf("expect cid: <nil>\nactual: %x", cid)
+	}
+}
+
+func BenchmarkAddressValidator(b *testing.B) {
+	addr := []byte("10.0.0.1:7890")
+	odcid := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6}
+	s, err := NewAddressValidator()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		token := s.Generate(addr, odcid)
+		cid := s.Validate(addr, token)
+		if cid == nil {
+			b.Fatal("invalid token")
+		}
 	}
 }

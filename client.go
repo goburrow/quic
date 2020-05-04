@@ -14,17 +14,28 @@ type Client struct {
 }
 
 // NewClient creates a new QUIC client.
-func NewClient(config *transport.Config, handler Handler) *Client {
+func NewClient(config *transport.Config) *Client {
 	return &Client{
 		localConn: localConn{
 			config:  config,
 			logger:  leveledLogger(LevelInfo),
 			peers:   make(map[string]*remoteConn),
-			handler: handler,
+			handler: noopHandler{},
 		},
 	}
 }
 
+// SetHandler sets QUIC connection callbacks.
+func (s *Client) SetHandler(v Handler) {
+	s.handler = v
+}
+
+// SetLogger sets transaction logger.
+func (s *Client) SetLogger(v Logger) {
+	s.logger = v
+}
+
+// Listen starts listening on UDP network address addr.
 func (s *Client) Listen(addr string) error {
 	if s.socket != nil {
 		return errors.New("socket already listening")
@@ -40,25 +51,27 @@ func (s *Client) serve() error {
 	for {
 		p := newPacket()
 		n, addr, err := s.socket.ReadFrom(p.buf[:])
+		if n > 0 {
+			p.data = p.buf[:n]
+			p.addr = addr
+			s.logger.Log(LevelDebug, "%s got %d bytes\n%x", addr, n, p.data)
+			s.recv(p)
+		}
 		if err != nil {
 			return err
 		}
-		p.data = p.buf[:n]
-		p.addr = addr
-		s.logger.Log(LevelDebug, "%s got %d bytes\n%x", addr, n, p.data)
-		h, err := transport.DecodeHeader(p.data, transport.MaxCIDLength)
-		if err != nil {
-			// Ignore invalid packet
-			s.logger.Log(LevelDebug, "%s parse header: %v", addr, err)
-			freePacket(p)
-			continue
-		}
-		s.logger.Log(LevelDebug, "%s receiving packet %s", addr, h)
-		s.recv(p, h)
 	}
 }
 
-func (s *Client) recv(p *packet, h *transport.Header) {
+func (s *Client) recv(p *packet) {
+	h := &transport.Header{}
+	_, err := h.Decode(p.data, transport.MaxCIDLength)
+	if err != nil {
+		s.logger.Log(LevelInfo, "%s could not parse packet: %v", p.addr, err)
+		freePacket(p)
+		return
+	}
+	s.logger.Log(LevelDebug, "%s got %s", p.addr, h)
 	s.peersMu.RLock()
 	c, ok := s.peers[string(h.DCID)]
 	s.peersMu.RUnlock()
@@ -70,6 +83,7 @@ func (s *Client) recv(p *packet, h *transport.Header) {
 	}
 }
 
+// Connect establishes a new connection to UDP network address addr.
 func (s *Client) Connect(addr string) error {
 	c, err := s.newConn(addr)
 	if err != nil {
