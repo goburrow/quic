@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,6 +55,7 @@ const (
 	typeFinished            uint8 = 20
 	typeCertificateStatus   uint8 = 22
 	typeKeyUpdate           uint8 = 24
+	typeNextProtocol        uint8 = 67  // Not IANA assigned
 	typeMessageHash         uint8 = 254 // synthetic message
 )
 
@@ -223,8 +225,9 @@ func ticketKeyFromBytes(b [32]byte) (key ticketKey) {
 // ticket, and the lifetime we set for tickets we send.
 const maxSessionTicketLifetime = 7 * 24 * time.Hour
 
+// configTicketKeys is a replacement for tls.Config.ticketKeys.
 func configTicketKeys(c *tls.Config) []ticketKey {
-	// FIXME
+	// FIXME: Get ticketKeys from tls.Config
 	v, ok := globalTicketKeys.Load(c)
 	if ok {
 		return v.([]ticketKey)
@@ -254,14 +257,16 @@ func configTicketKeys(c *tls.Config) []ticketKey {
 	return sessionTicketKeys
 }
 
+// configRand is a replacement for tls.Config.rand.
 func configRand(c *tls.Config) io.Reader {
 	r := c.Rand
-	if r != nil {
-		return r
+	if r == nil {
+		return rand.Reader
 	}
-	return rand.Reader
+	return r
 }
 
+// configTime is a replacement for tls.Config.time.
 func configTime(c *tls.Config) time.Time {
 	t := c.Time
 	if t == nil {
@@ -270,11 +275,13 @@ func configTime(c *tls.Config) time.Time {
 	return t()
 }
 
+// configCipherSuites is a replacement for tls.Config.cipherSuites.
 func configCipherSuites(c *tls.Config) []uint16 {
-	if len(c.CipherSuites) == 0 {
-		return defaultCipherSuitesTLS13
+	s := c.CipherSuites
+	if s == nil {
+		s = defaultCipherSuitesTLS13
 	}
-	return c.CipherSuites
+	return s
 }
 
 var supportedVersions = []uint16{
@@ -297,6 +304,7 @@ func supportedVersionsFromMax(maxVersion uint16) []uint16 {
 
 var defaultCurvePreferences = []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}
 
+// configCurvePreferences is a replacement for tls.Config.curvePreferences.
 func configCurvePreferences(c *tls.Config) []tls.CurveID {
 	if c == nil || len(c.CurvePreferences) == 0 {
 		return defaultCurvePreferences
@@ -317,7 +325,10 @@ func mutualVersion(peerVersions []uint16) (uint16, bool) {
 	return 0, false
 }
 
-// configGetCertificate returns the best certificate for the given ClientHelloInfo.
+var errNoCertificates = errors.New("tls: no certificates configured")
+
+// getCertificate returns the best certificate for the given ClientHelloInfo,
+// defaulting to the first element of c.Certificates.
 func configGetCertificate(c *tls.Config, clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	if c.GetCertificate != nil &&
 		(len(c.Certificates) == 0 || len(clientHello.ServerName) > 0) {
@@ -328,31 +339,32 @@ func configGetCertificate(c *tls.Config, clientHello *tls.ClientHelloInfo) (*tls
 	}
 
 	if len(c.Certificates) == 0 {
-		return nil, errors.New("tls: no certificates configured")
+		return nil, errNoCertificates
 	}
 
-	if len(c.Certificates) == 1 || c.NameToCertificate == nil {
+	if len(c.Certificates) == 1 {
 		// There's only one choice, so no point doing any work.
 		return &c.Certificates[0], nil
 	}
 
-	name := strings.ToLower(clientHello.ServerName)
-	for len(name) > 0 && name[len(name)-1] == '.' {
-		name = name[:len(name)-1]
-	}
-
-	if cert, ok := c.NameToCertificate[name]; ok {
-		return cert, nil
-	}
-
-	// try replacing labels in the name with wildcards until we get a
-	// match.
-	labels := strings.Split(name, ".")
-	for i := range labels {
-		labels[i] = "*"
-		candidate := strings.Join(labels, ".")
-		if cert, ok := c.NameToCertificate[candidate]; ok {
+	if c.NameToCertificate != nil {
+		name := strings.ToLower(clientHello.ServerName)
+		if cert, ok := c.NameToCertificate[name]; ok {
 			return cert, nil
+		}
+		if len(name) > 0 {
+			labels := strings.Split(name, ".")
+			labels[0] = "*"
+			wildcardName := strings.Join(labels, ".")
+			if cert, ok := c.NameToCertificate[wildcardName]; ok {
+				return cert, nil
+			}
+		}
+	}
+
+	for _, cert := range c.Certificates {
+		if err := clientHello.SupportsCertificate(&cert); err == nil {
+			return &cert, nil
 		}
 	}
 
@@ -368,14 +380,24 @@ const (
 	keyLogLabelServerTraffic   = "SERVER_TRAFFIC_SECRET_0"
 )
 
+// configWriteKeyLog is a replacement for tls.Config.writeKeyLog.
 func configWriteKeyLog(c *tls.Config, label string, clientRandom, secret []byte) error {
 	if c.KeyLogWriter == nil {
 		return nil
 	}
 
-	_, err := fmt.Fprintf(c.KeyLogWriter, "%s %x %x\n", label, clientRandom, secret)
+	logLine := []byte(fmt.Sprintf("%s %x %x\n", label, clientRandom, secret))
+
+	writerMutex.Lock()
+	_, err := c.KeyLogWriter.Write(logLine)
+	writerMutex.Unlock()
+
 	return err
 }
+
+// writerMutex protects all KeyLogWriters globally. It is rarely enabled,
+// and is only for debugging, so a global mutex saves space.
+var writerMutex sync.Mutex
 
 type handshakeMessage interface {
 	marshal() []byte
@@ -412,21 +434,4 @@ func isSupportedSignatureAlgorithm(sigAlg tls.SignatureScheme, supportedSignatur
 		}
 	}
 	return false
-}
-
-// signatureFromSignatureScheme maps a signature algorithm to the underlying
-// signature method (without hash function).
-func signatureFromSignatureScheme(signatureAlgorithm tls.SignatureScheme) uint8 {
-	switch signatureAlgorithm {
-	case tls.PKCS1WithSHA1, tls.PKCS1WithSHA256, tls.PKCS1WithSHA384, tls.PKCS1WithSHA512:
-		return signaturePKCS1v15
-	case tls.PSSWithSHA256, tls.PSSWithSHA384, tls.PSSWithSHA512:
-		return signatureRSAPSS
-	case tls.ECDSAWithSHA1, tls.ECDSAWithP256AndSHA256, tls.ECDSAWithP384AndSHA384, tls.ECDSAWithP521AndSHA512:
-		return signatureECDSA
-	case tls.Ed25519:
-		return signatureEd25519
-	default:
-		return 0
-	}
 }

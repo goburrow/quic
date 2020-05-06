@@ -275,11 +275,7 @@ type tlsHandshake struct {
 func (s *tlsHandshake) init(conn *Conn, config *tls.Config) {
 	s.conn = conn
 	s.tlsConfig = config
-	if conn.isClient {
-		s.tlsConn = tls13.Client(s, s.tlsConfig)
-	} else {
-		s.tlsConn = tls13.Server(s, s.tlsConfig)
-	}
+	s.tlsConn = tls13.NewConn(s, s.tlsConfig, conn.isClient)
 }
 
 func (s *tlsHandshake) doHandshake() error {
@@ -309,11 +305,7 @@ func (s *tlsHandshake) writeSpace() packetSpace {
 }
 
 func (s *tlsHandshake) reset() {
-	if s.conn.isClient {
-		s.tlsConn = tls13.Client(s, s.tlsConfig)
-	} else {
-		s.tlsConn = tls13.Server(s, s.tlsConfig)
-	}
+	s.tlsConn = tls13.NewConn(s, s.tlsConfig, s.conn.isClient)
 }
 
 func (s *tlsHandshake) ReadRecord(level tls13.EncryptionLevel, b []byte) (int, error) {
@@ -326,24 +318,24 @@ func (s *tlsHandshake) WriteRecord(level tls13.EncryptionLevel, b []byte) (int, 
 	return space.cryptoStream.Write(b)
 }
 
-func (s *tlsHandshake) SetSecrets(level tls13.EncryptionLevel, readSecret, writeSecret []byte) error {
-	debug("set secret level=%d read=%d write=%d", level, len(readSecret), len(writeSecret))
+func (s *tlsHandshake) SetReadSecret(level tls13.EncryptionLevel, readSecret []byte) error {
+	debug("set read secret level=%d read=%d", level, len(readSecret))
 	space := s.packetNumberSpace(level)
 	cipher := tls13.CipherSuiteByID(s.tlsConn.ConnectionState().CipherSuite)
 	if cipher == nil {
 		return fmt.Errorf("connection not yet handshaked")
 	}
-	if readSecret != nil {
-		if err := space.opener.init(cipher, readSecret); err != nil {
-			return err
-		}
+	return space.opener.init(cipher, readSecret)
+}
+
+func (s *tlsHandshake) SetWriteSecret(level tls13.EncryptionLevel, writeSecret []byte) error {
+	debug("set write secret level=%d write=%d", level, len(writeSecret))
+	space := s.packetNumberSpace(level)
+	cipher := tls13.CipherSuiteByID(s.tlsConn.ConnectionState().CipherSuite)
+	if cipher == nil {
+		return fmt.Errorf("connection not yet handshaked")
 	}
-	if writeSecret != nil {
-		if err := space.sealer.init(cipher, writeSecret); err != nil {
-			return err
-		}
-	}
-	return nil
+	return space.sealer.init(cipher, writeSecret)
 }
 
 func (s *tlsHandshake) setTransportParams(params *Parameters) {

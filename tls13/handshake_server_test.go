@@ -30,7 +30,11 @@ func (t *testRecordLayer) WriteRecord(level EncryptionLevel, b []byte) (int, err
 	return n, err
 }
 
-func (t *testRecordLayer) SetSecrets(level EncryptionLevel, readSecret, writeSecret []byte) error {
+func (t *testRecordLayer) SetReadSecret(level EncryptionLevel, readSecret []byte) error {
+	return nil
+}
+
+func (t *testRecordLayer) SetWriteSecret(level EncryptionLevel, writeSecret []byte) error {
 	return nil
 }
 
@@ -56,7 +60,7 @@ func TestReadClientHello(t *testing.T) {
 	records := testRecordLayer{}
 	records.read[EncryptionLevelInitial].Write(data)
 
-	conn := Server(&records, &tlsConfig)
+	conn := NewConn(&records, &tlsConfig, false)
 	err = conn.Handshake()
 	if err != ErrWantRead {
 		t.Fatalf("unexpected error: %v", err)

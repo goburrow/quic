@@ -5,7 +5,6 @@
 package tls13
 
 import (
-	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
@@ -15,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -327,43 +325,11 @@ func (c *Conn) getClientCertificate(cri *tls.CertificateRequestInfo) (*tls.Certi
 		return c.config.GetClientCertificate(cri)
 	}
 
-	// We need to search our list of client certs for one
-	// where SignatureAlgorithm is acceptable to the server and the
-	// Issuer is in AcceptableCAs.
-	for i, chain := range c.config.Certificates {
-		sigOK := false
-		for _, alg := range signatureSchemesForCertificate(c.vers, &chain) {
-			if isSupportedSignatureAlgorithm(alg, cri.SignatureSchemes) {
-				sigOK = true
-				break
-			}
-		}
-		if !sigOK {
+	for _, chain := range c.config.Certificates {
+		if err := cri.SupportsCertificate(&chain); err != nil {
 			continue
 		}
-
-		if len(cri.AcceptableCAs) == 0 {
-			return &chain, nil
-		}
-
-		for j, cert := range chain.Certificate {
-			x509Cert := chain.Leaf
-			// Parse the certificate if this isn't the leaf node, or if
-			// chain.Leaf was nil.
-			if j != 0 || x509Cert == nil {
-				var err error
-				if x509Cert, err = x509.ParseCertificate(cert); err != nil {
-					c.sendAlert(alertInternalError)
-					return nil, errors.New("tls: failed to parse configured certificate chain #" + strconv.Itoa(i) + ": " + err.Error())
-				}
-			}
-
-			for _, ca := range cri.AcceptableCAs {
-				if bytes.Equal(x509Cert.RawIssuer, ca) {
-					return &chain, nil
-				}
-			}
-		}
+		return &chain, nil
 	}
 
 	// No acceptable certificate found. Don't send a certificate.

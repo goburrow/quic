@@ -7,7 +7,6 @@ package tls13
 import (
 	"crypto/elliptic"
 	"crypto/hmac"
-	"crypto/subtle"
 	"crypto/tls"
 	"errors"
 	"hash"
@@ -74,7 +73,7 @@ func (c *cipherSuiteTLS13) nextTrafficSecret(trafficSecret []byte) []byte {
 	return c.expandLabel(trafficSecret, trafficUpdateLabel, nil, c.hash.Size())
 }
 
-// TrafficKey generates traffic keys according to RFC 8446, Section 7.3.
+// trafficKey generates traffic keys according to RFC 8446, Section 7.3.
 func (c *cipherSuiteTLS13) trafficKey(trafficSecret []byte) (key, iv []byte) {
 	key = c.expandLabel(trafficSecret, "key", nil, c.keyLen)
 	iv = c.expandLabel(trafficSecret, "iv", nil, aeadNonceLength)
@@ -113,12 +112,15 @@ type ecdheParameters interface {
 
 func generateECDHEParameters(rand io.Reader, curveID tls.CurveID) (ecdheParameters, error) {
 	if curveID == tls.X25519 {
-		p := &x25519Parameters{}
-		if _, err := io.ReadFull(rand, p.privateKey[:]); err != nil {
+		privateKey := make([]byte, curve25519.ScalarSize)
+		if _, err := io.ReadFull(rand, privateKey); err != nil {
 			return nil, err
 		}
-		curve25519.ScalarBaseMult(&p.publicKey, &p.privateKey)
-		return p, nil
+		publicKey, err := curve25519.X25519(privateKey, curve25519.Basepoint)
+		if err != nil {
+			return nil, err
+		}
+		return &x25519Parameters{privateKey: privateKey, publicKey: publicKey}, nil
 	}
 
 	curve, ok := curveForCurveID(curveID)
@@ -180,8 +182,8 @@ func (p *nistParameters) SharedKey(peerPublicKey []byte) []byte {
 }
 
 type x25519Parameters struct {
-	privateKey [32]byte
-	publicKey  [32]byte
+	privateKey []byte
+	publicKey  []byte
 }
 
 func (p *x25519Parameters) CurveID() tls.CurveID {
@@ -193,19 +195,9 @@ func (p *x25519Parameters) PublicKey() []byte {
 }
 
 func (p *x25519Parameters) SharedKey(peerPublicKey []byte) []byte {
-	if len(peerPublicKey) != 32 {
+	sharedKey, err := curve25519.X25519(p.privateKey, peerPublicKey)
+	if err != nil {
 		return nil
 	}
-
-	var theirPublicKey, sharedKey [32]byte
-	copy(theirPublicKey[:], peerPublicKey)
-	curve25519.ScalarMult(&sharedKey, &p.privateKey, &theirPublicKey)
-
-	// Check for low-order inputs. https://tools.ietf.org/html/rfc8422#section-5.11
-	var allZeroes [32]byte
-	if subtle.ConstantTimeCompare(allZeroes[:], sharedKey[:]) == 1 {
-		return nil
-	}
-
-	return sharedKey[:]
+	return sharedKey
 }

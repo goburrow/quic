@@ -62,10 +62,8 @@ type packetProtection struct {
 func (s *packetProtection) init(suite tls13.CipherSuite, secret []byte) error {
 	key, iv, hpKey := suite.QUICTrafficKey(secret)
 	var err error
-	s.aead, err = suite.AEAD(key, iv)
-	if err != nil {
-		return err
-	}
+	s.aead = suite.AEAD(key, iv)
+
 	// TODO: Support ChaCha
 	s.hp, err = aes.NewCipher(hpKey)
 	if err != nil {

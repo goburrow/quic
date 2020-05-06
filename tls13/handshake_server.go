@@ -59,7 +59,7 @@ func (c *Conn) processCertsFromClient(certificate tls.Certificate) error {
 		chains, err := certs[0].Verify(opts)
 		if err != nil {
 			c.sendAlert(alertBadCertificate)
-			return errors.New("tls: failed to verify client's certificate: " + err.Error())
+			return errors.New("tls: failed to verify client certificate: " + err.Error())
 		}
 
 		c.verifiedChains = chains
@@ -80,7 +80,7 @@ func (c *Conn) processCertsFromClient(certificate tls.Certificate) error {
 	case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
 	default:
 		c.sendAlert(alertUnsupportedCertificate)
-		return fmt.Errorf("tls: client's certificate contains an unsupported public key of type %T", certs[0].PublicKey)
+		return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
 	}
 
 	c.peerCertificates = certs

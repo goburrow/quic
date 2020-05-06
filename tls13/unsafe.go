@@ -5,7 +5,7 @@ import (
 	"unsafe"
 )
 
-// Work around for using tls.ClientSessionState
+// Work around for using tls.ClientSessionState in ClientSessionCache.
 // https://github.com/golang/go/issues/25351
 func (s *clientSessionState) toTLS() *tls.ClientSessionState {
 	ts := &tls.ClientSessionState{}
