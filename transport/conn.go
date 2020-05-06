@@ -92,9 +92,7 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 		if err := s.rand(s.dcid); err != nil {
 			return nil, err
 		}
-		if err := s.deriveInitialKeyMaterial(s.dcid); err != nil {
-			return nil, err
-		}
+		s.deriveInitialKeyMaterial(s.dcid)
 	}
 	s.handshake.setTransportParams(&s.localParams)
 	return s, nil
@@ -122,11 +120,8 @@ func (s *Conn) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-func (s *Conn) deriveInitialKeyMaterial(cid []byte) error {
-	aead, err := newInitialAEAD(cid)
-	if err != nil {
-		return err
-	}
+func (s *Conn) deriveInitialKeyMaterial(cid []byte) {
+	aead := newInitialAEAD(cid)
 	space := &s.packetNumberSpaces[packetSpaceInitial]
 	if s.isClient {
 		space.opener, space.sealer = aead.server, aead.client
@@ -134,7 +129,6 @@ func (s *Conn) deriveInitialKeyMaterial(cid []byte) error {
 		space.opener, space.sealer = aead.client, aead.server
 	}
 	s.derivedInitialSecrets = true
-	return nil
 }
 
 func (s *Conn) recv(b []byte, now time.Time) (int, error) {
@@ -220,9 +214,7 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 	// Update CIDs and crypto: dcid => odcid, header.scid => dcid
 	s.odcid = append(s.odcid[:0], s.dcid...)
 	s.dcid = append(s.dcid[:0], p.header.scid...)
-	if err = s.deriveInitialKeyMaterial(s.dcid); err != nil {
-		return 0, err
-	}
+	s.deriveInitialKeyMaterial(s.dcid)
 	// Reset connection state to send another initial packet
 	s.gotPeerCID = false
 	s.recovery.dropUnackedData(packetSpaceInitial)
@@ -244,9 +236,7 @@ func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error
 		s.gotPeerCID = true
 	}
 	if !s.derivedInitialSecrets { // Server side
-		if err := s.deriveInitialKeyMaterial(p.header.dcid); err != nil {
-			return 0, err
-		}
+		s.deriveInitialKeyMaterial(p.header.dcid)
 		s.dcid = append(s.dcid[:0], p.header.scid...)
 		s.gotPeerCID = true
 	}

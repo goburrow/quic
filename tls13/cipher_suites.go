@@ -119,10 +119,12 @@ func cipherSuiteTLS13ByID(id uint16) *cipherSuiteTLS13 {
 
 // CipherSuite is the exported cipherSuiteTLS13 for QUIC usage.
 type CipherSuite interface {
-	DeriveSecret(secret []byte, label string) []byte
-	Extract(newSecret, currentSecret []byte) []byte
-	QUICTrafficKey(trafficSecret []byte) (key, iv, hp []byte)
+	ID() uint16
+	KeyLen() int
 	AEAD(key, nonce []byte) cipher.AEAD
+	Hash() crypto.Hash
+	ExpandLabel(secret []byte, label string, length int) []byte
+	Extract(newSecret, currentSecret []byte) []byte
 }
 
 // CipherSuiteByID is the exported cipherSuiteTLS13ByID for QUIC usage.
@@ -130,21 +132,26 @@ func CipherSuiteByID(id uint16) CipherSuite {
 	return cipherSuiteTLS13ByID(id)
 }
 
-func (c *cipherSuiteTLS13) DeriveSecret(secret []byte, label string) []byte {
-	return c.expandLabel(secret, label, nil, c.hash.Size())
+func (c *cipherSuiteTLS13) ID() uint16 {
+	return c.id
 }
 
-func (c *cipherSuiteTLS13) Extract(newSecret, currentSecret []byte) []byte {
-	return c.extract(newSecret, currentSecret)
-}
-
-func (c *cipherSuiteTLS13) QUICTrafficKey(trafficSecret []byte) (key, iv, hp []byte) {
-	key = c.expandLabel(trafficSecret, "quic key", nil, c.keyLen)
-	iv = c.expandLabel(trafficSecret, "quic iv", nil, aeadNonceLength)
-	hp = c.expandLabel(trafficSecret, "quic hp", nil, c.keyLen)
-	return
+func (c *cipherSuiteTLS13) KeyLen() int {
+	return c.keyLen
 }
 
 func (c *cipherSuiteTLS13) AEAD(key, nonce []byte) cipher.AEAD {
 	return c.aead(key, nonce)
+}
+
+func (c *cipherSuiteTLS13) Hash() crypto.Hash {
+	return c.hash
+}
+
+func (c *cipherSuiteTLS13) ExpandLabel(secret []byte, label string, length int) []byte {
+	return c.expandLabel(secret, label, nil, length)
+}
+
+func (c *cipherSuiteTLS13) Extract(newSecret, currentSecret []byte) []byte {
+	return c.extract(newSecret, currentSecret)
 }

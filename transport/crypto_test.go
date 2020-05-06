@@ -67,10 +67,7 @@ acde6758312622d4fa675b39f728e062 d2bee680d8f41a597c262648bb18bcfc
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead, err := newInitialAEAD(testdata.DecodeHex("8394c8f03e515708"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	aead := newInitialAEAD(testdata.DecodeHex("8394c8f03e515708"))
 	err = aead.client.decryptHeader(b, pnOffset)
 	if err != nil {
 		t.Fatal(err)
@@ -111,10 +108,7 @@ cfc79825df566dc5430b9a045a120013 0100002e00330024001d00209d3c940d
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead, err := newInitialAEAD(testdata.DecodeHex("8394c8f03e515708"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	aead := newInitialAEAD(testdata.DecodeHex("8394c8f03e515708"))
 	err = aead.server.decryptHeader(b, pnOffset)
 	if err != nil {
 		t.Fatal(err)

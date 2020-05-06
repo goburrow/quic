@@ -319,23 +319,27 @@ func (s *tlsHandshake) WriteRecord(level tls13.EncryptionLevel, b []byte) (int, 
 }
 
 func (s *tlsHandshake) SetReadSecret(level tls13.EncryptionLevel, readSecret []byte) error {
-	debug("set read secret level=%d read=%d", level, len(readSecret))
+	suite := s.tlsConn.ConnectionState().CipherSuite
+	debug("set read secret level=%d ciphersuite=0x%x read=%d", level, suite, len(readSecret))
 	space := s.packetNumberSpace(level)
-	cipher := tls13.CipherSuiteByID(s.tlsConn.ConnectionState().CipherSuite)
+	cipher := tls13.CipherSuiteByID(suite)
 	if cipher == nil {
 		return fmt.Errorf("connection not yet handshaked")
 	}
-	return space.opener.init(cipher, readSecret)
+	space.opener.init(cipher, readSecret)
+	return nil
 }
 
 func (s *tlsHandshake) SetWriteSecret(level tls13.EncryptionLevel, writeSecret []byte) error {
-	debug("set write secret level=%d write=%d", level, len(writeSecret))
+	suite := s.tlsConn.ConnectionState().CipherSuite
+	debug("set write secret level=%d ciphersuite=0x%x write=%d", level, suite, len(writeSecret))
 	space := s.packetNumberSpace(level)
-	cipher := tls13.CipherSuiteByID(s.tlsConn.ConnectionState().CipherSuite)
+	cipher := tls13.CipherSuiteByID(suite)
 	if cipher == nil {
 		return fmt.Errorf("connection not yet handshaked")
 	}
-	return space.sealer.init(cipher, writeSecret)
+	space.sealer.init(cipher, writeSecret)
+	return nil
 }
 
 func (s *tlsHandshake) setTransportParams(params *Parameters) {

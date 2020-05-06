@@ -181,10 +181,7 @@ c9be6c7803567321829dd85853396269`
 	}
 	pnSpace := packetNumberSpace{}
 	pnSpace.init()
-	aead, err := newInitialAEAD(p.header.dcid)
-	if err != nil {
-		t.Fatal(err)
-	}
+	aead := newInitialAEAD(p.header.dcid)
 	pnSpace.opener, pnSpace.sealer = aead.client, aead.server
 	payload, n, err := pnSpace.decryptPacket(b, &p)
 	if err != nil {
