@@ -41,14 +41,12 @@ func newError(code uint64, msg string, v ...interface{}) *Error {
 }
 
 var (
-	errFlowControl        = newError(FlowControlError, "FlowControl")
-	errStreamLimit        = newError(StreamLimitError, "StreamLimit")
-	errStreamState        = newError(StreamStateError, "StreamState")
-	errFinalSize          = newError(FinalSizeError, "FinalSize")
-	errInvalidPacket      = newError(FrameEncodingError, "PacketEncoding")
-	errInvalidFrame       = newError(FrameEncodingError, "FrameEncoding")
-	errTransportParameter = newError(TransportParameterError, "TransportParameter")
-	errProtocolViolation  = newError(ProtocolViolation, "ProtocolViolation")
+	errFlowControl       = newError(FlowControlError, "FlowControl")
+	errStreamLimit       = newError(StreamLimitError, "StreamLimit")
+	errFinalSize         = newError(FinalSizeError, "FinalSize")
+	errInvalidPacket     = newError(FrameEncodingError, "PacketEncoding")
+	errInvalidFrame      = newError(FrameEncodingError, "FrameEncoding")
+	errProtocolViolation = newError(ProtocolViolation, "ProtocolViolation")
 
 	errShortBuffer = errors.New("ShortBuffer")
 )

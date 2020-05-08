@@ -194,17 +194,7 @@ func (s *packetHeader) decode(b []byte) (int, error) {
 }
 
 func (s *packetHeader) String() string {
-	var typ packetType
-	if isLongHeader(s.flags) {
-		if s.version == 0 {
-			typ = packetTypeVersionNegotiation
-		} else {
-			typ = packetTypeFromLongHeader(s.flags)
-		}
-	} else {
-		typ = packetTypeShort
-	}
-	return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x", typ, s.version, s.dcid, s.scid)
+	return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x", s.packetType(), s.version, s.dcid, s.scid)
 }
 
 // packetType returns type of the packet basing on header flags.
@@ -212,12 +202,10 @@ func (s *packetHeader) packetType() packetType {
 	if isLongHeader(s.flags) {
 		if s.version == 0 {
 			return packetTypeVersionNegotiation
-		} else {
-			return packetTypeFromLongHeader(s.flags)
 		}
-	} else {
-		return packetTypeShort
+		return packetTypeFromLongHeader(s.flags)
 	}
+	return packetTypeShort
 }
 
 // packet is an internal structure for all QUIC packet types.

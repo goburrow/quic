@@ -98,9 +98,9 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 	return s, nil
 }
 
+// Write consumes received data.
 func (s *Conn) Write(b []byte) (int, error) {
 	now := s.time()
-	s.resetEvents()
 	n := 0
 	for n < len(b) {
 		if !s.drainingTimer.IsZero() || s.closeFrame != nil {
@@ -278,14 +278,8 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 		return 0, err
 	}
 
-	// Process ACK'd frames
-	s.recovery.drainAcked(space, func(f frame) {
-		switch f := f.(type) {
-		case *ackFrame:
-			// Stop sending ack for packets when receiving is confirmed
-			pnSpace.recvPacketNeedAck.removeUntil(f.largestAck)
-		}
-	})
+	// Process acked frames
+	s.processAckedPackets(space)
 
 	// Mark this packet received
 	pnSpace.onPacketReceived(p.packetNumber, now)
@@ -383,6 +377,7 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 	}
 	ackDelay := time.Duration((1<<s.peerParams.AckDelayExponent)*f.ackDelay) * time.Microsecond
 	s.recovery.onAckReceived(ranges, ackDelay, space, now)
+
 	if !s.packetNumberSpaces[space].firstPacketAcked {
 		s.packetNumberSpaces[space].firstPacketAcked = true
 		// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-handshake-confirmed
@@ -405,8 +400,11 @@ func (s *Conn) recvFrameResetStream(b []byte) (int, error) {
 		return 0, err
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
-	if !isStreamBidi(f.streamID) && isStreamLocal(f.streamID, s.isClient) {
-		return 0, errStreamState
+	local := isStreamLocal(f.streamID, s.isClient)
+	bidi := isStreamBidi(f.streamID)
+	if local && !bidi {
+		debug("peer attempted to reset our receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
+		return 0, newError(StreamStateError, "ResetStreamFrame: invalid stream id: %d", f.streamID)
 	}
 	st, err := s.getOrCreateStream(f.streamID, false)
 	if err != nil {
@@ -416,7 +414,7 @@ func (s *Conn) recvFrameResetStream(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	s.addEvent(&ResetStreamEvent{
+	s.addEvent(StreamResetEvent{
 		StreamID:  f.streamID,
 		ErrorCode: f.errorCode,
 	})
@@ -431,10 +429,13 @@ func (s *Conn) recvFrameStopSending(b []byte) (int, error) {
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
 	// STOP_SENDING on a receive-only stream is a fatal error.
-	if !isStreamBidi(f.streamID) && !isStreamLocal(f.streamID, s.isClient) {
-		return 0, errStreamState
+	local := isStreamLocal(f.streamID, s.isClient)
+	bidi := isStreamBidi(f.streamID)
+	if !local && !bidi {
+		debug("peer attempted to stop sending their receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
+		return 0, newError(StreamStateError, "StopSendingFrame: invalid stream id: %d", f.streamID)
 	}
-	s.addEvent(&StopSendingEvent{
+	s.addEvent(StreamStopEvent{
 		StreamID:  f.streamID,
 		ErrorCode: f.errorCode,
 	})
@@ -475,8 +476,11 @@ func (s *Conn) recvFrameStream(b []byte) (int, error) {
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
 	// Peer can't send on our unidirectional streams.
-	if isStreamLocal(f.streamID, s.isClient) && !isStreamBidi(f.streamID) {
-		return 0, errStreamState
+	local := isStreamLocal(f.streamID, s.isClient)
+	bidi := isStreamBidi(f.streamID)
+	if local && !bidi {
+		debug("peer attempted to sent to our stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
+		return 0, newError(StreamStateError, "StreamFrame: invalid stream id: %d", f.streamID)
 	}
 	if !s.flow.canRecv(len(f.data)) {
 		return 0, errFlowControl
@@ -488,7 +492,9 @@ func (s *Conn) recvFrameStream(b []byte) (int, error) {
 	st.recv.push(f.data, f.offset, f.fin)
 	debug("stream %d received %v", f.streamID, &st.recv)
 	s.flow.addRecv(len(f.data))
-	s.addEvent(&StreamEvent{StreamID: f.streamID})
+	s.addEvent(StreamRecvEvent{
+		StreamID: f.streamID,
+	})
 	return n, nil
 }
 
@@ -580,6 +586,20 @@ func (s *Conn) recvFrameHandshakeDone(b []byte) (int, error) {
 	return n, nil
 }
 
+// processAckedPackets is called when the connection got an ACK frame.
+func (s *Conn) processAckedPackets(space packetSpace) {
+	s.recovery.drainAcked(space, func(f frame) {
+		pnSpace := &s.packetNumberSpaces[space]
+		switch f := f.(type) {
+		case *ackFrame:
+			// Stop sending ack for packets when receiving is confirmed
+			pnSpace.recvPacketNeedAck.removeUntil(f.largestAck)
+		case *streamFrame:
+			// TODO: Ack Stream frame and send event Send Stream Complete
+		}
+	})
+}
+
 func (s *Conn) doHandshake() error {
 	if s.state >= stateEstablished {
 		return nil
@@ -591,8 +611,8 @@ func (s *Conn) doHandshake() error {
 	if s.handshake.HandshakeComplete() {
 		params := s.handshake.peerTransportParams()
 		debug("handshaked peer transport params: %+v", params)
-		if !s.validatePeerTransportParams(params) {
-			return errTransportParameter
+		if err := s.validatePeerTransportParams(params); err != nil {
+			return err
 		}
 		s.flow.setMaxSend(params.InitialMaxData)
 		s.streams.setPeerMaxStreamsBidi(params.InitialMaxStreamsBidi)
@@ -605,27 +625,28 @@ func (s *Conn) doHandshake() error {
 	return nil
 }
 
-func (s *Conn) validatePeerTransportParams(p *Parameters) bool {
+func (s *Conn) validatePeerTransportParams(p *Parameters) error {
 	if p == nil {
-		return false
+		return newError(TransportParameterError, "TransportParameter must present")
 	}
 	if s.isClient {
 		if !bytes.Equal(p.OriginalCID, s.odcid) {
-			return false
+			return newError(TransportParameterError, "TransportParameter: original cid mismatched")
 		}
 	} else {
 		// Original CID and Stateless reset token must not be sent by client
 		if len(p.OriginalCID) > 0 {
-			return false
+			return newError(TransportParameterError, "TransportParameter: original cid must not present")
 		}
 		// Stateless reset token
 		if len(p.StatelessResetToken) > 0 {
-			return false
+			return newError(TransportParameterError, "TransportParameter: reset token must not present")
 		}
 	}
-	return true
+	return nil
 }
 
+// Read produces data for sending to the client.
 func (s *Conn) Read(b []byte) (int, error) {
 	now := s.time()
 	if !s.drainingTimer.IsZero() {
@@ -943,22 +964,24 @@ func (s *Conn) IsClosed() bool {
 	return s.state == stateClosed
 }
 
-// Events returns received events. The returned list only valid until next receive (calling Write).
-func (s *Conn) Events() []interface{} {
-	return s.events
-}
-
-func (s *Conn) resetEvents() {
+// Events consumes received events. It appends to provided events slice
+// and clear received events.
+func (s *Conn) Events(events []interface{}) []interface{} {
+	events = append(events, s.events...)
 	for i := range s.events {
 		s.events[i] = nil
 	}
 	s.events = s.events[:0]
+	return events
 }
 
-// Stream returned opened stream or nil if not created.
+// Stream returned opened stream or nil if it cannot be created.
+// Client-initiated streams have even-numbered stream IDs and
+// server-initiated streams have odd-numbered stream IDs.
 func (s *Conn) Stream(id uint64) *Stream {
 	st, err := s.getOrCreateStream(id, s.isClient)
 	if err != nil {
+		debug("get stream error: %v", err)
 		return nil
 	}
 	return st
@@ -1021,6 +1044,7 @@ func (s *Conn) sendFrameMaxData() *maxDataFrame {
 }
 
 func (s *Conn) sendFrameHandshakeDone() *handshakeDoneFrame {
+	// HandshakeDone is sent only by server.
 	if s.isClient || s.state != stateEstablished || s.handshakeConfirmed {
 		return nil
 	}
@@ -1032,6 +1056,7 @@ func (s *Conn) lostFrameStream(f *streamFrame) {
 	if st == nil {
 		return
 	}
+	// Push data back to send again
 	err := st.send.push(f.data, f.offset, f.fin)
 	if err != nil {
 		debug("process lost stream frame %s: %v", f, err)
@@ -1053,7 +1078,7 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 	}
 	// Initialize new stream
 	if local != isStreamLocal(id, s.isClient) {
-		return nil, errStreamState
+		return nil, newError(StreamStateError, "invalid type of stream id: %d", id)
 	}
 	bidi := isStreamBidi(id)
 	st = s.streams.create(id, local, bidi)

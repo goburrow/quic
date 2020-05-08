@@ -3,7 +3,6 @@ package transport
 import (
 	"bytes"
 	"testing"
-	"time"
 
 	"github.com/goburrow/quic/testdata"
 )
@@ -165,60 +164,6 @@ a1359d8e`)
 		}
 		if !verifyRetryIntegrity(retryPacket, odcid) {
 			b.Fatal("verify retry integrity failed")
-		}
-	}
-}
-
-func TestAddressValidator(t *testing.T) {
-	addr1 := []byte("1.2.3.4:90")
-	addr2 := []byte("5.6.7.8:90")
-	odcid := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 0}
-	s, err := NewAddressValidator()
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	s.timeFn = func() time.Time {
-		return now
-	}
-	token := s.Generate(addr1, odcid)
-	t.Logf("token: %d %x", len(token), token)
-	cid := s.Validate(addr1, token)
-	if !bytes.Equal(odcid, cid) {
-		t.Fatalf("expect cid: %x\nactual: %x", odcid, cid)
-	}
-	// Still valid
-	now = now.Add(10 * time.Second)
-	cid = s.Validate(addr1, token)
-	if !bytes.Equal(odcid, cid) {
-		t.Fatalf("expect cid: %x\nactual: %x", odcid, cid)
-	}
-	// Wrong address
-	cid = s.Validate(addr2, token)
-	if cid != nil {
-		t.Fatalf("expect cid: <nil>\nactual: %x", cid)
-	}
-	// Expired
-	now = now.Add(1 * time.Second)
-	cid = s.Validate(addr2, token)
-	if cid != nil {
-		t.Fatalf("expect cid: <nil>\nactual: %x", cid)
-	}
-}
-
-func BenchmarkAddressValidator(b *testing.B) {
-	addr := []byte("10.0.0.1:7890")
-	odcid := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6}
-	s, err := NewAddressValidator()
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		token := s.Generate(addr, odcid)
-		cid := s.Validate(addr, token)
-		if cid == nil {
-			b.Fatal("invalid token")
 		}
 	}
 }

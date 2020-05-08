@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
-	"time"
 
 	"github.com/goburrow/quic/tls13"
 	"golang.org/x/crypto/chacha20"
@@ -270,6 +268,7 @@ var retryIntegrityAEAD cipher.AEAD
 
 func newRetryIntegrityAEAD() cipher.AEAD {
 	if retryIntegrityAEAD == nil {
+		// XXX: Need sync.Once?
 		var retryIntegrityKey = []byte{
 			0x4d, 0x32, 0xec, 0xdb, 0x2a, 0x21, 0x33, 0xc8,
 			0x41, 0xe4, 0x04, 0x3d, 0xf2, 0x7d, 0x44, 0x30,
@@ -316,66 +315,4 @@ func verifyRetryIntegrity(b, odcid []byte) bool {
 	inTag := b[len(b)-retryIntegrityTagLen:]
 	outTag := out[len(out)-retryIntegrityTagLen:]
 	return bytes.Equal(inTag, outTag)
-}
-
-// AddressValidator is a simple implementation for client address validation.
-// It encrypts client original CID using AES-GSM AEAD with a randomly-generated key.
-type AddressValidator struct {
-	aead   cipher.AEAD
-	timeFn func() time.Time
-}
-
-// NewAddressValidator creates a new AddressValidator or returns error when failed to
-// generate secret or AEAD.
-func NewAddressValidator() (*AddressValidator, error) {
-	var key [16]byte
-	_, err := rand.Read(key[:])
-	if err != nil {
-		return nil, err
-	}
-	blk, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(blk)
-	if err != nil {
-		return nil, err
-	}
-	return &AddressValidator{
-		aead:   aead,
-		timeFn: time.Now,
-	}, nil
-}
-
-// Generate encrypts odcid using current time as nonce and addr as additional data.
-func (s *AddressValidator) Generate(addr, odcid []byte) []byte {
-	now := s.timeFn().Unix()
-	nonce := make([]byte, s.aead.NonceSize())
-	binary.BigEndian.PutUint32(nonce, uint32(now))
-
-	token := make([]byte, 4+len(odcid)+s.aead.Overhead())
-	binary.BigEndian.PutUint32(token, uint32(now))
-	s.aead.Seal(token[4:4], nonce, odcid, addr)
-	return token
-}
-
-// Validate decrypts token and returns odcid.
-func (s *AddressValidator) Validate(addr, token []byte) []byte {
-	if len(token) < 4 {
-		return nil
-	}
-	const validity = 10 // Second
-	now := s.timeFn().Unix()
-	issued := int64(binary.BigEndian.Uint32(token))
-	if issued < now-validity || issued > now {
-		// TODO: Fix overflow when time > MAX_U32
-		return nil
-	}
-	nonce := make([]byte, s.aead.NonceSize())
-	copy(nonce, token[:4])
-	odcid, err := s.aead.Open(nil, nonce, token[4:], addr)
-	if err != nil {
-		return nil
-	}
-	return odcid
 }

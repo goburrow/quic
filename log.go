@@ -11,6 +11,7 @@ const (
 	LevelError
 	LevelInfo
 	LevelDebug
+	LevelTrace
 )
 
 // Logger logs QUIC transactions.

@@ -44,6 +44,13 @@ func NewConfig() *Config {
 			MaxIdleTimeout:   60 * time.Second,
 			AckDelayExponent: 3,
 			MaxAckDelay:      25 * time.Millisecond,
+
+			InitialMaxData:                 1024,
+			InitialMaxStreamDataBidiLocal:  1024,
+			InitialMaxStreamDataBidiRemote: 1024,
+			InitialMaxStreamDataUni:        1024,
+			InitialMaxStreamsBidi:          1,
+			InitialMaxStreamsUni:           1,
 		},
 	}
 }

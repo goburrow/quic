@@ -146,3 +146,34 @@ func TestHandshake(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkConnEvents(b *testing.B) {
+	config := NewConfig()
+	conn, err := Connect([]byte{1, 2, 3, 4}, config)
+	if err != nil {
+		b.Fatal(err)
+	}
+	events := make([]interface{}, 0, 2)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		conn.addEvent(StreamRecvEvent{
+			StreamID: uint64(i),
+		})
+		conn.addEvent(&StreamRecvEvent{
+			StreamID: uint64(i),
+		})
+		events = conn.Events(events)
+		if len(events) != 2 {
+			b.Fatalf("expect %d events. got %d", 2, len(events))
+		}
+		for _, e := range events {
+			switch e := e.(type) {
+			case StreamRecvEvent:
+				_ = e
+			case *StreamRecvEvent:
+				_ = e
+			}
+		}
+		events = events[:0]
+	}
+}
