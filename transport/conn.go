@@ -588,14 +588,25 @@ func (s *Conn) recvFrameHandshakeDone(b []byte) (int, error) {
 
 // processAckedPackets is called when the connection got an ACK frame.
 func (s *Conn) processAckedPackets(space packetSpace) {
+	pnSpace := &s.packetNumberSpaces[space]
 	s.recovery.drainAcked(space, func(f frame) {
-		pnSpace := &s.packetNumberSpaces[space]
 		switch f := f.(type) {
 		case *ackFrame:
 			// Stop sending ack for packets when receiving is confirmed
 			pnSpace.recvPacketNeedAck.removeUntil(f.largestAck)
+		case *cryptoFrame:
+			pnSpace.cryptoStream.send.ack(f.offset, uint64(len(f.data)))
 		case *streamFrame:
-			// TODO: Ack Stream frame and send event Send Stream Complete
+			st := s.streams.get(f.streamID)
+			if st != nil {
+				st.send.ack(f.offset, uint64(len(f.data)))
+				if st.send.complete() {
+					s.addEvent(StreamComplete{
+						StreamID: f.streamID,
+					})
+					// TODO: Garbage collect the stream
+				}
+			}
 		}
 	})
 }
@@ -802,15 +813,27 @@ func (s *Conn) maxPacketSize() int {
 }
 
 func (s *Conn) processLostPackets(space packetSpace) {
+	pnSpace := &s.packetNumberSpaces[space]
 	s.recovery.drainLost(space, func(f frame) {
 		debug("lost frame %v", f)
 		switch f := f.(type) {
 		case *ackFrame:
-			s.packetNumberSpaces[space].ackElicited = true
+			pnSpace.ackElicited = true
 		case *cryptoFrame:
-			s.packetNumberSpaces[space].cryptoStream.send.push(f.data, f.offset, false)
+			// Push data back to send again
+			err := pnSpace.cryptoStream.send.push(f.data, f.offset, false)
+			if err != nil {
+				debug("process lost crypto frame %s: %v", f, err)
+			}
 		case *streamFrame:
-			s.lostFrameStream(f)
+			st := s.streams.get(f.streamID)
+			if st != nil {
+				// Push data back to send again
+				err := st.send.push(f.data, f.offset, f.fin)
+				if err != nil {
+					debug("process lost stream frame %s: %v", f, err)
+				}
+			}
 		case *handshakeDoneFrame:
 			s.handshakeConfirmed = false
 		}
@@ -975,16 +998,11 @@ func (s *Conn) Events(events []interface{}) []interface{} {
 	return events
 }
 
-// Stream returned opened stream or nil if it cannot be created.
+// Stream returns an openned stream or create a local stream if it does not exist.
 // Client-initiated streams have even-numbered stream IDs and
 // server-initiated streams have odd-numbered stream IDs.
-func (s *Conn) Stream(id uint64) *Stream {
-	st, err := s.getOrCreateStream(id, s.isClient)
-	if err != nil {
-		debug("get stream error: %v", err)
-		return nil
-	}
-	return st
+func (s *Conn) Stream(id uint64) (*Stream, error) {
+	return s.getOrCreateStream(id, s.isClient)
 }
 
 func (s *Conn) sendFrameAck(pnSpace *packetNumberSpace, now time.Time) *ackFrame {
@@ -1051,20 +1069,6 @@ func (s *Conn) sendFrameHandshakeDone() *handshakeDoneFrame {
 	return &handshakeDoneFrame{}
 }
 
-func (s *Conn) lostFrameStream(f *streamFrame) {
-	st := s.streams.get(f.streamID)
-	if st == nil {
-		return
-	}
-	// Push data back to send again
-	err := st.send.push(f.data, f.offset, f.fin)
-	if err != nil {
-		debug("process lost stream frame %s: %v", f, err)
-		// FIXME
-		panic(err)
-	}
-}
-
 func (s *Conn) setDraining(now time.Time) {
 	if s.drainingTimer.IsZero() {
 		s.drainingTimer = now.Add(s.recovery.probeTimeout() * 3)
@@ -1078,12 +1082,12 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 	}
 	// Initialize new stream
 	if local != isStreamLocal(id, s.isClient) {
-		return nil, newError(StreamStateError, "invalid type of stream id: %d", id)
+		return nil, newError(StreamStateError, "invalid type of stream %d", id)
 	}
 	bidi := isStreamBidi(id)
-	st = s.streams.create(id, local, bidi)
-	if st == nil {
-		return nil, errStreamLimit
+	st, err := s.streams.create(id, local, bidi)
+	if err != nil {
+		return nil, err
 	}
 	var maxRecv, maxSend uint64
 	if local {

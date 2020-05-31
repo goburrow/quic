@@ -5,111 +5,150 @@ import (
 	"fmt"
 )
 
+// numberRange is an inclusive range.
 type numberRange struct {
 	start uint64
 	end   uint64
 }
 
-// rangeSet is sorted ranges in descending order
+// rangeSet is sorted ranges in ascending order.
 type rangeSet []numberRange
 
 func (s rangeSet) largest() uint64 {
 	if len(s) > 0 {
-		return s[0].end
+		return s[len(s)-1].end
 	}
 	return 0
 }
 
 func (s rangeSet) contains(n uint64) bool {
-	for _, r := range s {
-		if n > r.end {
-			return false
-		}
-		if n >= r.start {
+	left := 0
+	right := len(s)
+	for left < right {
+		mid := left + (right-left)/2
+		r := s[mid]
+		if n < r.start {
+			right = mid
+		} else if n <= r.end {
 			return true
+		} else {
+			left = mid + 1
 		}
 	}
 	return false
 }
 
-func (s *rangeSet) push(n uint64) {
-	ls := *s
-	for i := range ls {
-		r := &ls[i]
-		if n > r.end {
-			if n == r.end+1 {
-				// Extend current range
-				r.end = n
-				if i > 0 {
-					prev := &ls[i-1]
-					if prev.start == r.end+1 {
-						// Merge two ranges
-						prev.start = r.start
-						s.remove(i)
-					}
-				}
-			} else {
-				// Insert new range
-				s.insert(i, &numberRange{start: n, end: n})
-			}
-			return
-		}
-		if n >= r.start {
-			return
-		}
-	}
-	if len(ls) > 0 {
-		prev := &ls[len(ls)-1]
-		if prev.start == n+1 {
-			prev.start = n
-			return
-		}
-	}
-	*s = append(*s, numberRange{start: n, end: n})
+// equals returns true only when range is continuous from start to end.
+func (s rangeSet) equals(start, end uint64) bool {
+	return len(s) == 1 && s[0].start == start && s[0].end == end
 }
 
-func (s *rangeSet) insert(idx int, r *numberRange) {
+// push adds new range [start, end].
+func (s *rangeSet) push(start, end uint64) {
+	if end < start {
+		panic("invalid number range")
+	}
+	ls := *s
+	idx := ls.insertPos(start)
+	if idx < len(ls) {
+		r := ls[idx]
+		if r.start <= start && end <= r.end {
+			// [....]
+			//  [..]
+			return
+		}
+		if start > r.start {
+			// [..]
+			//   [..]
+			start = r.start
+		}
+	}
+	if idx > 0 && ls[idx-1].end+1 == start {
+		// New range is usually continous, can just extend the range
+		// [1..2][3..4] => [1..4]
+		idx--
+		ls[idx].end = end
+	} else {
+		s.insert(idx, numberRange{start: start, end: end})
+		ls = *s
+	}
+	// Check if the new range can be merged with the following ranges
+	cur := &(*s)[idx]
+	k := -1
+	for i := idx + 1; i < len(ls); i++ {
+		if cur.end+1 < ls[i].start {
+			break
+		}
+		k = i
+	}
+	if k > idx {
+		if cur.end <= ls[k].end {
+			cur.end = ls[k].end
+		}
+		// Remove ranges from idx+1 until k
+		copy(ls[idx+1:], ls[k+1:])
+		*s = ls[:len(ls)-(k-idx)]
+	}
+}
+
+// insertPos returns the highest position i where s[i-1].end <= n.
+func (s rangeSet) insertPos(n uint64) int {
+	left := 0
+	right := len(s)
+	for left < right {
+		mid := left + (right-left)/2
+		r := s[mid]
+		if n < r.start {
+			right = mid
+		} else if n <= r.end {
+			return mid
+		} else {
+			left = mid + 1
+		}
+	}
+	return left
+}
+
+func (s *rangeSet) insert(idx int, r numberRange) {
 	ls := append(*s, numberRange{})
 	copy(ls[idx+1:], ls[idx:])
-	ls[idx] = *r
+	ls[idx] = r
 	*s = ls
 }
 
-func (s *rangeSet) remove(idx int) {
-	ls := *s
-	copy(ls[idx:], ls[idx+1:])
-	*s = ls[:len(ls)-1]
-}
-
+// removeUntil removes all numbers less than or equal to v.
 func (s *rangeSet) removeUntil(v uint64) {
 	ls := *s
-	idx := -1 // Index to remove
-	for i := range ls {
-		r := &ls[i]
-		if r.end <= v {
-			idx = i // Remove current range
-			break
-		}
-		if r.start <= v {
+	// Find starting range to keep
+	idx := ls.insertPos(v)
+	if idx < len(ls) {
+		r := &ls[idx]
+		if v < r.start {
+			// Keep this range
+		} else if v < r.end {
+			// Narrow this range
 			r.start = v + 1
-			idx = i + 1 // Remove next range
-			break
+		} else {
+			// Delete this range
+			idx++
 		}
 	}
-	if idx >= 0 {
-		*s = ls[:idx]
+	if idx > 0 {
+		copy(ls, ls[idx:])
+		*s = ls[:len(ls)-idx]
 	}
 }
 
 func (s rangeSet) String() string {
 	buf := bytes.Buffer{}
-	fmt.Fprintf(&buf, "size=%d", len(s))
-	for i, r := range s {
-		fmt.Fprintf(&buf, " %d:[%d,%d]", i, r.end, r.start)
+	fmt.Fprintf(&buf, "ranges=%d", len(s))
+	for _, r := range s {
+		fmt.Fprintf(&buf, " [%d,%d]", r.start, r.end)
 	}
 	return buf.String()
 }
 
+// rangeBuffer represents a fragment of data at an offset.
 type rangeBuffer struct {
 	data   []byte
 	offset uint64
@@ -132,7 +171,7 @@ func newRangeBuffer(data []byte, offset uint64) *rangeBuffer {
 	}
 }
 
-// rangeBufferList is a sorted list.
+// rangeBufferList is a sorted list of data buffer by offset.
 type rangeBufferList []rangeBuffer
 
 func (s *rangeBufferList) write(data []byte, offset uint64) {
@@ -283,9 +322,9 @@ func (s rangeBufferList) insertPos(offset uint64) int {
 
 func (s rangeBufferList) String() string {
 	buf := bytes.Buffer{}
-	fmt.Fprintf(&buf, "size=%d", len(s))
-	for i, b := range s {
-		fmt.Fprintf(&buf, " %d:%s", i, &b)
+	fmt.Fprintf(&buf, "ranges=%d", len(s))
+	for _, b := range s {
+		fmt.Fprintf(&buf, " %s", &b)
 	}
 	return buf.String()
 }

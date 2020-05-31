@@ -5,6 +5,7 @@ import (
 	"io"
 )
 
+// Stream is bidirection data stream.
 type Stream struct {
 	recv recvStream
 	send sendStream
@@ -34,6 +35,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 	return s.send.Write(b)
 }
 
+// Close sets end of the sending stream.
 func (s *Stream) Close() error {
 	s.send.fin = true
 	return nil
@@ -124,7 +126,8 @@ func (s *recvStream) String() string {
 }
 
 type sendStream struct {
-	buf rangeBufferList // Chunks of data to be sent, ordered by offset
+	buf   rangeBufferList // Chunks of data to be sent, ordered by offset
+	acked rangeSet        // receive confirmed
 
 	maxData uint64 // maximum data allowed to send
 	offset  uint64 // read offset
@@ -194,6 +197,16 @@ func (s *sendStream) String() string {
 	return fmt.Sprintf("offset=%d length=%d max=%d", s.offset, s.length, s.maxData)
 }
 
+// ack acknowleges stream data received.
+func (s *sendStream) ack(offset, length uint64) {
+	s.acked.push(offset, offset+length)
+}
+
+// complete returns true if all data in the stream has been sent.
+func (s *sendStream) complete() bool {
+	return s.fin && s.offset >= s.length && s.acked.equals(0, s.length)
+}
+
 /// streamMap keeps track of QUIC streams and enforces stream limits.
 type streamMap struct {
 	// Streams indexed by stream ID
@@ -225,36 +238,36 @@ func (s *streamMap) get(id uint64) *Stream {
 	return s.streams[id]
 }
 
-// create adds and returns new stream or nil if it exceeds limits.
-func (s *streamMap) create(id uint64, local, bidi bool) *Stream {
+// create adds and returns new stream or error if it exceeds limits.
+func (s *streamMap) create(id uint64, local, bidi bool) (*Stream, error) {
 	if local {
 		if bidi {
 			if s.openedStreams.localBidi >= s.maxStreams.peerBidi {
-				return nil
+				return nil, newError(StreamLimitError, "local bidi streams exceeded %d", s.maxStreams.peerBidi)
 			}
 			s.openedStreams.localBidi++
 		} else {
 			if s.openedStreams.localUni >= s.maxStreams.peerUni {
-				return nil
+				return nil, newError(StreamLimitError, "local uni streams exceeded %d", s.maxStreams.peerUni)
 			}
 			s.openedStreams.localUni++
 		}
 	} else {
 		if bidi {
 			if s.openedStreams.peerBidi >= s.maxStreams.localBidi {
-				return nil
+				return nil, newError(StreamLimitError, "remote bidi streams exceeded %d", s.maxStreams.localBidi)
 			}
 			s.openedStreams.peerBidi++
 		} else {
 			if s.openedStreams.peerUni >= s.maxStreams.localUni {
-				return nil
+				return nil, newError(StreamLimitError, "remote uni streams exceeded %d", s.maxStreams.localUni)
 			}
 			s.openedStreams.peerUni++
 		}
 	}
 	st := &Stream{}
 	s.streams[id] = st
-	return st
+	return st, nil
 }
 
 func (s *streamMap) setPeerMaxStreamsBidi(v uint64) {

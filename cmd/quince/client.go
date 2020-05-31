@@ -56,10 +56,12 @@ func (s *clientHandler) Serve(c quic.Conn, events []interface{}) {
 			st.Close()
 		case transport.StreamRecvEvent:
 			st := c.Stream(e.StreamID)
-			buf := make([]byte, 512)
-			n, _ := st.Read(buf)
-			log.Printf("stream %d received: %s", e.StreamID, buf[:n])
-			c.Close()
+			if st != nil {
+				buf := make([]byte, 512)
+				n, _ := st.Read(buf)
+				log.Printf("stream %d received: %s", e.StreamID, buf[:n])
+				c.Close()
+			}
 		case quic.ConnCloseEvent:
 			s.wg.Done()
 		}

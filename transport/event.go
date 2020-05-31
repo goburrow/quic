@@ -16,3 +16,8 @@ type StreamResetEvent struct {
 	StreamID  uint64
 	ErrorCode uint64
 }
+
+// StreamComplete is an event where all data of the stream has been acked by peer.
+type StreamComplete struct {
+	StreamID uint64
+}

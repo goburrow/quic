@@ -255,42 +255,41 @@ func (s *ackFrame) toRangeSet() rangeSet {
 	if s.largestAck < s.firstAckRange {
 		return nil
 	}
+	n := len(s.ackRanges)
+	ranges := make(rangeSet, n+1)
 	smallest := s.largestAck - s.firstAckRange
-	ranges := make(rangeSet, 0, 1+len(s.ackRanges))
-	ranges = append(ranges, numberRange{end: s.largestAck, start: smallest})
-	if len(s.ackRanges) > 0 {
-		for _, r := range s.ackRanges {
-			if smallest < r.gap+2 {
-				return nil
-			}
-			smallest -= r.gap + 2
-			if smallest < r.ackRange {
-				return nil
-			}
-			ranges = append(ranges, numberRange{end: smallest, start: smallest - r.ackRange})
-			smallest -= r.ackRange
+	ranges[n] = numberRange{start: smallest, end: s.largestAck}
+	for i, r := range s.ackRanges {
+		if smallest < r.gap+2 {
+			return nil
 		}
+		smallest -= r.gap + 2
+		if smallest < r.ackRange {
+			return nil
+		}
+		ranges[n-i-1] = numberRange{start: smallest - r.ackRange, end: smallest}
+		smallest -= r.ackRange
 	}
-	return rangeSet(ranges)
+	return ranges
 }
 
 func (s *ackFrame) fromRangeSet(ranges rangeSet) {
-	var smallest uint64
-	if len(ranges) > 1 {
-		s.ackRanges = make([]ackRange, len(ranges)-1)
-	} else {
-		s.ackRanges = nil
+	n := len(ranges)
+	if n == 0 {
+		return
 	}
-	for i, r := range ranges {
-		if i == 0 {
-			s.largestAck = r.end
-			s.firstAckRange = r.end - r.start
-			smallest = r.start
-		} else {
+	r := ranges[n-1]
+	s.largestAck = r.end
+	s.firstAckRange = r.end - r.start
+	if n > 1 {
+		s.ackRanges = make([]ackRange, n-1)
+		smallest := r.start
+		for i := n - 2; i >= 0; i-- {
+			r = ranges[i]
 			if smallest-1 <= r.end || r.start > r.end {
 				panic(fmt.Sprintf("invalid range set: %s", ranges))
 			}
-			s.ackRanges[i-1] = ackRange{
+			s.ackRanges[n-i-2] = ackRange{
 				gap:      smallest - r.end - 2,
 				ackRange: r.end - r.start,
 			}

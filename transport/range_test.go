@@ -8,41 +8,59 @@ import (
 
 func TestRangeSetPush(t *testing.T) {
 	x := rangeSetTest{t: t}
-	x.ls.push(20)
-	x.assertSnapshot("size=1 0:[20,20]")
-	x.ls.push(21)
-	x.assertSnapshot("size=1 0:[21,20]")
-	x.ls.push(19)
-	x.assertSnapshot("size=1 0:[21,19]")
-	x.ls.push(22)
-	x.assertSnapshot("size=1 0:[22,19]")
+	data := []struct {
+		m, n uint64
+		s    string
+	}{
+		{20, 20, "ranges=1 [20,20]"},
+		{21, 21, "ranges=1 [20,21]"},                 // Extend UB
+		{19, 19, "ranges=1 [19,21]"},                 // Extend LB
+		{21, 22, "ranges=1 [19,22]"},                 // Extend UB with overlap
+		{24, 24, "ranges=2 [19,22] [24,24]"},         // Add UB with gap
+		{17, 17, "ranges=3 [17,17] [19,22] [24,24]"}, // Add LB with gap
+		{25, 27, "ranges=3 [17,17] [19,22] [24,27]"}, // Extend single UB
+		{15, 17, "ranges=3 [15,17] [19,22] [24,27]"}, // Extend single LB
+		{16, 16, "ranges=3 [15,17] [19,22] [24,27]"}, // Overlap LB
+		{19, 21, "ranges=3 [15,17] [19,22] [24,27]"}, // Overlap
+		{24, 24, "ranges=3 [15,17] [19,22] [24,27]"}, // Overlap UB
+		{17, 18, "ranges=2 [15,22] [24,27]"},         // Join range
+		{29, 30, "ranges=3 [15,22] [24,27] [29,30]"},
+		{23, 28, "ranges=1 [15,30]"}, // Join two ranges
+	}
+	for _, d := range data {
+		x.ls.push(d.m, d.n)
+		x.assertSnapshot(d.s)
+	}
 }
 
 func TestRangeSetRemoveUntil(t *testing.T) {
-	x := rangeSetTest{
-		t: t,
-		ls: rangeSet{
-			{start: 12, end: 24},
-			{start: 0, end: 10},
-		},
+	x := rangeSetTest{t: t}
+	x.ls.push(0, 10)
+	x.ls.push(12, 24)
+	data := []struct {
+		n uint64
+		s string
+	}{
+		{0, "ranges=2 [1,10] [12,24]"},
+		{9, "ranges=2 [10,10] [12,24]"},
+		{10, "ranges=1 [12,24]"},
+		{24, "ranges=0"},
 	}
-	x.ls.removeUntil(0)
-	x.assertSnapshot("size=2 0:[24,12] 1:[10,1]")
-	x.ls.removeUntil(9)
-	x.assertSnapshot("size=2 0:[24,12] 1:[10,10]")
-	x.ls.removeUntil(10)
-	x.assertSnapshot("size=1 0:[24,12]")
-	x.ls.removeUntil(24)
-	x.assertSnapshot("size=0")
+	for _, d := range data {
+		x.ls.removeUntil(d.n)
+		x.assertSnapshot(d.s)
+	}
 }
 
 func TestRangeSetRandom(t *testing.T) {
 	x := rangeSetTest{t: t}
 	n := rand.Intn(1000)
 	for i := 0; i < n; i++ {
-		x.ls.push(uint64(rand.Intn(100)))
+		start := uint64(rand.Intn(100))
+		end := start + uint64(rand.Intn(50))
+		x.ls.push(start, end)
 		x.assertOrderedAndNoOverlap()
-		x.ls.removeUntil(uint64(rand.Intn(100)))
+		x.ls.removeUntil(uint64(rand.Intn(200)))
 		x.assertOrderedAndNoOverlap()
 	}
 }
@@ -55,26 +73,23 @@ type rangeSetTest struct {
 func (t *rangeSetTest) assertOrderedAndNoOverlap() {
 	for i, r := range t.ls {
 		if r.start > r.end {
+			t.t.Helper()
 			t.t.Fatalf("list is not sorted\nactual: %+v", &t.ls)
 		}
 		if i > 0 {
 			prev := t.ls[i-1]
-			if prev.start <= r.end {
+			if prev.end >= r.start {
+				t.t.Helper()
 				t.t.Fatalf("list is not sorted\nactual: %+v", &t.ls)
 			}
 		}
 	}
 }
 
-func (t *rangeSetTest) assertSize(expect int) {
-	if len(t.ls) != expect {
-		t.t.Fatalf("size does not match:\nexpect: %d\nactual: %+v", expect, t.ls)
-	}
-}
-
 func (t *rangeSetTest) assertSnapshot(expect string) {
 	actual := t.ls.String()
 	if actual != expect {
+		t.t.Helper()
 		t.t.Fatalf("snapshot does not match:\nexpect: %s\nactual: %s", expect, actual)
 	}
 }
@@ -98,13 +113,13 @@ func TestRangeBufferWriteNoOverlap(t *testing.T) {
 	data := makeData(15)
 	x := rangeBufferListTest{t: t}
 	x.ls.write(data[10:15], 10)
-	x.assertSnapshot("size=1 0:[10,15)")
+	x.assertSnapshot("ranges=1 [10,15)")
 	x.ls.write(data[0:4], 0)
-	x.assertSnapshot("size=2 0:[0,4) 1:[10,15)")
+	x.assertSnapshot("ranges=2 [0,4) [10,15)")
 	x.ls.write(data[7:10], 7)
-	x.assertSnapshot("size=3 0:[0,4) 1:[7,10) 2:[10,15)")
+	x.assertSnapshot("ranges=3 [0,4) [7,10) [10,15)")
 	x.ls.write(data[4:7], 4)
-	x.assertSnapshot("size=4 0:[0,4) 1:[4,7) 2:[7,10) 3:[10,15)")
+	x.assertSnapshot("ranges=4 [0,4) [4,7) [7,10) [10,15)")
 	x.assertOrdered()
 
 	read := make([]byte, 20)
@@ -112,7 +127,7 @@ func TestRangeBufferWriteNoOverlap(t *testing.T) {
 	if n != 7 {
 		t.Fatalf("expect read: %d actual: %d", 7, n)
 	}
-	x.assertSnapshot("size=2 0:[7,10) 1:[10,15)")
+	x.assertSnapshot("ranges=2 [7,10) [10,15)")
 	n = x.ls.read(read, 6)
 	if n != 0 {
 		t.Fatalf("expect read: %d actual: %d", 0, n)
@@ -125,7 +140,7 @@ func TestRangeBufferWriteNoOverlap(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("expect read: %d actual: %d", 3, n)
 	}
-	x.assertSnapshot("size=1 0:[10,15)")
+	x.assertSnapshot("ranges=1 [10,15)")
 	n = x.ls.read(read[10:], 10)
 	if n != 5 {
 		t.Fatalf("expect read: %d actual: %d", 5, n)
@@ -140,15 +155,15 @@ func TestRangeBufferPushDataOverlap(t *testing.T) {
 	data := makeData(255)
 	x := rangeBufferListTest{t: t}
 	x.ls.write(data[50:100], 50)
-	x.assertSnapshot("size=1 0:[50,100)")
+	x.assertSnapshot("ranges=1 [50,100)")
 	x.ls.write(data[80:100], 80)
-	x.assertSnapshot("size=1 0:[50,100)")
+	x.assertSnapshot("ranges=1 [50,100)")
 	x.ls.write(data[40:80], 40)
-	x.assertSnapshot("size=2 0:[40,50) 1:[50,100)")
+	x.assertSnapshot("ranges=2 [40,50) [50,100)")
 	x.ls.write(data[90:120], 90)
-	x.assertSnapshot("size=3 0:[40,50) 1:[50,100) 2:[100,120)")
+	x.assertSnapshot("ranges=3 [40,50) [50,100) [100,120)")
 	x.ls.write(data[150:200], 150)
-	x.assertSnapshot("size=4 0:[40,50) 1:[50,100) 2:[100,120) 3:[150,200)")
+	x.assertSnapshot("ranges=4 [40,50) [50,100) [100,120) [150,200)")
 	x.assertOrdered()
 
 	read := make([]byte, len(data))
@@ -164,7 +179,7 @@ func TestRangeBufferPushDataOverlap(t *testing.T) {
 	if !bytes.Equal(data[40:120], read) {
 		t.Fatalf("data does not match:\nexpect: %x\nactual: %x", data[40:120], read)
 	}
-	x.assertSnapshot("size=1 0:[150,200)")
+	x.assertSnapshot("ranges=1 [150,200)")
 }
 
 func TestRangeBufferWrite(t *testing.T) {
@@ -195,17 +210,17 @@ func TestRangeBufferPop(t *testing.T) {
 	if offset != 0 || !bytes.Equal(data[:10], read) {
 		t.Fatalf("data does not match:\nexpect: %x\nactual: %x (offset=%d)", data[:10], read, offset)
 	}
-	x.assertSnapshot("size=3 0:[10,100) 1:[100,120) 2:[150,180)")
+	x.assertSnapshot("ranges=3 [10,100) [100,120) [150,180)")
 	read, offset = x.ls.pop(150)
 	if offset != 10 || !bytes.Equal(data[10:120], read) {
 		t.Fatalf("data does not match:\nexpect: %x\nactual: %x (offset=%d)", data[10:120], read, offset)
 	}
-	x.assertSnapshot("size=1 0:[150,180)")
+	x.assertSnapshot("ranges=1 [150,180)")
 	read, offset = x.ls.pop(10)
 	if offset != 150 || !bytes.Equal(data[150:160], read) {
 		t.Fatalf("data does not match:\nexpect: %x\nactual: %x (offset=%d)", data[10:120], read, offset)
 	}
-	x.assertSnapshot("size=1 0:[160,180)")
+	x.assertSnapshot("ranges=1 [160,180)")
 }
 
 func BenchmarkRangeBuffer(b *testing.B) {
@@ -225,6 +240,7 @@ type rangeBufferListTest struct {
 
 func (t *rangeBufferListTest) assertOrdered() {
 	if !isListOrdered(t.ls) {
+		t.t.Helper()
 		t.t.Fatalf("list is not sorted\nactual: %+v", &t.ls)
 	}
 }
@@ -232,6 +248,7 @@ func (t *rangeBufferListTest) assertOrdered() {
 func (t *rangeBufferListTest) assertSize(expect int) {
 	ls := t.ls
 	if len(ls) != expect {
+		t.t.Helper()
 		t.t.Fatalf("size does not match:\nexpect: %d\nactual: %+v", expect, ls)
 	}
 }
@@ -239,6 +256,7 @@ func (t *rangeBufferListTest) assertSize(expect int) {
 func (t *rangeBufferListTest) assertSnapshot(expect string) {
 	actual := t.ls.String()
 	if actual != expect {
+		t.t.Helper()
 		t.t.Fatalf("snapshot does not match:\nexpect: %s\nactual: %s", expect, actual)
 	}
 }

@@ -82,15 +82,16 @@ func (s *remoteConn) Close() error {
 }
 
 func (s *remoteConn) Stream(id uint64) io.ReadWriteCloser {
-	st := s.conn.Stream(id)
-	if st == nil {
+	st, err := s.conn.Stream(id)
+	if err != nil {
+		// TODO: log error
 		return nil
 	}
 	return st
 }
 
 func (s *remoteConn) SetStream(id uint64) {
-	s.stream = s.conn.Stream(id)
+	s.stream, _ = s.conn.Stream(id)
 }
 
 func (s *remoteConn) LocalAddr() net.Addr {

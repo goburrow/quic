@@ -3,6 +3,7 @@ package transport
 import (
 	"crypto/rand"
 	"fmt"
+	mrand "math/rand"
 	"reflect"
 	"testing"
 
@@ -60,7 +61,7 @@ func TestFrameAck(t *testing.T) {
 	}
 	testFrame(t, f, "025234745602407801020304")
 	ranges := f.toRangeSet()
-	if ranges.String() != "size=3 0:[4660,4540] 1:[4537,4535] 2:[4530,4526]" {
+	if ranges.String() != "ranges=3 [4526,4530] [4535,4537] [4540,4660]" {
 		t.Fatalf("range set: actual=%s", ranges)
 	}
 	rf := &ackFrame{
@@ -76,13 +77,13 @@ func TestFrameAckRangeSet(t *testing.T) {
 	var f ackFrame
 	var ranges rangeSet
 	f.fromRangeSet(ranges)
-	t.Logf("ranges %s frame %s", ranges, &f)
-	ranges.push(0)
-	f.fromRangeSet(ranges)
-	t.Logf("ranges %s frame %s", ranges, &f)
-	ranges.push(1)
-	f.fromRangeSet(ranges)
-	t.Logf("ranges %s frame %s", ranges, &f)
+
+	for i := 0; i < 100; i++ {
+		n := uint64(mrand.Intn(100))
+		ranges.push(n, n)
+		f.fromRangeSet(ranges)
+		t.Logf("ranges %s\nframe %s", ranges, &f)
+	}
 }
 
 func TestFrameConnectionClose(t *testing.T) {

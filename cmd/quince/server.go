@@ -51,8 +51,10 @@ func (s *serverHandler) Serve(c quic.Conn, events []interface{}) {
 		switch e := e.(type) {
 		case transport.StreamRecvEvent:
 			st := c.Stream(e.StreamID)
-			st.Write([]byte("pong!"))
-			st.Close()
+			if st != nil {
+				st.Write([]byte("pong!"))
+				st.Close()
+			}
 		}
 	}
 }

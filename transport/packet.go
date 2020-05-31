@@ -791,7 +791,7 @@ type packetNumberSpace struct {
 
 	nextPacketNumber uint64
 	// recvPacketNeedAck contains received packet numbers that need to acknowledge in ACK frame.
-	// A packet number is added when receiving a packet is received and removed when receiving an ACK frame.
+	// A packet number is added when receiving a packet and removed when receiving an ACK frame.
 	recvPacketNeedAck rangeSet
 	// recvPacketNumbers tracks packet numbers received.
 	recvPacketNumbers packetNumberWindow
@@ -874,7 +874,7 @@ func (s *packetNumberSpace) onPacketReceived(pn uint64, now time.Time) {
 		s.largestRecvPacketTime = now
 	}
 	s.recvPacketNumbers.push(pn)
-	s.recvPacketNeedAck.push(pn)
+	s.recvPacketNeedAck.push(pn, pn)
 	if pn > s.largestRecvPacketNumber {
 		s.largestRecvPacketNumber = pn
 	}
