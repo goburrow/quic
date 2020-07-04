@@ -23,10 +23,11 @@ type Conn struct {
 	isClient bool
 	version  uint32
 
-	scid  []byte
-	dcid  []byte
-	odcid []byte
-	token []byte
+	scid  []byte // Source CID
+	dcid  []byte // Destination CID. DCID can be replaced in recvPacketInitial.
+	odcid []byte // Original destination CID. Used to validate transport parameters.
+	rscid []byte // Retry soure CID. Set in recvPacketRetry.
+	token []byte // Stateless retry token
 
 	packetNumberSpaces [packetSpaceCount]packetNumberSpace
 	streams            streamMap
@@ -82,11 +83,20 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 	if len(scid) > 0 {
 		s.scid = append(s.scid[:0], scid...)
 	}
+	s.localParams.InitialSourceCID = s.scid // SCID is fixed so can use its reference
 	if len(odcid) > 0 {
 		s.odcid = append(s.odcid[:0], odcid...)
-		s.localParams.OriginalCID = s.odcid
+		s.localParams.OriginalDestinationCID = s.odcid
+		s.localParams.RetrySourceCID = s.scid
+		s.didRetry = true // So odcid will not be set again
+	} else {
+		// Do not take CIDs from config
+		s.localParams.OriginalDestinationCID = nil
+		s.localParams.RetrySourceCID = nil
 	}
 	if isClient {
+		// Stateless reset token must not be sent by client
+		s.localParams.StatelessResetToken = nil
 		// Random first destination connection id from client
 		s.dcid = make([]byte, MaxCIDLength)
 		if err := s.rand(s.dcid); err != nil {
@@ -109,9 +119,6 @@ func (s *Conn) Write(b []byte) (int, error) {
 		}
 		i, err := s.recv(b[n:], now)
 		if err != nil {
-			if e, ok := err.(*Error); ok {
-				s.Close(false, e.Code, "")
-			}
 			return n, err
 		}
 		n += i
@@ -165,7 +172,7 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet) (int, error) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
-	n, err := p.decodeBody(b[p.headerLen:])
+	n, err := p.decodeBody(b)
 	if err != nil {
 		return 0, err
 	}
@@ -200,20 +207,21 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
-	_, err := p.decodeBody(b[p.headerLen:])
+	_, err := p.decodeBody(b)
 	if err != nil {
 		return 0, err
 	}
 	// Verify token and integrity tag
 	if len(p.token) == 0 || !verifyRetryIntegrity(b, s.dcid) {
-		return 0, errInvalidPacket
+		return 0, errInvalidToken
 	}
 	debug("received packet %v", p)
-	s.token = append(s.token[:0], p.token...)
 	s.didRetry = true
+	s.token = append(s.token[:0], p.token...)
 	// Update CIDs and crypto: dcid => odcid, header.scid => dcid
 	s.odcid = append(s.odcid[:0], s.dcid...)
 	s.dcid = append(s.dcid[:0], p.header.scid...)
+	s.rscid = s.dcid // DCID is now fixed
 	s.deriveInitialKeyMaterial(s.dcid)
 	// Reset connection state to send another initial packet
 	s.gotPeerCID = false
@@ -229,14 +237,23 @@ func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error
 		debug("dropped packet %v", p)
 		return len(b), nil
 	}
-	if s.isClient && !s.gotPeerCID {
-		// Replace the randomly generated destination connection ID with
-		// the one supplied by the server.
-		s.dcid = append(s.dcid[:0], p.header.scid...)
-		s.gotPeerCID = true
-	}
 	if !s.derivedInitialSecrets { // Server side
 		s.deriveInitialKeyMaterial(p.header.dcid)
+	}
+	if !s.gotPeerCID {
+		if s.isClient {
+			if len(s.odcid) == 0 {
+				s.odcid = append(s.odcid[:0], s.dcid...)
+			}
+		} else {
+			if !s.didRetry {
+				s.odcid = append(s.odcid[:0], p.header.dcid...)
+				s.localParams.OriginalDestinationCID = s.odcid
+				s.handshake.setTransportParams(&s.localParams)
+			}
+		}
+		// Replace the randomly generated destination connection ID with
+		// the one supplied by the server.
 		s.dcid = append(s.dcid[:0], p.header.scid...)
 		s.gotPeerCID = true
 	}
@@ -308,7 +325,7 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 		var typ uint64
 		n := getVarint(b, &typ)
 		if n == 0 {
-			return errInvalidFrame
+			return newError(FrameEncodingError, "")
 		}
 		var err error
 		// TODO: Check allowed frames for current packet type
@@ -343,7 +360,7 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 		case typ == frameTypeStreamsBlockedBidi || typ == frameTypeStreamsBlockedUni:
 			n, err = s.recvFrameStreamsBlocked(b)
 		case typ == frameTypeConnectionClose || typ == frameTypeApplicationClose:
-			n, err = s.recvFrameConnClose(b, space, now)
+			n, err = s.recvFrameConnectionClose(b, space, now)
 		case typ == frameTypeHanshakeDone:
 			n, err = s.recvFrameHandshakeDone(b)
 		default:
@@ -404,7 +421,7 @@ func (s *Conn) recvFrameResetStream(b []byte) (int, error) {
 	bidi := isStreamBidi(f.streamID)
 	if local && !bidi {
 		debug("peer attempted to reset our receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
-		return 0, newError(StreamStateError, "ResetStreamFrame: invalid stream id: %d", f.streamID)
+		return 0, newError(StreamStateError, "reset stream %d", f.streamID)
 	}
 	st, err := s.getOrCreateStream(f.streamID, false)
 	if err != nil {
@@ -433,7 +450,7 @@ func (s *Conn) recvFrameStopSending(b []byte) (int, error) {
 	bidi := isStreamBidi(f.streamID)
 	if !local && !bidi {
 		debug("peer attempted to stop sending their receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
-		return 0, newError(StreamStateError, "StopSendingFrame: invalid stream id: %d", f.streamID)
+		return 0, newError(StreamStateError, "stop sending stream %d", f.streamID)
 	}
 	s.addEvent(StreamStopEvent{
 		StreamID:  f.streamID,
@@ -480,7 +497,7 @@ func (s *Conn) recvFrameStream(b []byte) (int, error) {
 	bidi := isStreamBidi(f.streamID)
 	if local && !bidi {
 		debug("peer attempted to sent to our stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
-		return 0, newError(StreamStateError, "StreamFrame: invalid stream id: %d", f.streamID)
+		return 0, newError(StreamStateError, "stream %d", f.streamID)
 	}
 	if !s.flow.canRecv(len(f.data)) {
 		return 0, errFlowControl
@@ -556,13 +573,13 @@ func (s *Conn) recvFrameStreamsBlocked(b []byte) (int, error) {
 	return f.decode(b)
 }
 
-func (s *Conn) recvFrameConnClose(b []byte, space packetSpace, now time.Time) (int, error) {
+func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Time) (int, error) {
 	var f connectionCloseFrame
 	n, err := f.decode(b)
 	if err != nil {
 		return 0, err
 	}
-	debug("receiving frame 0x%x: %s", b[0], &f)
+	debug("receiving frame 0x%x: %s (%s)", b[0], &f, errorCodeString(f.errorCode))
 	s.state = stateClosing
 	s.setDraining(now)
 	return n, nil
@@ -575,7 +592,7 @@ func (s *Conn) recvFrameHandshakeDone(b []byte) (int, error) {
 		return 0, err
 	}
 	if !s.isClient {
-		return 0, errInvalidPacket
+		return 0, newError(ProtocolViolation, "unexpected handshake done frame")
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
 	if s.state == stateEstablished && !s.handshakeConfirmed {
@@ -621,7 +638,7 @@ func (s *Conn) doHandshake() error {
 	}
 	if s.handshake.HandshakeComplete() {
 		params := s.handshake.peerTransportParams()
-		debug("handshaked peer transport params: %+v", params)
+		debug("peer transport params: %+v", params)
 		if err := s.validatePeerTransportParams(params); err != nil {
 			return err
 		}
@@ -636,23 +653,50 @@ func (s *Conn) doHandshake() error {
 	return nil
 }
 
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-authenticating-connection-i
+//
+// Client                                                  Server
+// Initial: DCID=S1, SCID=C1 ->
+//                                     <- Retry: DCID=C1, SCID=S2
+// Initial: DCID=S2, SCID=C1 ->
+//                                   <- Initial: DCID=C1, SCID=S3
+//                              ...
+// 1-RTT: DCID=S3 ->
+//                                              <- 1-RTT: DCID=C1
+// Client:
+//   initial_source_connection_id = C1
+// Server without Retry:
+//   original_destination_connection_id = S1
+//   initial_source_connection_id = S3
+//   retry_source_connection_id = nil
+// Server with Retry:
+//   original_destination_connection_id = S1
+//   retry_source_connection_id = S2
+//   initial_source_connection_id = S3
 func (s *Conn) validatePeerTransportParams(p *Parameters) error {
 	if p == nil {
-		return newError(TransportParameterError, "TransportParameter must present")
+		return newError(TransportParameterError, "")
+	}
+	// Initial Source CID must be sent by both endpoints
+	if len(p.InitialSourceCID) == 0 || !bytes.Equal(p.InitialSourceCID, s.dcid) {
+		return newError(TransportParameterError, "initial source cid")
 	}
 	if s.isClient {
-		if !bytes.Equal(p.OriginalCID, s.odcid) {
-			return newError(TransportParameterError, "TransportParameter: original cid mismatched")
+		if !bytes.Equal(p.OriginalDestinationCID, s.odcid) {
+			return newError(TransportParameterError, "original destination cid")
 		}
 	} else {
 		// Original CID and Stateless reset token must not be sent by client
-		if len(p.OriginalCID) > 0 {
-			return newError(TransportParameterError, "TransportParameter: original cid must not present")
+		if len(p.OriginalDestinationCID) > 0 {
+			return newError(TransportParameterError, "original destination cid")
 		}
 		// Stateless reset token
 		if len(p.StatelessResetToken) > 0 {
-			return newError(TransportParameterError, "TransportParameter: reset token must not present")
+			return newError(TransportParameterError, "reset token")
 		}
+	}
+	if len(s.rscid) > 0 && !bytes.Equal(p.RetrySourceCID, s.rscid) {
+		return newError(TransportParameterError, "retry source cid")
 	}
 	return nil
 }

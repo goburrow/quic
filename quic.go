@@ -200,6 +200,12 @@ func (s *localConn) recvConn(c *remoteConn, data []byte) {
 	n, err := c.conn.Write(data)
 	if err != nil {
 		s.logger.Log(LevelError, "%s receive failed: %v", c.addr, err)
+		// Close connection when receive failed
+		if err, ok := err.(*transport.Error); ok {
+			c.conn.Close(false, err.Code, err.Message)
+		} else {
+			c.conn.Close(false, transport.InternalError, "")
+		}
 		return
 	}
 	s.logger.Log(LevelTrace, "%s processed %d bytes", c.addr, n)

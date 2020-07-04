@@ -11,10 +11,13 @@ import (
 
 func TestTransportParams(t *testing.T) {
 	tp := Parameters{
-		OriginalCID:         []byte{0x01, 0x02, 0x03, 0x04, 0x05},
-		MaxIdleTimeout:      30 * time.Millisecond,
-		StatelessResetToken: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a},
-		MaxUDPPayloadSize:   1200,
+		OriginalDestinationCID: []byte{0x01, 0x02, 0x03, 0x04, 0x05},
+		InitialSourceCID:       []byte{0x02, 0x04},
+		RetrySourceCID:         []byte{0x03, 0x05, 0x07},
+		StatelessResetToken:    []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a},
+
+		MaxIdleTimeout:    30 * time.Millisecond,
+		MaxUDPPayloadSize: 1200,
 
 		InitialMaxData:                 1440000,
 		InitialMaxStreamDataBidiLocal:  90000,
@@ -24,8 +27,18 @@ func TestTransportParams(t *testing.T) {
 		InitialMaxStreamsUni:           8,
 	}
 	b := testdata.DecodeHex(`
-0005010203040501011e020a0102030405060708090a030244b004048015f900
-050480015f90060480015f90070480040000080108090108`)
+	00050102030405
+	01011e
+	020a0102030405060708090a
+	030244b0
+	04048015f900
+	050480015f90
+	060480015f90
+	070480040000
+	080108
+	090108
+	0f020204
+	1003030507`)
 	encoded := tp.marshal()
 	if !bytes.Equal(b, encoded) {
 		t.Fatalf("marshal transport parameters\nexpect=%x\nactual=%x", b, encoded)

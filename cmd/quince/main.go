@@ -47,7 +47,10 @@ func newConfig() *transport.Config {
 	c.Params.InitialMaxStreamsBidi = 10
 	c.Params.InitialMaxStreamsUni = 10
 	c.TLS = &tls.Config{
-		NextProtos:   []string{"hq-27", "http/0.9"},
+		NextProtos: []string{
+			fmt.Sprintf("hq-%d", transport.ProtocolVersion&0xff),
+			"http/0.9",
+		},
 		KeyLogWriter: newKeyLogWriter(),
 	}
 	return c

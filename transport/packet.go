@@ -135,10 +135,10 @@ func (s *packetHeader) encodedLenShort() int {
 
 func (s *packetHeader) encode(b []byte) (int, error) {
 	if len(s.dcid) > MaxCIDLength {
-		return 0, errors.New("destination CID too long")
+		return 0, errors.New("destination cid too long")
 	}
 	if len(s.scid) > MaxCIDLength {
-		return 0, errors.New("source CID too long")
+		return 0, errors.New("source cid too long")
 	}
 	// Buffer length checking is done in packet encoder
 	enc := newCodec(b)
@@ -293,17 +293,19 @@ func (s *packet) decodeHeader(b []byte) (int, error) {
 }
 
 // decodeBody decodes packet until payload. It returns payload offset relatively to header.
+// b is entire packet, including header. decodeHeader must be called before so that headerLen is set.
 func (s *packet) decodeBody(b []byte) (int, error) {
-	return packetDecodeFuncs[s.typ](s, b)
+	return packetDecodeFuncs[s.typ](s, b[s.headerLen:])
 }
 
 // packetNumberOffset returns index offset of packet number for decrypting.
-func (s *packet) packetNumberOffset(b []byte, headerLen int) (int, error) {
+// decodeHeader must be called before so that headerLen is set.
+func (s *packet) packetNumberOffset(b []byte) (int, error) {
 	if s.typ == packetTypeShort {
-		return headerLen, nil
+		return s.headerLen, nil
 	}
 	var length uint64
-	dec := newCodec(b[headerLen:])
+	dec := newCodec(b[s.headerLen:])
 	if s.typ == packetTypeInitial {
 		// Skip token
 		if !dec.readVarint(&length) || !dec.skip(int(length)) {
@@ -314,7 +316,7 @@ func (s *packet) packetNumberOffset(b []byte, headerLen int) (int, error) {
 	if !dec.readVarint(&length) {
 		return 0, errInvalidPacket
 	}
-	return headerLen + dec.offset(), nil
+	return s.headerLen + dec.offset(), nil
 }
 
 func (s *packet) String() string {
@@ -837,7 +839,7 @@ func (s *packetNumberSpace) canDecrypt() bool {
 }
 
 func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, int, error) {
-	pnOffset, err := p.packetNumberOffset(b, p.headerLen)
+	pnOffset, err := p.packetNumberOffset(b)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -846,7 +848,7 @@ func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, int, err
 		return nil, 0, err
 	}
 	p.header.flags = b[0]
-	n, err := p.decodeBody(b[p.headerLen:])
+	n, err := p.decodeBody(b)
 	if err != nil {
 		return nil, 0, err
 	}

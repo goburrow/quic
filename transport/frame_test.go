@@ -82,7 +82,15 @@ func TestFrameAckRangeSet(t *testing.T) {
 		n := uint64(mrand.Intn(100))
 		ranges.push(n, n)
 		f.fromRangeSet(ranges)
-		t.Logf("ranges %s\nframe %s", ranges, &f)
+		if f.largestAck != ranges.largest() {
+			t.Fatalf("largest ack: actual=%d, want=%d\n%s\n%s",
+				f.largestAck, ranges.largest(), ranges, &f)
+		}
+		if len(f.ackRanges) != len(ranges)-1 {
+			t.Fatalf("ranges size: actual=%d, want=%d\n%s\n%s",
+				len(f.ackRanges), len(ranges), ranges, &f)
+		}
+		//t.Logf("ranges\n%s\nframe %s", ranges, &f)
 	}
 }
 
