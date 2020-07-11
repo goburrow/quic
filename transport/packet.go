@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"errors"
 	"fmt"
 	"time"
 )
@@ -71,7 +70,7 @@ func packetTypeFromSpace(space packetSpace) packetType {
 	case packetSpaceApplication:
 		return packetTypeShort
 	default:
-		panic(fmt.Sprintf("invalid state: space=%d", space))
+		panic("unsupported packet space")
 	}
 }
 
@@ -134,11 +133,8 @@ func (s *packetHeader) encodedLenShort() int {
 }
 
 func (s *packetHeader) encode(b []byte) (int, error) {
-	if len(s.dcid) > MaxCIDLength {
-		return 0, errors.New("destination cid too long")
-	}
-	if len(s.scid) > MaxCIDLength {
-		return 0, errors.New("source cid too long")
+	if len(s.dcid) > MaxCIDLength || len(s.scid) > MaxCIDLength {
+		return 0, errInvalidPacket
 	}
 	// Buffer length checking is done in packet encoder
 	enc := newCodec(b)
@@ -267,8 +263,6 @@ func (s *packet) encode(b []byte) (int, error) {
 		s.header.flags = 0xc0
 	case packetTypeShort:
 		s.header.flags = 0x00 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
-	default:
-		return 0, fmt.Errorf("unsupported packet type: %d", s.typ)
 	}
 	n, err := s.header.encode(b)
 	if err != nil {
@@ -418,7 +412,7 @@ func packetVersionEncodedLen(s *packet) int {
 
 func packetVersionEncode(s *packet, b []byte) (int, error) {
 	if len(s.supportedVersions) == 0 {
-		return 0, errors.New("supported versions must not be empty")
+		return 0, errInvalidPacket
 	}
 	enc := newCodec(b)
 	for _, v := range s.supportedVersions {
@@ -448,6 +442,9 @@ func packetVersionDecode(s *packet, b []byte) (int, error) {
 
 // NegotiateVersion writes version negotiation packet to b.
 func NegotiateVersion(b, dcid, scid []byte) (int, error) {
+	if len(dcid) > MaxCIDLength || len(scid) > MaxCIDLength {
+		return 0, newError(ProtocolViolation, "cid too long")
+	}
 	p := &packet{
 		typ: packetTypeVersionNegotiation,
 		header: packetHeader{
@@ -680,8 +677,8 @@ func packetRetryDecode(s *packet, b []byte) (int, error) {
 
 // Retry writes retry packet to b.
 func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
-	if len(odcid) > MaxCIDLength {
-		return 0, errInvalidPacket
+	if len(dcid) > MaxCIDLength || len(scid) > MaxCIDLength || len(odcid) > MaxCIDLength {
+		return 0, newError(ProtocolViolation, "cid too long")
 	}
 	// Use the provided buffer to write Retry Pseudo-Packet, which is computed by taking the transmitted Retry packet,
 	// removing the Retry Integrity Tag and prepending the ODCID.
@@ -708,7 +705,7 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 		return 0, err
 	}
 	if len(out) != offset+n+retryIntegrityTagLen {
-		return 0, fmt.Errorf("invalid integrity tag length generated: %d", len(out)-offset-n)
+		panic("invalid length of integrity tag generated")
 	}
 	n = copy(b, out[offset:])
 	return n, nil
@@ -808,11 +805,13 @@ type packetNumberSpace struct {
 }
 
 func (s *packetNumberSpace) init() {
-	s.cryptoStream.init(defaultStreamMaxData, defaultStreamMaxData)
+	s.cryptoStream.init(true, true)
+	s.cryptoStream.flow.init(cryptoMaxData, cryptoMaxData)
 }
 
 func (s *packetNumberSpace) reset() {
-	s.cryptoStream.reset()
+	s.cryptoStream = Stream{}
+	s.init()
 	s.ackElicited = false
 }
 
@@ -828,7 +827,7 @@ func (s *packetNumberSpace) canEncrypt() bool {
 func (s *packetNumberSpace) encryptPacket(b []byte, p *packet) {
 	payload := s.sealer.encryptPayload(b, p.packetNumber, p.payloadLen)
 	if len(payload) != p.payloadLen {
-		panic(fmt.Errorf("encrypted payload length %d does not equal %d", len(payload), p.payloadLen))
+		panic("encrypted payload length not expected")
 	}
 	pnOffset := len(b) - p.payloadLen - packetNumberLen(p.packetNumber)
 	s.sealer.encryptHeader(b, pnOffset)
@@ -862,11 +861,6 @@ func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, int, err
 	return payload, length, nil
 }
 
-func (s *packetNumberSpace) onCryptoReceived(b []byte, offset uint64) {
-	// Push the data to the stream so it can be re-ordered.
-	s.cryptoStream.recv.push(b, offset, false)
-}
-
 func (s *packetNumberSpace) isPacketReceived(pn uint64) bool {
 	return s.recvPacketNumbers.contains(pn)
 }
@@ -883,7 +877,7 @@ func (s *packetNumberSpace) onPacketReceived(pn uint64, now time.Time) {
 }
 
 func (s *packetNumberSpace) ready() bool {
-	return s.ackElicited || s.cryptoStream.send.ready()
+	return s.ackElicited || s.cryptoStream.isFlushable()
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#sample-packet-number-decoding

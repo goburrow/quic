@@ -400,6 +400,15 @@ type streamFrame struct {
 	fin      bool
 }
 
+func newStreamFrame(id uint64, data []byte, offset uint64, fin bool) *streamFrame {
+	return &streamFrame{
+		streamID: id,
+		data:     data,
+		offset:   offset,
+		fin:      fin,
+	}
+}
+
 func (s *streamFrame) encodedLen() int {
 	n := 1 + varintLen(s.streamID) +
 		varintLen(uint64(len(s.data))) +
@@ -475,6 +484,12 @@ type maxDataFrame struct {
 	maximumData uint64
 }
 
+func newMaxDataFrame(max uint64) *maxDataFrame {
+	return &maxDataFrame{
+		maximumData: max,
+	}
+}
+
 func (s *maxDataFrame) encodedLen() int {
 	return 1 + varintLen(s.maximumData)
 }
@@ -510,6 +525,13 @@ func (s *maxDataFrame) String() string {
 type maxStreamDataFrame struct {
 	streamID    uint64
 	maximumData uint64
+}
+
+func newMaxStreamDataFrame(id, max uint64) *maxStreamDataFrame {
+	return &maxStreamDataFrame{
+		streamID:    id,
+		maximumData: max,
+	}
 }
 
 func (s *maxStreamDataFrame) encodedLen() int {

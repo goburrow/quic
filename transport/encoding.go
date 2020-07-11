@@ -214,8 +214,9 @@ func getVarint(b []byte, v *uint64) int {
 		*v = uint64(b[7]) | uint64(b[6])<<8 | uint64(b[5])<<16 | uint64(b[4])<<24 |
 			uint64(b[3])<<32 | uint64(b[2])<<40 | uint64(b[1])<<48 | uint64(b[0]&0x3f)<<56
 		return 8
+	default:
+		panic("unreachable")
 	}
-	return 0
 }
 
 func packetNumberLen(v uint64) int {

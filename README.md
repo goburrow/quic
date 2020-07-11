@@ -43,6 +43,17 @@ RUST_LOG=trace ./target/release/quiche-client --no-verify https://127.0.0.1:4433
 RUST_LOG=trace ./target/release/quiche-server
 ```
 
+Test coverage:
+```
+go test -coverprofile=coverage.out
+go tool cover -html=coverage.out
+```
+
+Generating test certificate:
+```
+go run $GOROOT/src/crypto/tls/generate_cert.go -ecdsa-curve P256 --host localhost,127.0.0.1
+```
+
 ## Fuzzing
 
 See https://github.com/goburrow/quic-fuzz

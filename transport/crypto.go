@@ -157,6 +157,9 @@ func (s *packetProtection) encryptHeader(b []byte, pnOffset int) {
 
 func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 	sampleOffset := pnOffset + maxPacketNumberLength
+	if len(b) < sampleOffset {
+		return errInvalidPacket
+	}
 	mask := s.hp.decryptMask(b[sampleOffset:])
 	if len(mask) < 1 {
 		return errInvalidPacket

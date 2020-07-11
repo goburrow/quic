@@ -5,38 +5,101 @@ import (
 	"io"
 )
 
-// Stream is bidirection data stream.
+// Stream is a data stream.
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-streams
 type Stream struct {
 	recv recvStream
 	send sendStream
+
+	// Stream flow control is based on absolute data offset.
+	// In comparision, connection-level flow control manages volume of data instead.
+	flow flowControl
+	// Linked to connection-level flow control. Does not apply for crypto stream.
+	connFlow *flowControl
+	// Whether this stream needs to send MAX_STREAM_DATA
+	updateMaxData bool
+
+	local bool
+	bidi  bool
 }
 
-func (s *Stream) init(maxRecv, maxSend uint64) {
-	s.recv.setMaxData(maxRecv)
-	s.send.setMaxData(maxSend)
+func (s *Stream) init(local, bidi bool) {
+	s.local = local
+	s.bidi = bidi
 }
 
-func (s *Stream) reset() {
-	maxRecv := s.recv.maxData
-	maxSend := s.send.maxData
-	s.recv = recvStream{
-		maxData: maxRecv,
+// pushRecv checks for maximum data can be received and pushes data to recv stream.
+func (s *Stream) pushRecv(data []byte, offset uint64, fin bool) error {
+	if offset+uint64(len(data)) > s.flow.maxRecv {
+		return errFlowControl
 	}
-	s.send = sendStream{
-		maxData: maxSend,
+	err := s.recv.push(data, offset, fin)
+	if err == nil {
+		// Keep flow received bytes in sync with maximum absolute offset of the stream.
+		s.flow.setRecv(s.recv.length)
 	}
+	return err
 }
 
+// Read reads data from recv stream.
 func (s *Stream) Read(b []byte) (int, error) {
-	return s.recv.Read(b)
+	n, err := s.recv.Read(b)
+	if n > 0 {
+		// A receiver could use the current offset of data consumed to determine the
+		// flow control offset to be advertised.
+		s.flow.addMaxRecvNext(uint64(n))
+		if s.connFlow != nil {
+			s.connFlow.addMaxRecvNext(uint64(n))
+		}
+		// Only tell peer to update max data when the stream is consumed.
+		if !s.recv.fin && s.flow.shouldUpdateMaxRecv() {
+			s.updateMaxData = true
+		}
+	}
+	return n, err
 }
 
+// Write writes data to send stream.
 func (s *Stream) Write(b []byte) (int, error) {
-	return s.send.Write(b)
+	if !s.bidi && !s.local {
+		return 0, newError(StreamStateError, "cannot write to uni stream")
+	}
+	if s.flow.canSend() < uint64(len(b)) {
+		return 0, errFlowControl
+	}
+	n, err := s.send.Write(b)
+	if err == nil {
+		// Keep flow sent bytes in sync with read offset of the stream
+		s.flow.setSend(s.send.length)
+	}
+	return n, err
+}
+
+// isFlushable returns true if the stream has data to send
+func (s *Stream) isFlushable() bool {
+	// flow maxSend is controlled by peer via MAX_STREAM_DATA
+	return s.send.ready(s.flow.maxSend)
+}
+
+// popSend returns continuous data from send buffer that size less than max bytes.
+// max is calculated by availability of packet buffer and flow control at connection level.
+func (s *Stream) popSend(max int) (data []byte, offset uint64, fin bool) {
+	if !s.isFlushable() {
+		return nil, 0, false
+	}
+	return s.send.pop(max)
+}
+
+// ackMaxData acknowledges that the MAX_STREAM_DATA frame delivery is confirmed.
+func (s *Stream) ackMaxData() {
+	s.updateMaxData = false
 }
 
 // Close sets end of the sending stream.
 func (s *Stream) Close() error {
+	if !s.bidi && !s.local {
+		return newError(StreamStateError, "cannot close uni stream")
+	}
 	s.send.fin = true
 	return nil
 }
@@ -45,28 +108,18 @@ func (s *Stream) String() string {
 	return fmt.Sprintf("recv{%s} send{%s}", &s.recv, &s.send)
 }
 
+// recvStream is buffer for receiving data.
 type recvStream struct {
 	buf rangeBufferList // Chunks of received data, ordered by offset
 
-	maxData uint64 // maximum data can receive
-	offset  uint64 // read offset
-	length  uint64 // total length
+	offset uint64 // read offset
+	length uint64 // total length
 
 	fin bool
 }
 
-// setMaxData updates maximum data can send. It's done by flow control.
-func (s *recvStream) setMaxData(maxData uint64) {
-	if maxData > s.maxData {
-		s.maxData = maxData
-	}
-}
-
 func (s *recvStream) push(data []byte, offset uint64, fin bool) error {
 	end := offset + uint64(len(data))
-	if end > s.maxData {
-		return errFlowControl
-	}
 	if s.fin {
 		// Stream's size is known, forbid new data or changing it.
 		if end > s.length {
@@ -122,32 +175,24 @@ func (s *recvStream) isFin() bool {
 }
 
 func (s *recvStream) String() string {
-	return fmt.Sprintf("offset=%d length=%d max=%d", s.offset, s.length, s.maxData)
+	return fmt.Sprintf("offset=%v length=%v fin=%v", s.offset, s.length, s.fin)
 }
 
+// sendStream is buffer for sending data.
 type sendStream struct {
 	buf   rangeBufferList // Chunks of data to be sent, ordered by offset
 	acked rangeSet        // receive confirmed
 
-	maxData uint64 // maximum data allowed to send
-	offset  uint64 // read offset
-	length  uint64 // total length
+	offset uint64 // read offset
+	length uint64 // total length
 
 	fin bool
 }
 
-// setMaxData updates maximum data can send. It's done by flow control.
-func (s *sendStream) setMaxData(maxData uint64) {
-	if maxData > s.maxData {
-		s.maxData = maxData
-	}
-}
-
+// push would only be called directly when it needs to bypass flow control.
+// e.g. pushing data back to the stream to resend.
 func (s *sendStream) push(data []byte, offset uint64, fin bool) error {
 	end := offset + uint64(len(data))
-	if end > s.maxData {
-		return errFlowControl
-	}
 	if s.fin {
 		// Stream's size is known, forbid new data or changing it.
 		if end > s.length {
@@ -168,6 +213,7 @@ func (s *sendStream) push(data []byte, offset uint64, fin bool) error {
 	return nil
 }
 
+// pop returns continuous data in buffer with smallest offset up to max bytes in length.
 // pop would be called after checking ready().
 func (s *sendStream) pop(max int) (data []byte, offset uint64, fin bool) {
 	data, offset = s.buf.pop(max)
@@ -179,9 +225,9 @@ func (s *sendStream) pop(max int) (data []byte, offset uint64, fin bool) {
 	return
 }
 
-// ready returns true is the stream has data to send and is allowed to send.
-func (s *sendStream) ready() bool {
-	return len(s.buf) > 0 && s.buf[0].offset < s.maxData
+// ready returns true is the stream has any data with offset less than maxOffset.
+func (s *sendStream) ready(maxOffset uint64) bool {
+	return len(s.buf) > 0 && s.buf[0].offset < maxOffset
 }
 
 // Write append data to the stream.
@@ -194,10 +240,10 @@ func (s *sendStream) Write(b []byte) (int, error) {
 }
 
 func (s *sendStream) String() string {
-	return fmt.Sprintf("offset=%d length=%d max=%d", s.offset, s.length, s.maxData)
+	return fmt.Sprintf("offset=%v length=%v fin=%v", s.offset, s.length, s.fin)
 }
 
-// ack acknowleges stream data received.
+// ack acknowledges stream data received.
 func (s *sendStream) ack(offset, length uint64) {
 	s.acked.push(offset, offset+length)
 }
@@ -266,6 +312,7 @@ func (s *streamMap) create(id uint64, local, bidi bool) (*Stream, error) {
 		}
 	}
 	st := &Stream{}
+	st.init(local, bidi)
 	s.streams[id] = st
 	return st, nil
 }
@@ -294,9 +341,9 @@ func (s *streamMap) setLocalMaxStreamsUni(v uint64) {
 	}
 }
 
-func (s *streamMap) hasFlusable() bool {
+func (s *streamMap) hasFlushable() bool {
 	for _, st := range s.streams {
-		if st.send.ready() {
+		if st.isFlushable() {
 			return true
 		}
 	}

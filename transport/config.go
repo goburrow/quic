@@ -26,7 +26,8 @@ const (
 
 	minPayloadLength = 4
 
-	defaultStreamMaxData = 1 << 14 // 16k
+	// Crypto is not under flow control, but we still enforce a hard limit.
+	cryptoMaxData = 1 << 20
 )
 
 // Config is a QUIC connection configuration.

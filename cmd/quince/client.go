@@ -15,6 +15,7 @@ func clientCommand(args []string) error {
 	cmd := flag.NewFlagSet("client", flag.ExitOnError)
 	listenAddr := cmd.String("listen", "0.0.0.0:0", "listen on the given IP:port")
 	insecure := cmd.Bool("insecure", false, "skip verifying server certificate")
+	data := cmd.String("data", "GET /\r\n", "sending data")
 	logLevel := cmd.Int("v", quic.LevelInfo, "log verbose level")
 	cmd.Parse(args)
 
@@ -27,7 +28,7 @@ func clientCommand(args []string) error {
 	config := newConfig()
 	config.TLS.ServerName = serverName(addr)
 	config.TLS.InsecureSkipVerify = *insecure
-	handler := clientHandler{}
+	handler := clientHandler{data: *data}
 	client := quic.NewClient(config)
 	client.SetHandler(&handler)
 	client.SetLogger(quic.LeveledLogger(*logLevel))
@@ -43,7 +44,8 @@ func clientCommand(args []string) error {
 }
 
 type clientHandler struct {
-	wg sync.WaitGroup
+	wg   sync.WaitGroup
+	data string
 }
 
 func (s *clientHandler) Serve(c quic.Conn, events []interface{}) {
@@ -52,15 +54,14 @@ func (s *clientHandler) Serve(c quic.Conn, events []interface{}) {
 		switch e := e.(type) {
 		case quic.ConnAcceptEvent:
 			st := c.Stream(4)
-			st.Write([]byte("GET /\r\n"))
-			st.Close()
+			_, _ = st.Write([]byte(s.data))
+			_ = st.Close()
 		case transport.StreamRecvEvent:
 			st := c.Stream(e.StreamID)
 			if st != nil {
 				buf := make([]byte, 512)
 				n, _ := st.Read(buf)
-				log.Printf("stream %d received: %s", e.StreamID, buf[:n])
-				c.Close()
+				log.Printf("stream %d received:\n%s", e.StreamID, buf[:n])
 			}
 		case quic.ConnCloseEvent:
 			s.wg.Done()

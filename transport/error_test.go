@@ -15,9 +15,14 @@ func TestErrorFormat(t *testing.T) {
 		{0xffff, "unknown", "0xffff unknown"},
 	}
 	for _, d := range data {
-		err := Error{d.code, d.msg}
+		err := newError(d.code, d.msg)
 		if err.Error() != d.err {
 			t.Errorf("unexpect error string: %+v %q", err, err.Error())
 		}
+	}
+	// String format
+	err := newError(ApplicationError, "%d", 123)
+	if err.Error() != "APPLICATION_ERROR 123" {
+		t.Errorf("unexpect error string: %+v %q", err, err.Error())
 	}
 }

@@ -26,25 +26,26 @@ type outgoingPacket struct {
 	packetNumber uint64
 	frames       []frame
 	timeSent     time.Time
-	size         uint64
+	size         uint64 // size is final packet size including header and encryption overhead
 
 	ackEliciting bool
 	inFlight     bool
 }
 
+// All frames other than ACK, PADDING, and CONNECTION_CLOSE are considered ack-eliciting.
+// Packets are considered in-flight when they are ack-eliciting or contain a PADDING frame.
 func (s *outgoingPacket) addFrame(f frame) {
 	s.frames = append(s.frames, f)
-}
-
-func (s *outgoingPacket) addInFlightFrame(f frame) {
-	s.addFrame(f)
-	s.inFlight = true
-}
-
-func (s *outgoingPacket) addAckElicitingFrame(f frame) {
-	s.addFrame(f)
-	s.inFlight = true
-	s.ackEliciting = true
+	if !s.ackEliciting {
+		switch f.(type) {
+		case *ackFrame, *connectionCloseFrame:
+		case *paddingFrame:
+			s.inFlight = true
+		default:
+			s.inFlight = true
+			s.ackEliciting = true
+		}
+	}
 }
 
 func (s *outgoingPacket) String() string {

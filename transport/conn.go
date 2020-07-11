@@ -46,6 +46,7 @@ type Conn struct {
 	ackElicitingSent      bool // Whether an ACK-eliciting packet has been sent since last receiving a packet.
 	handshakeConfirmed    bool // On server, it's handshakeDone frame sent. On client, it's the frame received
 	derivedInitialSecrets bool
+	updateMaxData         bool // Whether a MAX_DATA needs to be sent
 
 	closeFrame *connectionCloseFrame // Error to be send to peer
 
@@ -66,6 +67,12 @@ func Accept(scid, odcid []byte, config *Config) (*Conn, error) {
 }
 
 func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
+	if config == nil {
+		return nil, newError(InternalError, "config required")
+	}
+	if len(scid) > MaxCIDLength || len(odcid) > MaxCIDLength {
+		return nil, newError(ProtocolViolation, "cid too long")
+	}
 	s := &Conn{
 		version:     config.Version,
 		isClient:    isClient,
@@ -79,7 +86,7 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 	}
 	s.streams.init(s.localParams.InitialMaxStreamsBidi, s.localParams.InitialMaxStreamsUni)
 	s.recovery.init(now)
-	s.flow.init(s.localParams.InitialMaxData)
+	s.flow.init(s.localParams.InitialMaxData, 0)
 	if len(scid) > 0 {
 		s.scid = append(s.scid[:0], scid...)
 	}
@@ -179,7 +186,7 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet) (int, error) {
 	debug("received packet %v", p)
 	var newVersion uint32
 	for _, v := range p.supportedVersions {
-		if v == ProtocolVersion {
+		if versionSupported(v) {
 			newVersion = v
 			break
 		}
@@ -466,7 +473,11 @@ func (s *Conn) recvFrameCrypto(b []byte, space packetSpace) (int, error) {
 		return 0, err
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
-	s.packetNumberSpaces[space].onCryptoReceived(f.data, f.offset)
+	// Push the data to the stream so it can be re-ordered.
+	err = s.packetNumberSpaces[space].cryptoStream.pushRecv(f.data, f.offset, false)
+	if err != nil {
+		return 0, err
+	}
 	err = s.doHandshake()
 	if err != nil {
 		return 0, err
@@ -497,17 +508,22 @@ func (s *Conn) recvFrameStream(b []byte) (int, error) {
 	bidi := isStreamBidi(f.streamID)
 	if local && !bidi {
 		debug("peer attempted to sent to our stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
-		return 0, newError(StreamStateError, "stream %d", f.streamID)
+		return 0, newError(StreamStateError, "writing not permitted")
 	}
-	if !s.flow.canRecv(len(f.data)) {
+	if s.flow.canRecv() < uint64(len(f.data)) {
 		return 0, errFlowControl
 	}
 	st, err := s.getOrCreateStream(f.streamID, false)
 	if err != nil {
 		return 0, err
 	}
-	st.recv.push(f.data, f.offset, f.fin)
+	err = st.pushRecv(f.data, f.offset, f.fin)
+	if err != nil {
+		return 0, err
+	}
 	debug("stream %d received %v", f.streamID, &st.recv)
+	// A receiver maintains a cumulative sum of bytes received on all streams,
+	// which is used to check for flow control violations
 	s.flow.addRecv(len(f.data))
 	s.addEvent(StreamRecvEvent{
 		StreamID: f.streamID,
@@ -537,7 +553,7 @@ func (s *Conn) recvFrameMaxStreamData(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	st.send.setMaxData(f.maximumData)
+	st.flow.setMaxSend(f.maximumData)
 	return n, nil
 }
 
@@ -623,6 +639,13 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 					})
 					// TODO: Garbage collect the stream
 				}
+			}
+		case *maxDataFrame:
+			s.updateMaxData = false
+		case *maxStreamDataFrame:
+			st := s.streams.get(f.streamID)
+			if st != nil {
+				st.ackMaxData()
 			}
 		}
 	})
@@ -780,7 +803,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 			if n > left {
 				return 0, errShortBuffer
 			}
-			op.addInFlightFrame(newPaddingFrame(n))
+			op.addFrame(newPaddingFrame(n))
 			p.payloadLen += n
 			left -= n
 		}
@@ -790,7 +813,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 		if n > left {
 			return 0, errShortBuffer
 		}
-		op.addInFlightFrame(newPaddingFrame(n))
+		op.addFrame(newPaddingFrame(n))
 		p.payloadLen += n
 		left -= n
 	}
@@ -839,7 +862,7 @@ func (s *Conn) writeSpace() packetSpace {
 		}
 	}
 	// If there are flushable streams, use Application.
-	if s.state >= stateEstablished && s.streams.hasFlusable() {
+	if s.state >= stateEstablished && s.streams.hasFlushable() {
 		return packetSpaceApplication
 	}
 	// Nothing to send
@@ -887,18 +910,18 @@ func (s *Conn) processLostPackets(space packetSpace) {
 func (s *Conn) sendFrames(op *outgoingPacket, space packetSpace, left int, now time.Time) int {
 	pnSpace := &s.packetNumberSpaces[space]
 	payloadLen := 0
-	// Close
+	// CONNECTION_CLOSE
 	if s.closeFrame != nil {
 		n := s.closeFrame.encodedLen()
 		if left >= n {
-			op.addAckElicitingFrame(s.closeFrame)
+			op.addFrame(s.closeFrame)
 			payloadLen += n
 			left -= n
 			s.setDraining(now)
 		}
 	}
 	if s.state < stateClosing {
-		// Ack
+		// ACK
 		if f := s.sendFrameAck(pnSpace, now); f != nil {
 			n := f.encodedLen()
 			if left >= n {
@@ -908,14 +931,15 @@ func (s *Conn) sendFrames(op *outgoingPacket, space packetSpace, left int, now t
 				pnSpace.ackElicited = false
 			}
 		}
-		// Crypto
+		// CRYPTO
 		if f := s.sendFrameCrypto(pnSpace, left); f != nil {
 			n := f.encodedLen()
-			op.addAckElicitingFrame(f)
+			op.addFrame(f)
 			payloadLen += n
 			left -= n
 		}
 		if space == packetSpaceApplication {
+			// HANDSHAKE_DONE
 			if f := s.sendFrameHandshakeDone(); f != nil {
 				n := f.encodedLen()
 				if left >= n {
@@ -925,29 +949,46 @@ func (s *Conn) sendFrames(op *outgoingPacket, space packetSpace, left int, now t
 					s.handshakeConfirmed = true
 				}
 			}
-			// MaxData
+			// MAX_DATA
 			if f := s.sendFrameMaxData(); f != nil {
 				n := f.encodedLen()
 				if left >= n {
-					op.addAckElicitingFrame(f)
+					op.addFrame(f)
 					payloadLen += n
 					left -= n
-					s.flow.setMaxRecv(f.maximumData)
+					s.updateMaxData = true
+					s.flow.commitMaxRecv()
 				}
 			}
-			// Stream
-			if f := s.sendFrameStream(left); f != nil {
-				n := f.encodedLen()
-				op.addAckElicitingFrame(f)
-				payloadLen += n
-				left -= n
+			// MAX_STREAM_DATA
+			for id, st := range s.streams.streams {
+				if f := s.sendFrameMaxStreamData(id, st); f != nil {
+					n := f.encodedLen()
+					if left >= n {
+						op.addFrame(f)
+						payloadLen += n
+						left -= n
+						st.flow.commitMaxRecv()
+					}
+				}
+			}
+			// STREAM
+			// TODO: support stream priority
+			for id, st := range s.streams.streams {
+				if f := s.sendFrameStream(id, st, left); f != nil {
+					n := f.encodedLen()
+					op.addFrame(f)
+					payloadLen += n
+					left -= n
+					s.flow.addSend(len(f.data))
+				}
 			}
 		}
-		// Ping
+		// PING
 		if s.recovery.probes > 0 && left >= 1 {
 			f := &pingFrame{}
 			n := f.encodedLen()
-			op.addAckElicitingFrame(f)
+			op.addFrame(f)
 			payloadLen += n
 			left -= n
 			s.recovery.probes--
@@ -1046,7 +1087,7 @@ func (s *Conn) Events(events []interface{}) []interface{} {
 // Client-initiated streams have even-numbered stream IDs and
 // server-initiated streams have odd-numbered stream IDs.
 func (s *Conn) Stream(id uint64) (*Stream, error) {
-	return s.getOrCreateStream(id, s.isClient)
+	return s.getOrCreateStream(id, true)
 }
 
 func (s *Conn) sendFrameAck(pnSpace *packetNumberSpace, now time.Time) *ackFrame {
@@ -1060,8 +1101,8 @@ func (s *Conn) sendFrameAck(pnSpace *packetNumberSpace, now time.Time) *ackFrame
 
 func (s *Conn) sendFrameCrypto(pnSpace *packetNumberSpace, left int) *cryptoFrame {
 	left -= maxCryptoFrameOverhead
-	if left > 0 && pnSpace.cryptoStream.send.ready() {
-		data, offset, _ := pnSpace.cryptoStream.send.pop(left)
+	if left > 0 {
+		data, offset, _ := pnSpace.cryptoStream.popSend(left)
 		if len(data) > 0 {
 			return newCryptoFrame(data, offset)
 		}
@@ -1069,38 +1110,32 @@ func (s *Conn) sendFrameCrypto(pnSpace *packetNumberSpace, left int) *cryptoFram
 	return nil
 }
 
-func (s *Conn) sendFrameStream(left int) *streamFrame {
-	allowed := s.flow.canSend()
+func (s *Conn) sendFrameStream(id uint64, st *Stream, left int) *streamFrame {
+	allowed := int(s.flow.canSend())
 	left -= maxStreamFrameOverhead
 	if left > allowed {
 		left = allowed
 	}
 	if left > 0 {
-		for id, st := range s.streams.streams {
+		data, offset, fin := st.popSend(left)
+		if len(data) > 0 {
 			debug("stream: %v", st)
-			if !st.send.ready() {
-				continue
-			}
-			data, offset, fin := st.send.pop(left)
-			if len(data) > 0 {
-				s.flow.addSend(len(data))
-				return &streamFrame{
-					streamID: id,
-					data:     data,
-					offset:   offset,
-					fin:      fin,
-				}
-			}
+			return newStreamFrame(id, data, offset, fin)
 		}
 	}
 	return nil
 }
 
 func (s *Conn) sendFrameMaxData() *maxDataFrame {
-	if max := s.flow.shouldUpdateMaxRecv(); max > 0 {
-		return &maxDataFrame{
-			maximumData: max,
-		}
+	if s.updateMaxData || s.flow.shouldUpdateMaxRecv() {
+		return newMaxDataFrame(s.flow.maxRecvNext)
+	}
+	return nil
+}
+
+func (s *Conn) sendFrameMaxStreamData(id uint64, st *Stream) *maxStreamDataFrame {
+	if st.updateMaxData {
+		return newMaxStreamDataFrame(id, st.flow.maxRecvNext)
 	}
 	return nil
 }
@@ -1151,7 +1186,9 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 			maxSend = 0
 		}
 	}
-	st.init(maxRecv, maxSend)
+	st.flow.init(maxRecv, maxSend)
+	// Manually set connection flow control to get updated read bytes
+	st.connFlow = &s.flow
 	return st, nil
 }
 

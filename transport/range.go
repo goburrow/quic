@@ -64,7 +64,7 @@ func (s *rangeSet) push(start, end uint64) {
 		}
 	}
 	if idx > 0 && ls[idx-1].end+1 == start {
-		// New range is usually continous, can just extend the range
+		// New range is usually continuous, can just extend the range
 		// [1..2][3..4] => [1..4]
 		idx--
 		ls[idx].end = end

@@ -52,8 +52,16 @@ func (s *serverHandler) Serve(c quic.Conn, events []interface{}) {
 		case transport.StreamRecvEvent:
 			st := c.Stream(e.StreamID)
 			if st != nil {
-				st.Write([]byte("pong!"))
-				st.Close()
+				// echo data back
+				buf := make([]byte, 512)
+				for {
+					n, _ := st.Read(buf)
+					if n > 0 {
+						_, _ = st.Write(buf[:n])
+					} else {
+						break
+					}
+				}
 			}
 		}
 	}

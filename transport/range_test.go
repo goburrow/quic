@@ -30,6 +30,8 @@ func TestRangeSetPush(t *testing.T) {
 	for _, d := range data {
 		x.ls.push(d.m, d.n)
 		x.assertSnapshot(d.s)
+		x.assertContain(d.m)
+		x.assertContain(d.n)
 	}
 }
 
@@ -49,6 +51,7 @@ func TestRangeSetRemoveUntil(t *testing.T) {
 	for _, d := range data {
 		x.ls.removeUntil(d.n)
 		x.assertSnapshot(d.s)
+		x.assertNotContain(d.n)
 	}
 }
 
@@ -91,6 +94,20 @@ func (t *rangeSetTest) assertSnapshot(expect string) {
 	if actual != expect {
 		t.t.Helper()
 		t.t.Fatalf("snapshot does not match:\nexpect: %s\nactual: %s", expect, actual)
+	}
+}
+
+func (t *rangeSetTest) assertContain(v uint64) {
+	if !t.ls.contains(v) {
+		t.t.Helper()
+		t.t.Fatalf("list does not contain: %v", v)
+	}
+}
+
+func (t *rangeSetTest) assertNotContain(v uint64) {
+	if t.ls.contains(v) {
+		t.t.Helper()
+		t.t.Fatalf("list does contain: %v", v)
 	}
 }
 
