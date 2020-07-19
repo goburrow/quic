@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-type packetSpace int
+type packetSpace uint8
 
 const (
 	packetSpaceInitial packetSpace = iota
@@ -14,7 +14,18 @@ const (
 	packetSpaceCount
 )
 
-type packetType int
+var packetSpaceNames = [...]string{
+	packetSpaceInitial:     "initial",
+	packetSpaceHandshake:   "handshake",
+	packetSpaceApplication: "application_data",
+	packetSpaceCount:       "",
+}
+
+func (s packetSpace) String() string {
+	return packetSpaceNames[s]
+}
+
+type packetType uint8
 
 const (
 	packetTypeInitial packetType = iota
@@ -27,10 +38,10 @@ const (
 
 var packetTypeNames = [...]string{
 	packetTypeInitial:            "initial",
-	packetTypeZeroRTT:            "zeroRTT",
+	packetTypeZeroRTT:            "zerortt",
 	packetTypeHandshake:          "handshake",
 	packetTypeRetry:              "retry",
-	packetTypeVersionNegotiation: "version",
+	packetTypeVersionNegotiation: "version_negotiation",
 	packetTypeShort:              "short",
 }
 
@@ -190,7 +201,7 @@ func (s *packetHeader) decode(b []byte) (int, error) {
 }
 
 func (s *packetHeader) String() string {
-	return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x", s.packetType(), s.version, s.dcid, s.scid)
+	return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x", s.packetType(), s.version, s.dcid, s.scid)
 }
 
 // packetType returns type of the packet basing on header flags.
@@ -217,38 +228,25 @@ type packet struct {
 	payloadLen   int
 }
 
-var packetEncodedLenFuncs = [...]func(*packet) int{
-	packetTypeInitial:            packetInitialEncodedLen,
-	packetTypeZeroRTT:            packetLongEncodedLen,
-	packetTypeHandshake:          packetLongEncodedLen,
-	packetTypeRetry:              packetRetryEncodedLen,
-	packetTypeVersionNegotiation: packetVersionEncodedLen,
-	packetTypeShort:              packetShortEncodedLen,
-}
-
-var packetEncodeFuncs = [...]func(*packet, []byte) (int, error){
-	packetTypeInitial:            packetInitialEncode,
-	packetTypeZeroRTT:            packetLongEncode,
-	packetTypeHandshake:          packetLongEncode,
-	packetTypeRetry:              packetRetryEncode,
-	packetTypeVersionNegotiation: packetVersionEncode,
-	packetTypeShort:              packetShortEncode,
-}
-
-var packetDecodeFuncs = [...]func(*packet, []byte) (int, error){
-	packetTypeInitial:            packetInitialDecode,
-	packetTypeZeroRTT:            packetLongDecode,
-	packetTypeHandshake:          packetLongDecode,
-	packetTypeRetry:              packetRetryDecode,
-	packetTypeVersionNegotiation: packetVersionDecode,
-	packetTypeShort:              packetShortDecode,
-}
-
 func (s *packet) encodedLen() int {
-	return packetEncodedLenFuncs[s.typ](s)
+	switch s.typ {
+	case packetTypeInitial:
+		return s.encodedLenInitial()
+	case packetTypeZeroRTT, packetTypeHandshake:
+		return s.encodedLenLong()
+	case packetTypeRetry:
+		return s.encodedLenRetry()
+	case packetTypeVersionNegotiation:
+		return s.encodedLenVersionNegotiation()
+	case packetTypeShort:
+		return s.encodedLenShort()
+	default:
+		panic("unreachable")
+	}
 }
 
 func (s *packet) encode(b []byte) (int, error) {
+	// Header
 	switch s.typ {
 	case packetTypeInitial:
 		s.header.flags = 0xc0 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
@@ -268,7 +266,23 @@ func (s *packet) encode(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	m, err := packetEncodeFuncs[s.typ](s, b[n:])
+	// Body
+	b = b[n:]
+	var m int
+	switch s.typ {
+	case packetTypeInitial:
+		m, err = s.encodeInitial(b)
+	case packetTypeZeroRTT, packetTypeHandshake:
+		m, err = s.encodeLong(b)
+	case packetTypeRetry:
+		m, err = s.encodeRetry(b)
+	case packetTypeVersionNegotiation:
+		m, err = s.encodeVersionNegotiation(b)
+	case packetTypeShort:
+		m, err = s.encodeShort(b)
+	default:
+		panic("unreachable")
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -289,7 +303,21 @@ func (s *packet) decodeHeader(b []byte) (int, error) {
 // decodeBody decodes packet until payload. It returns payload offset relatively to header.
 // b is entire packet, including header. decodeHeader must be called before so that headerLen is set.
 func (s *packet) decodeBody(b []byte) (int, error) {
-	return packetDecodeFuncs[s.typ](s, b[s.headerLen:])
+	b = b[s.headerLen:]
+	switch s.typ {
+	case packetTypeInitial:
+		return s.decodeInitial(b)
+	case packetTypeZeroRTT, packetTypeHandshake:
+		return s.decodeLong(b)
+	case packetTypeRetry:
+		return s.decodeRetry(b)
+	case packetTypeVersionNegotiation:
+		return s.decodeVersionNegotiation(b)
+	case packetTypeShort:
+		return s.decodeShort(b)
+	default:
+		panic("unreachable")
+	}
 }
 
 // packetNumberOffset returns index offset of packet number for decrypting.
@@ -316,13 +344,13 @@ func (s *packet) packetNumberOffset(b []byte) (int, error) {
 func (s *packet) String() string {
 	switch s.typ {
 	case packetTypeInitial, packetTypeRetry:
-		return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x token=%x number=%d",
+		return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x token=%x packet_number=%d",
 			s.typ, s.header.version, s.header.dcid, s.header.scid, s.token, s.packetNumber)
 	case packetTypeShort:
-		return fmt.Sprintf("type=%s dcid=%x number=%d",
+		return fmt.Sprintf("packet_type=%s dcid=%x packet_number=%d",
 			s.typ, s.header.dcid, s.packetNumber)
 	default:
-		return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x number=%d",
+		return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x packet_number=%d",
 			s.typ, s.header.version, s.header.dcid, s.header.scid, s.packetNumber)
 	}
 }
@@ -330,7 +358,7 @@ func (s *packet) String() string {
 // Header is for decoding public information of a QUIC packet.
 // This data allows to process packet prior to decryption.
 type Header struct {
-	Type    int // XXX: Need to export packetType?
+	Type    string
 	Flags   byte
 	Version uint32
 	DCID    []byte
@@ -350,7 +378,7 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 		return 0, err
 	}
 	typ := h.packetType()
-	s.Type = int(typ)
+	s.Type = typ.String()
 	s.Flags = h.flags
 	s.Version = h.version
 	s.DCID = h.dcid
@@ -359,7 +387,7 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 	dec := newCodec(b[n:])
 	switch typ {
 	case packetTypeInitial:
-		// See packetInitialDecode
+		// See decodeInitial
 		var length uint64
 		if !dec.readVarint(&length) {
 			return 0, errInvalidPacket
@@ -368,7 +396,7 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 			return 0, errInvalidPacket
 		}
 	case packetTypeRetry:
-		// See packetRetryDecode
+		// See decodeRetry
 		length := dec.len() - retryIntegrityTagLen
 		if length < 0 {
 			return 0, errInvalidPacket
@@ -379,8 +407,8 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 }
 
 func (s *Header) String() string {
-	return fmt.Sprintf("type=%s version=%d dcid=%x scid=%x token=%x",
-		packetType(s.Type), s.Version, s.DCID, s.SCID, s.Token)
+	return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x token=%x",
+		s.Type, s.Version, s.DCID, s.SCID, s.Token)
 }
 
 // Version Negotiation Packet: https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#packet-version
@@ -406,11 +434,11 @@ func (s *Header) String() string {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                   [Supported Version N (32)]                ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-func packetVersionEncodedLen(s *packet) int {
+func (s *packet) encodedLenVersionNegotiation() int {
 	return s.header.encodedLenLong() + 4*len(s.supportedVersions)
 }
 
-func packetVersionEncode(s *packet, b []byte) (int, error) {
+func (s *packet) encodeVersionNegotiation(b []byte) (int, error) {
 	if len(s.supportedVersions) == 0 {
 		return 0, errInvalidPacket
 	}
@@ -423,7 +451,7 @@ func packetVersionEncode(s *packet, b []byte) (int, error) {
 	return enc.offset(), nil
 }
 
-func packetVersionDecode(s *packet, b []byte) (int, error) {
+func (s *packet) decodeVersionNegotiation(b []byte) (int, error) {
 	dec := newCodec(b)
 	var vers uint32
 	if !dec.readUint32(&vers) {
@@ -445,7 +473,7 @@ func NegotiateVersion(b, dcid, scid []byte) (int, error) {
 	if len(dcid) > MaxCIDLength || len(scid) > MaxCIDLength {
 		return 0, newError(ProtocolViolation, "cid too long")
 	}
-	p := &packet{
+	p := packet{
 		typ: packetTypeVersionNegotiation,
 		header: packetHeader{
 			dcid: dcid,
@@ -481,13 +509,13 @@ func NegotiateVersion(b, dcid, scid []byte) (int, error) {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                          Payload (*)                        ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-func packetInitialEncodedLen(s *packet) int {
-	return packetLongEncodedLen(s) +
+func (s *packet) encodedLenInitial() int {
+	return s.encodedLenLong() +
 		varintLen(uint64(len(s.token))) +
 		len(s.token)
 }
 
-func packetInitialEncode(s *packet, b []byte) (int, error) {
+func (s *packet) encodeInitial(b []byte) (int, error) {
 	pnLen := packetNumberLenFromHeader(s.header.flags)
 	enc := newCodec(b)
 	if !enc.writeVarint(uint64(len(s.token))) ||
@@ -499,7 +527,7 @@ func packetInitialEncode(s *packet, b []byte) (int, error) {
 	return enc.offset(), nil
 }
 
-func packetInitialDecode(s *packet, b []byte) (int, error) {
+func (s *packet) decodeInitial(b []byte) (int, error) {
 	dec := newCodec(b)
 	// Token
 	var length uint64
@@ -567,7 +595,7 @@ func packetInitialDecode(s *packet, b []byte) (int, error) {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                          Payload (*)                        ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-func packetLongEncodedLen(s *packet) int {
+func (s *packet) encodedLenLong() int {
 	pnLen := packetNumberLen(s.packetNumber)
 	return s.header.encodedLenLong() +
 		varintLen(uint64(pnLen+s.payloadLen)) +
@@ -575,7 +603,7 @@ func packetLongEncodedLen(s *packet) int {
 		s.payloadLen
 }
 
-func packetLongEncode(s *packet, b []byte) (int, error) {
+func (s *packet) encodeLong(b []byte) (int, error) {
 	pnLen := packetNumberLenFromHeader(s.header.flags)
 	enc := newCodec(b)
 	if !enc.writeVarint(uint64(pnLen+s.payloadLen)) ||
@@ -585,7 +613,7 @@ func packetLongEncode(s *packet, b []byte) (int, error) {
 	return enc.offset(), nil
 }
 
-func packetLongDecode(s *packet, b []byte) (int, error) {
+func (s *packet) decodeLong(b []byte) (int, error) {
 	dec := newCodec(b)
 	var length uint64
 	// Remainder length includes Packet Number and Payload
@@ -628,13 +656,13 @@ func packetLongDecode(s *packet, b []byte) (int, error) {
 // +                                                               +
 // |                                                               |
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-func packetRetryEncodedLen(s *packet) int {
+func (s *packet) encodedLenRetry() int {
 	return s.header.encodedLenLong() +
 		len(s.token) + retryIntegrityTagLen
 }
 
-// packetRetryEncode does not add Integrity tag.
-func packetRetryEncode(s *packet, b []byte) (int, error) {
+// encodeRetry does not add Integrity tag.
+func (s *packet) encodeRetry(b []byte) (int, error) {
 	enc := newCodec(b)
 	if !enc.write(s.token) {
 		return 0, errShortBuffer
@@ -642,8 +670,8 @@ func packetRetryEncode(s *packet, b []byte) (int, error) {
 	return enc.offset(), nil
 }
 
-// packetRetryDecode does not decode Integrity tag.
-func packetRetryDecode(s *packet, b []byte) (int, error) {
+// decodeRetry does not decode Integrity tag.
+func (s *packet) decodeRetry(b []byte) (int, error) {
 	dec := newCodec(b)
 	tokenLen := dec.len() - retryIntegrityTagLen
 	if tokenLen < 0 {
@@ -721,13 +749,13 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                     Protected Payload (*)                   ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-func packetShortEncodedLen(s *packet) int {
+func (s *packet) encodedLenShort() int {
 	return s.header.encodedLenShort() +
 		packetNumberLen(s.packetNumber) +
 		s.payloadLen
 }
 
-func packetShortEncode(s *packet, b []byte) (int, error) {
+func (s *packet) encodeShort(b []byte) (int, error) {
 	pnLen := packetNumberLenFromHeader(s.header.flags)
 	enc := newCodec(b)
 	if !enc.writePacketNumber(s.packetNumber, pnLen) {
@@ -736,7 +764,7 @@ func packetShortEncode(s *packet, b []byte) (int, error) {
 	return enc.offset(), nil
 }
 
-func packetShortDecode(s *packet, b []byte) (int, error) {
+func (s *packet) decodeShort(b []byte) (int, error) {
 	pnLen := packetNumberLenFromHeader(s.header.flags)
 	dec := newCodec(b)
 	dec.readPacketNumber(&s.packetNumber, pnLen)

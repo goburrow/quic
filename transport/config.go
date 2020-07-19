@@ -13,7 +13,7 @@ const (
 	// MaxCIDLength is the maximum length of a Connection ID
 	MaxCIDLength = 20
 
-	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#path-maximum-transmission-unit-pmtu
+	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-packet-size
 
 	// MaxIPv6PacketSize is the QUIC maximum packet size for IPv6 when Path MTU Discovery is missing.
 	MaxIPv6PacketSize = 1232

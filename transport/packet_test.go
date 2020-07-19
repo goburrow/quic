@@ -33,8 +33,8 @@ func TestPacketInitial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Type != 0 {
-		t.Errorf("expect type %d, actual %d", 0, h.Type)
+	if h.Type != "initial" {
+		t.Errorf("expect type %s, actual %s", packetTypeInitial, h.Type)
 	}
 	if !bytes.Equal(dcid, h.DCID) {
 		t.Errorf("expect dcid %x, actual %x", dcid, h.DCID)
@@ -83,8 +83,8 @@ func TestPacketVersionNegotiation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Type != int(packetTypeVersionNegotiation) {
-		t.Errorf("expect type %d, actual %d", packetTypeVersionNegotiation, h.Type)
+	if h.Type != "version_negotiation" {
+		t.Errorf("expect type %s, actual %s", packetTypeVersionNegotiation, h.Type)
 	}
 	if h.Flags != 0xc0 {
 		t.Errorf("expect flags 0x%x, actual 0x%x", 0xc0, h.Flags)
@@ -138,8 +138,8 @@ func TestPacketRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Type != int(packetTypeRetry) {
-		t.Errorf("expect type %d, actual %d", packetTypeRetry, h.Type)
+	if h.Type != "retry" {
+		t.Errorf("expect type %s, actual %s", packetTypeRetry, h.Type)
 	}
 	if h.Flags != 0xf0 {
 		t.Errorf("expect flags 0x%x, actual 0x%x", 0xf0, h.Flags)

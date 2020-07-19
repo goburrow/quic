@@ -38,7 +38,6 @@ type frame interface {
 	encodedLen() int
 	encoder
 	decoder
-	String() string
 }
 
 // The PADDING frame (type=0x00) has no semantic value.
@@ -287,7 +286,7 @@ func (s *ackFrame) fromRangeSet(ranges rangeSet) {
 		for i := n - 2; i >= 0; i-- {
 			r = ranges[i]
 			if smallest-1 <= r.end || r.start > r.end {
-				panic(fmt.Sprintf("invalid range set: %s", ranges))
+				panic("invalid range set: " + ranges.String())
 			}
 			s.ackRanges[n-i-2] = ackRange{
 				gap:      smallest - r.end - 2,
@@ -318,6 +317,14 @@ type resetStreamFrame struct {
 	finalSize uint64
 }
 
+func newResetStreamFrame(id, code, size uint64) *resetStreamFrame {
+	return &resetStreamFrame{
+		streamID:  id,
+		errorCode: code,
+		finalSize: size,
+	}
+}
+
 func (s *resetStreamFrame) encodedLen() int {
 	return 1 + varintLen(s.streamID) +
 		varintLen(s.errorCode) +
@@ -341,7 +348,7 @@ func (s *resetStreamFrame) decode(b []byte) (int, error) {
 		!dec.readVarint(&s.streamID) ||
 		!dec.readVarint(&s.errorCode) ||
 		!dec.readVarint(&s.finalSize) {
-		return 0, newError(FrameEncodingError, "reset stream")
+		return 0, newError(FrameEncodingError, "reset_stream")
 	}
 	return dec.offset(), nil
 }
@@ -353,6 +360,13 @@ func (s *resetStreamFrame) String() string {
 type stopSendingFrame struct {
 	streamID  uint64
 	errorCode uint64
+}
+
+func newStopSendingFrame(id, code uint64) *stopSendingFrame {
+	return &stopSendingFrame{
+		streamID:  id,
+		errorCode: code,
+	}
 }
 
 func (s *stopSendingFrame) encodedLen() int {
@@ -374,7 +388,7 @@ func (s *stopSendingFrame) decode(b []byte) (int, error) {
 	if !dec.skip(1) || // Skip type
 		!dec.readVarint(&s.streamID) ||
 		!dec.readVarint(&s.errorCode) {
-		return 0, newError(FrameEncodingError, "stop sending")
+		return 0, newError(FrameEncodingError, "stop_sending")
 	}
 	return dec.offset(), nil
 }
@@ -507,7 +521,7 @@ func (s *maxDataFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	if !dec.skip(1) || // Skip type
 		!dec.readVarint(&s.maximumData) {
-		return 0, newError(FrameEncodingError, "max data")
+		return 0, newError(FrameEncodingError, "max_data")
 	}
 	return dec.offset(), nil
 }
@@ -553,7 +567,7 @@ func (s *maxStreamDataFrame) decode(b []byte) (int, error) {
 	if !dec.skip(1) || // Skip type
 		!dec.readVarint(&s.streamID) ||
 		!dec.readVarint(&s.maximumData) {
-		return 0, newError(FrameEncodingError, "max stream data")
+		return 0, newError(FrameEncodingError, "max_stream_data")
 	}
 	return dec.offset(), nil
 }
@@ -569,6 +583,13 @@ func (s *maxStreamDataFrame) String() string {
 type maxStreamsFrame struct {
 	maximumStreams uint64
 	bidi           bool
+}
+
+func newMaxStreamsFrame(max uint64, bidi bool) *maxStreamsFrame {
+	return &maxStreamsFrame{
+		maximumStreams: max,
+		bidi:           bidi,
+	}
 }
 
 func (s *maxStreamsFrame) encodedLen() int {
@@ -595,7 +616,7 @@ func (s *maxStreamsFrame) decode(b []byte) (int, error) {
 	var typ uint8
 	if !dec.readByte(&typ) || // Skip type
 		!dec.readVarint(&s.maximumStreams) {
-		return 0, newError(FrameEncodingError, "max streams")
+		return 0, newError(FrameEncodingError, "max_streams")
 	}
 	s.bidi = typ == frameTypeMaxStreamsBidi
 	return dec.offset(), nil
@@ -611,6 +632,12 @@ func (s *maxStreamsFrame) String() string {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 type dataBlockedFrame struct {
 	dataLimit uint64
+}
+
+func newDataBlockedFrame(limit uint64) *dataBlockedFrame {
+	return &dataBlockedFrame{
+		dataLimit: limit,
+	}
 }
 
 func (s *dataBlockedFrame) encodedLen() int {
@@ -630,7 +657,7 @@ func (s *dataBlockedFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	if !dec.skip(1) || // Skip type
 		!dec.readVarint(&s.dataLimit) {
-		return 0, newError(FrameEncodingError, "data blocked")
+		return 0, newError(FrameEncodingError, "data_blocked")
 	}
 	return dec.offset(), nil
 }
@@ -648,6 +675,13 @@ func (s *dataBlockedFrame) String() string {
 type streamDataBlockedFrame struct {
 	streamID  uint64
 	dataLimit uint64
+}
+
+func newStreamDataBlockedFrame(id, limit uint64) *streamDataBlockedFrame {
+	return &streamDataBlockedFrame{
+		streamID:  id,
+		dataLimit: limit,
+	}
 }
 
 func (s *streamDataBlockedFrame) encodedLen() int {
@@ -669,7 +703,7 @@ func (s *streamDataBlockedFrame) decode(b []byte) (int, error) {
 	if !dec.skip(1) || // Skip type
 		!dec.readVarint(&s.streamID) ||
 		!dec.readVarint(&s.dataLimit) {
-		return 0, newError(FrameEncodingError, "stream data blocked")
+		return 0, newError(FrameEncodingError, "stream_data_blocked")
 	}
 	return dec.offset(), nil
 }
@@ -681,6 +715,13 @@ func (s *streamDataBlockedFrame) String() string {
 type streamsBlockedFrame struct {
 	streamLimit uint64
 	bidi        bool
+}
+
+func newStreamsBlockedFrame(limit uint64, bidi bool) *streamsBlockedFrame {
+	return &streamsBlockedFrame{
+		streamLimit: limit,
+		bidi:        bidi,
+	}
 }
 
 func (s *streamsBlockedFrame) encodedLen() int {
@@ -707,7 +748,7 @@ func (s *streamsBlockedFrame) decode(b []byte) (int, error) {
 	var typ uint8
 	if !dec.readByte(&typ) || // Skip type
 		!dec.readVarint(&s.streamLimit) {
-		return 0, newError(FrameEncodingError, "streams blocked")
+		return 0, newError(FrameEncodingError, "streams_blocked")
 	}
 	s.bidi = typ == frameTypeStreamsBlockedBidi
 	return dec.offset(), nil
@@ -732,6 +773,15 @@ type connectionCloseFrame struct {
 	frameType    uint64
 	reasonPhrase []byte
 	application  bool // application type does not have frameType
+}
+
+func newConnectionCloseFrame(code, frame uint64, reason []byte, app bool) *connectionCloseFrame {
+	return &connectionCloseFrame{
+		errorCode:    code,
+		frameType:    frame,
+		reasonPhrase: reason,
+		application:  app,
+	}
 }
 
 func (s *connectionCloseFrame) encodedLen() int {
@@ -771,20 +821,20 @@ func (s *connectionCloseFrame) decode(b []byte) (int, error) {
 	// Check if it is a Application Close frame type
 	var length uint64
 	if !dec.readVarint(&length) || !dec.readVarint(&s.errorCode) {
-		return 0, newError(FrameEncodingError, "connection close")
+		return 0, newError(FrameEncodingError, "connection_close")
 	}
 	if length == frameTypeConnectionClose {
 		if !dec.readVarint(&s.frameType) {
-			return 0, newError(FrameEncodingError, "connection close")
+			return 0, newError(FrameEncodingError, "connection_close")
 		}
 	} else {
 		s.application = true
 	}
 	if !dec.readVarint(&length) {
-		return 0, newError(FrameEncodingError, "connection close")
+		return 0, newError(FrameEncodingError, "connection_close")
 	}
 	if s.reasonPhrase = dec.read(int(length)); s.reasonPhrase == nil {
-		return 0, newError(FrameEncodingError, "connection close")
+		return 0, newError(FrameEncodingError, "connection_close")
 	}
 	return dec.offset(), nil
 }
@@ -801,6 +851,12 @@ func (s *connectionCloseFrame) String() string {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 type newTokenFrame struct {
 	token []byte
+}
+
+func newNewTokenFrame(token []byte) *newTokenFrame {
+	return &newTokenFrame{
+		token: token,
+	}
 }
 
 func (s *newTokenFrame) encodedLen() int {
@@ -823,10 +879,10 @@ func (s *newTokenFrame) decode(b []byte) (int, error) {
 	if !dec.skip(1) || // Skip type
 		!dec.readVarint(&length) ||
 		length == 0 {
-		return 0, newError(FrameEncodingError, "new token")
+		return 0, newError(FrameEncodingError, "new_token")
 	}
 	if s.token = dec.read(int(length)); s.token == nil {
-		return 0, newError(FrameEncodingError, "new token")
+		return 0, newError(FrameEncodingError, "new_token")
 	}
 	return dec.offset(), nil
 }

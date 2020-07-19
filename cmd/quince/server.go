@@ -3,7 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
 
@@ -16,7 +16,7 @@ func serverCommand(args []string) error {
 	listenAddr := cmd.String("listen", "localhost:4433", "listen on the given IP:port")
 	certFile := cmd.String("cert", "cert.crt", "TLS certificate path")
 	keyFile := cmd.String("key", "cert.key", "TLS certificate key path")
-	logLevel := cmd.Int("v", quic.LevelInfo, "log verbose level")
+	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
 	enableRetry := cmd.Bool("retry", false, "enable address validation using Retry packet")
 	cmd.Parse(args)
 
@@ -30,7 +30,7 @@ func serverCommand(args []string) error {
 	}
 	server := quic.NewServer(config)
 	server.SetHandler(&serverHandler{})
-	server.SetLogger(quic.LeveledLogger(*logLevel))
+	server.SetLogger(*logLevel, os.Stderr)
 	if *enableRetry {
 		server.SetAddressValidator(quic.NewAddressValidator())
 	}
@@ -45,11 +45,11 @@ func serverCommand(args []string) error {
 
 type serverHandler struct{}
 
-func (s *serverHandler) Serve(c quic.Conn, events []interface{}) {
+func (s *serverHandler) Serve(c quic.Conn, events []transport.Event) {
 	for _, e := range events {
-		log.Printf("%s connection event: %#v", c.RemoteAddr(), e)
-		switch e := e.(type) {
-		case transport.StreamRecvEvent:
+		fmt.Printf("%s connection event: %v\n", c.RemoteAddr(), e.Type)
+		switch e.Type {
+		case transport.EventStream:
 			st := c.Stream(e.StreamID)
 			if st != nil {
 				// echo data back

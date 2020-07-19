@@ -3,18 +3,17 @@ package transport
 import (
 	"bytes"
 	"crypto/rand"
-	"fmt"
 	"io"
 	"time"
 )
 
-type connectionState int
+type connectionState uint8
 
 const (
-	stateInitial connectionState = iota
+	stateAttempted connectionState = iota
 	stateHandshake
-	stateEstablished
-	stateClosing
+	stateActive
+	stateDraining
 	stateClosed
 )
 
@@ -26,7 +25,7 @@ type Conn struct {
 	scid  []byte // Source CID
 	dcid  []byte // Destination CID. DCID can be replaced in recvPacketInitial.
 	odcid []byte // Original destination CID. Used to validate transport parameters.
-	rscid []byte // Retry soure CID. Set in recvPacketRetry.
+	rscid []byte // Retry source CID. Set in recvPacketRetry.
 	token []byte // Stateless retry token
 
 	packetNumberSpaces [packetSpaceCount]packetNumberSpace
@@ -53,7 +52,9 @@ type Conn struct {
 	idleTimer     time.Time // Idle timeout expiration time.
 	drainingTimer time.Time // Draining timeout expiration time.
 
-	events []interface{}
+	events []Event
+	// Application callbacks
+	logEventFn func(LogEvent)
 }
 
 // Connect creates a client connection.
@@ -77,7 +78,7 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 		version:     config.Version,
 		isClient:    isClient,
 		localParams: config.Params,
-		state:       stateInitial,
+		state:       stateAttempted,
 	}
 	s.handshake.init(s, config.TLS)
 	now := s.time() // Depends on handshake TLS config
@@ -135,7 +136,8 @@ func (s *Conn) Write(b []byte) (int, error) {
 }
 
 func (s *Conn) deriveInitialKeyMaterial(cid []byte) {
-	aead := newInitialAEAD(cid)
+	aead := initialAEAD{}
+	aead.init(cid)
 	space := &s.packetNumberSpaces[packetSpaceInitial]
 	if s.isClient {
 		space.opener, space.sealer = aead.server, aead.client
@@ -157,26 +159,29 @@ func (s *Conn) recv(b []byte, now time.Time) (int, error) {
 	}
 	switch p.typ {
 	case packetTypeVersionNegotiation:
-		return s.recvPacketVersionNegotiation(b, &p)
+		return s.recvPacketVersionNegotiation(b, &p, now)
 	case packetTypeRetry:
-		return s.recvPacketRetry(b, &p)
+		return s.recvPacketRetry(b, &p, now)
 	case packetTypeInitial:
 		return s.recvPacketInitial(b, &p, now)
+	case packetTypeZeroRTT:
+		return 0, newError(InternalError, "zerortt packet not supported")
 	case packetTypeHandshake:
 		return s.recvPacketHandshake(b, &p, now)
 	case packetTypeShort:
 		return s.recvPacketShort(b, &p, now)
 	default:
-		return 0, fmt.Errorf("unsupported packet type: %d", p.typ)
+		panic(sprint("unsupported packet type ", p.typ))
 	}
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#version-negotiation
-func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet) (int, error) {
+func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) (int, error) {
 	// VN packet can only be sent by server
-	if !s.isClient || s.didVersionNegotiation || s.state != stateInitial ||
+	if !s.isClient || s.didVersionNegotiation || s.state != stateAttempted ||
 		!bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
 		debug("dropped packet %v", p)
+		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
 	n, err := p.decodeBody(b)
@@ -192,7 +197,7 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet) (int, error) {
 		}
 	}
 	if newVersion == 0 {
-		return 0, fmt.Errorf("unsupported version: %v", p.supportedVersions)
+		return 0, newError(InternalError, sprint("unsupported version ", p.supportedVersions))
 	}
 	s.version = newVersion
 	s.didVersionNegotiation = true
@@ -202,16 +207,18 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet) (int, error) {
 	s.packetNumberSpaces[packetSpaceInitial].reset()
 	s.handshake.reset()
 	s.handshake.setTransportParams(&s.localParams)
+	s.logPacketReceived(p, now)
 	return p.headerLen + n, nil
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#validate-handshake
-func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
+func (s *Conn) recvPacketRetry(b []byte, p *packet, now time.Time) (int, error) {
 	// Retry packet can only be sent by server
 	// Packet's SCID must not be equal to the client's DCID.
-	if !s.isClient || s.didRetry || s.state != stateInitial ||
+	if !s.isClient || s.didRetry || s.state != stateAttempted ||
 		!bytes.Equal(p.header.dcid, s.scid) || bytes.Equal(p.header.scid, s.dcid) {
 		debug("dropped packet %v", p)
+		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
 	_, err := p.decodeBody(b)
@@ -236,12 +243,14 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet) (int, error) {
 	s.packetNumberSpaces[packetSpaceInitial].reset()
 	s.handshake.reset()
 	s.handshake.setTransportParams(&s.localParams)
+	s.logPacketReceived(p, now)
 	return len(b), nil // p.headerLen + bodyLen + retryIntegrityTagLen
 }
 
 func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error) {
 	if s.gotPeerCID && (!bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid)) {
 		debug("dropped packet %v", p)
+		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
 	if !s.derivedInitialSecrets { // Server side
@@ -270,6 +279,7 @@ func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error
 func (s *Conn) recvPacketHandshake(b []byte, p *packet, now time.Time) (int, error) {
 	if !bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
 		debug("dropped packet %v", p)
+		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
 	return s.recvPacket(b, p, packetSpaceHandshake, now)
@@ -278,6 +288,7 @@ func (s *Conn) recvPacketHandshake(b []byte, p *packet, now time.Time) (int, err
 func (s *Conn) recvPacketShort(b []byte, p *packet, now time.Time) (int, error) {
 	if !bytes.Equal(p.header.dcid, s.scid) {
 		debug("dropped packet %v", p)
+		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
 	return s.recvPacket(b, p, packetSpaceApplication, now)
@@ -286,7 +297,8 @@ func (s *Conn) recvPacketShort(b []byte, p *packet, now time.Time) (int, error) 
 func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time) (int, error) {
 	pnSpace := &s.packetNumberSpaces[space]
 	if !pnSpace.canDecrypt() {
-		debug("dropped undecryptable packet %v space=%d", &p.header, space)
+		debug("dropped undecryptable packet %v space=%v", p, space)
+		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
 	payload, length, err := pnSpace.decryptPacket(b, p)
@@ -296,8 +308,10 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 	debug("decrypted packet %v payload=%d", p, len(payload))
 	if pnSpace.isPacketReceived(p.packetNumber) {
 		// Ignore duplicate packet
+		s.logPacketDropped(p, now)
 		return length, nil
 	}
+	s.logPacketReceived(p, now)
 	if err = s.recvFrames(payload, space, now); err != nil {
 		return 0, err
 	}
@@ -313,7 +327,7 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 	}
 	// An Handshake packet has been received from the client and has been successfully processed,
 	// so we can drop the initial state and consider the client's address to be verified.
-	if !s.isClient && space == packetSpaceHandshake && s.state == stateInitial {
+	if !s.isClient && space == packetSpaceHandshake && s.state == stateAttempted {
 		s.state = stateHandshake
 		s.dropPacketSpace(packetSpaceInitial)
 	}
@@ -338,40 +352,39 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 		// TODO: Check allowed frames for current packet type
 		switch {
 		case typ == frameTypePadding:
-			var f paddingFrame
-			n, err = f.decode(b)
+			n, err = s.recvFramePadding(b, now)
 		case typ == frameTypePing:
-			// Will ack
+			s.recvFramePing(now)
 		case typ == frameTypeAck:
 			n, err = s.recvFrameAck(b, space, now)
 		case typ == frameTypeResetStream:
-			n, err = s.recvFrameResetStream(b)
+			n, err = s.recvFrameResetStream(b, now)
 		case typ == frameTypeStopSending:
-			n, err = s.recvFrameStopSending(b)
+			n, err = s.recvFrameStopSending(b, now)
 		case typ == frameTypeCrypto:
-			n, err = s.recvFrameCrypto(b, space)
+			n, err = s.recvFrameCrypto(b, space, now)
 		case typ == frameTypeNewToken:
-			n, err = s.recvFrameNewToken(b)
+			n, err = s.recvFrameNewToken(b, now)
 		case typ >= frameTypeStream && typ <= frameTypeStreamEnd:
-			n, err = s.recvFrameStream(b)
+			n, err = s.recvFrameStream(b, now)
 		case typ == frameTypeMaxData:
-			n, err = s.recvFrameMaxData(b)
+			n, err = s.recvFrameMaxData(b, now)
 		case typ == frameTypeMaxStreamData:
-			n, err = s.recvFrameMaxStreamData(b)
+			n, err = s.recvFrameMaxStreamData(b, now)
 		case typ == frameTypeMaxStreamsBidi || typ == frameTypeMaxStreamsUni:
-			n, err = s.recvFrameMaxStreams(b)
+			n, err = s.recvFrameMaxStreams(b, now)
 		case typ == frameTypeDataBlocked:
-			n, err = s.recvFrameDataBlocked(b)
+			n, err = s.recvFrameDataBlocked(b, now)
 		case typ == frameTypeStreamDataBlocked:
-			n, err = s.recvFrameStreamDataBlocked(b)
+			n, err = s.recvFrameStreamDataBlocked(b, now)
 		case typ == frameTypeStreamsBlockedBidi || typ == frameTypeStreamsBlockedUni:
-			n, err = s.recvFrameStreamsBlocked(b)
+			n, err = s.recvFrameStreamsBlocked(b, now)
 		case typ == frameTypeConnectionClose || typ == frameTypeApplicationClose:
 			n, err = s.recvFrameConnectionClose(b, space, now)
 		case typ == frameTypeHanshakeDone:
-			n, err = s.recvFrameHandshakeDone(b)
+			n, err = s.recvFrameHandshakeDone(b, now)
 		default:
-			return newError(FrameEncodingError, "unsupported frame 0x%x", typ)
+			return newError(FrameEncodingError, sprint("unsupported frame ", typ))
 		}
 		if err != nil {
 			debug("error processing frame 0x%x: %v", typ, err)
@@ -388,6 +401,19 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 	return nil
 }
 
+func (s *Conn) recvFramePadding(b []byte, now time.Time) (int, error) {
+	var f paddingFrame
+	n, err := f.decode(b)
+	s.logFrameProcessed(&f, now)
+	return n, err
+}
+
+func (s *Conn) recvFramePing(now time.Time) {
+	// Will ack
+	var f pingFrame
+	s.logFrameProcessed(&f, now)
+}
+
 func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, error) {
 	var f ackFrame
 	n, err := f.decode(b)
@@ -397,7 +423,7 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 	debug("received frame 0x%x: %v", b[0], &f)
 	ranges := f.toRangeSet()
 	if ranges == nil {
-		return 0, newError(FrameEncodingError, "invalid ack ranges: %v", f)
+		return 0, newError(FrameEncodingError, sprint("invalid ack ranges ", f.String()))
 	}
 	ackDelay := time.Duration((1<<s.peerParams.AckDelayExponent)*f.ackDelay) * time.Microsecond
 	s.recovery.onAckReceived(ranges, ackDelay, space, now)
@@ -407,66 +433,77 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 		// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-handshake-confirmed
 		// When we receive an ACK for a 1-RTT packet after handshake completion,
 		// it means the handshake has been confirmed.
-		if space == packetSpaceApplication && s.state == stateEstablished {
+		if space == packetSpaceApplication && s.state == stateActive {
 			s.dropPacketSpace(packetSpaceHandshake)
 			if s.isClient && !s.handshakeConfirmed {
 				s.handshakeConfirmed = true
 			}
 		}
 	}
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameResetStream(b []byte) (int, error) {
+// An endpoint uses a RESET_STREAM frame to abruptly terminate
+// the sending part of a stream.
+func (s *Conn) recvFrameResetStream(b []byte, now time.Time) (int, error) {
 	var f resetStreamFrame
 	n, err := f.decode(b)
 	if err != nil {
 		return 0, err
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
+	// Not for send-only stream
 	local := isStreamLocal(f.streamID, s.isClient)
 	bidi := isStreamBidi(f.streamID)
 	if local && !bidi {
-		debug("peer attempted to reset our receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
-		return 0, newError(StreamStateError, "reset stream %d", f.streamID)
+		debug("peer attempted to reset our send-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
+		return 0, newError(StreamStateError, sprint("reset stream ", f.streamID))
 	}
 	st, err := s.getOrCreateStream(f.streamID, false)
 	if err != nil {
 		return 0, err
 	}
-	_, err = st.recv.reset(f.finalSize)
+	mayRecv, err := st.recv.reset(f.finalSize)
 	if err != nil {
 		return 0, err
 	}
-	s.addEvent(StreamResetEvent{
-		StreamID:  f.streamID,
-		ErrorCode: f.errorCode,
-	})
+	if s.flow.canRecv() < uint64(mayRecv) {
+		return 0, errFlowControl
+	}
+	s.flow.addRecv(mayRecv)
+	s.addEvent(newStreamResetEvent(f.streamID, f.errorCode))
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameStopSending(b []byte) (int, error) {
+// An endpoint uses a STOP_SENDING frame to communicate that incoming data
+// is being discarded on receipt at application request.
+func (s *Conn) recvFrameStopSending(b []byte, now time.Time) (int, error) {
 	var f stopSendingFrame
 	n, err := f.decode(b)
 	if err != nil {
 		return 0, err
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
-	// STOP_SENDING on a receive-only stream is a fatal error.
+	// Not for a locally-initiated stream that has not yet been created.
 	local := isStreamLocal(f.streamID, s.isClient)
-	bidi := isStreamBidi(f.streamID)
-	if !local && !bidi {
-		debug("peer attempted to stop sending their receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
-		return 0, newError(StreamStateError, "stop sending stream %d", f.streamID)
+	if local && s.streams.get(f.streamID) == nil {
+		return 0, newError(StreamStateError, sprint("stop sending stream ", f.streamID))
 	}
-	s.addEvent(StreamStopEvent{
-		StreamID:  f.streamID,
-		ErrorCode: f.errorCode,
-	})
+	// Not for a receive-only stream.
+	bidi := isStreamBidi(f.streamID)
+	if !bidi {
+		debug("peer attempted to stop sending their receive-only stream: id=%d local=%v bidi=%v", f.streamID, local, bidi)
+		return 0, newError(StreamStateError, sprint("stop sending stream ", f.streamID))
+	}
+	// TODO: block writing data to the stream?
+	s.addEvent(newStreamStopEvent(f.streamID, f.errorCode))
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameCrypto(b []byte, space packetSpace) (int, error) {
+func (s *Conn) recvFrameCrypto(b []byte, space packetSpace, now time.Time) (int, error) {
 	var f cryptoFrame
 	n, err := f.decode(b)
 	if err != nil {
@@ -478,14 +515,15 @@ func (s *Conn) recvFrameCrypto(b []byte, space packetSpace) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	err = s.doHandshake()
+	err = s.doHandshake(now)
 	if err != nil {
 		return 0, err
 	}
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameNewToken(b []byte) (int, error) {
+func (s *Conn) recvFrameNewToken(b []byte, now time.Time) (int, error) {
 	// TODO
 	var f newTokenFrame
 	n, err := f.decode(b)
@@ -493,10 +531,11 @@ func (s *Conn) recvFrameNewToken(b []byte) (int, error) {
 		return 0, err
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameStream(b []byte) (int, error) {
+func (s *Conn) recvFrameStream(b []byte, now time.Time) (int, error) {
 	var f streamFrame
 	n, err := f.decode(b)
 	if err != nil {
@@ -525,13 +564,12 @@ func (s *Conn) recvFrameStream(b []byte) (int, error) {
 	// A receiver maintains a cumulative sum of bytes received on all streams,
 	// which is used to check for flow control violations
 	s.flow.addRecv(len(f.data))
-	s.addEvent(StreamRecvEvent{
-		StreamID: f.streamID,
-	})
+	s.addEvent(newStreamRecvEvent(f.streamID))
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameMaxData(b []byte) (int, error) {
+func (s *Conn) recvFrameMaxData(b []byte, now time.Time) (int, error) {
 	var f maxDataFrame
 	n, err := f.decode(b)
 	if err != nil {
@@ -539,10 +577,11 @@ func (s *Conn) recvFrameMaxData(b []byte) (int, error) {
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
 	s.flow.setMaxSend(f.maximumData)
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameMaxStreamData(b []byte) (int, error) {
+func (s *Conn) recvFrameMaxStreamData(b []byte, now time.Time) (int, error) {
 	var f maxStreamDataFrame
 	n, err := f.decode(b)
 	if err != nil {
@@ -554,10 +593,11 @@ func (s *Conn) recvFrameMaxStreamData(b []byte) (int, error) {
 		return 0, err
 	}
 	st.flow.setMaxSend(f.maximumData)
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameMaxStreams(b []byte) (int, error) {
+func (s *Conn) recvFrameMaxStreams(b []byte, now time.Time) (int, error) {
 	var f maxStreamsFrame
 	n, err := f.decode(b)
 	if err != nil {
@@ -568,25 +608,41 @@ func (s *Conn) recvFrameMaxStreams(b []byte) (int, error) {
 	} else {
 		s.streams.setPeerMaxStreamsUni(f.maximumStreams)
 	}
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
 // TODO
-func (s *Conn) recvFrameDataBlocked(b []byte) (int, error) {
+func (s *Conn) recvFrameDataBlocked(b []byte, now time.Time) (int, error) {
 	var f dataBlockedFrame
-	return f.decode(b)
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
 }
 
 // TODO
-func (s *Conn) recvFrameStreamDataBlocked(b []byte) (int, error) {
+func (s *Conn) recvFrameStreamDataBlocked(b []byte, now time.Time) (int, error) {
 	var f streamDataBlockedFrame
-	return f.decode(b)
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
 }
 
 // TODO
-func (s *Conn) recvFrameStreamsBlocked(b []byte) (int, error) {
+func (s *Conn) recvFrameStreamsBlocked(b []byte, now time.Time) (int, error) {
 	var f streamsBlockedFrame
-	return f.decode(b)
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
 }
 
 func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Time) (int, error) {
@@ -596,12 +652,13 @@ func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Ti
 		return 0, err
 	}
 	debug("receiving frame 0x%x: %s (%s)", b[0], &f, errorCodeString(f.errorCode))
-	s.state = stateClosing
+	s.state = stateDraining
 	s.setDraining(now)
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
-func (s *Conn) recvFrameHandshakeDone(b []byte) (int, error) {
+func (s *Conn) recvFrameHandshakeDone(b []byte, now time.Time) (int, error) {
 	var f handshakeDoneFrame
 	n, err := f.decode(b)
 	if err != nil {
@@ -611,11 +668,12 @@ func (s *Conn) recvFrameHandshakeDone(b []byte) (int, error) {
 		return 0, newError(ProtocolViolation, "unexpected handshake done frame")
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
-	if s.state == stateEstablished && !s.handshakeConfirmed {
+	if s.state == stateActive && !s.handshakeConfirmed {
 		// Drop client's handshake state when it received done from server
 		s.dropPacketSpace(packetSpaceHandshake)
 		s.handshakeConfirmed = true
 	}
+	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -634,9 +692,7 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 			if st != nil {
 				st.send.ack(f.offset, uint64(len(f.data)))
 				if st.send.complete() {
-					s.addEvent(StreamComplete{
-						StreamID: f.streamID,
-					})
+					s.addEvent(newStreamCompleteEvent(f.streamID))
 					// TODO: Garbage collect the stream
 				}
 			}
@@ -651,8 +707,8 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 	})
 }
 
-func (s *Conn) doHandshake() error {
-	if s.state >= stateEstablished {
+func (s *Conn) doHandshake(now time.Time) error {
+	if s.state >= stateActive {
 		return nil
 	}
 	err := s.handshake.doHandshake()
@@ -670,8 +726,9 @@ func (s *Conn) doHandshake() error {
 		s.streams.setPeerMaxStreamsUni(params.InitialMaxStreamsUni)
 		s.recovery.maxAckDelay = params.MaxAckDelay
 		s.peerParams = *params
+		s.logParametersSet(&s.peerParams, now)
 		// TODO: early app frames
-		s.state = stateEstablished
+		s.state = stateActive
 	}
 	return nil
 }
@@ -730,7 +787,7 @@ func (s *Conn) Read(b []byte) (int, error) {
 	if !s.drainingTimer.IsZero() {
 		return 0, nil
 	}
-	if err := s.doHandshake(); err != nil {
+	if err := s.doHandshake(now); err != nil {
 		return 0, err
 	}
 	space := s.writeSpace()
@@ -762,7 +819,7 @@ func (s *Conn) Read(b []byte) (int, error) {
 func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 	pnSpace := &s.packetNumberSpaces[space]
 	if !pnSpace.canEncrypt() {
-		return 0, fmt.Errorf("cannot encrypt space=%d", space)
+		return 0, newError(InternalError, sprint("cannot encrypt space ", space.String()))
 	}
 	avail := minInt(s.maxPacketSize(), len(b))
 	p := packet{
@@ -785,12 +842,8 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 	}
 	s.processLostPackets(space)
 	// Add frames
-	op := outgoingPacket{
-		packetNumber: p.packetNumber,
-		frames:       make([]frame, 0, 8),
-		timeSent:     now,
-	}
-	p.payloadLen = s.sendFrames(&op, space, left, now)
+	op := newOutgoingPacket(p.packetNumber, now)
+	p.payloadLen = s.sendFrames(op, space, left, now)
 	if len(op.frames) == 0 {
 		return 0, nil
 	}
@@ -817,6 +870,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 		p.payloadLen += n
 		left -= n
 	}
+	// Include crypto overhead to encode packet header with correct length
 	p.payloadLen += overhead
 	payloadOffset, err := p.encode(b)
 	if err != nil {
@@ -829,15 +883,17 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 	}
 	n += payloadOffset + overhead
 	if n != payloadOffset+p.payloadLen || n > len(b) {
-		return 0, fmt.Errorf("encoded payload length %d exceeded buffer capacity %d", n, len(b))
+		return 0, newError(InternalError, sprint("encoded payload length ", n, " exceeded buffer capacity ", len(b)))
 	}
 	pnSpace.encryptPacket(b[:n], &p)
 	op.size = uint64(n)
 	// Finish preparing sending packet
-	debug("sending packet %s %s", &p, &op)
-	s.onPacketSent(&op, space)
+	debug("sending packet %s %s", &p, op)
+	s.onPacketSent(op, space)
+	// TODO: Log real payload length without crypto overhead
+	s.logPacketSent(&p, op.frames, now)
 	// On the client, drop initial state after sending an Handshake packet.
-	if s.isClient && p.typ == packetTypeHandshake && s.state == stateInitial {
+	if s.isClient && p.typ == packetTypeHandshake && s.state == stateAttempted {
 		s.state = stateHandshake
 		s.dropPacketSpace(packetSpaceInitial)
 	}
@@ -851,7 +907,7 @@ func (s *Conn) writeSpace() packetSpace {
 	}
 	for i := packetSpaceInitial; i < packetSpaceCount; i++ {
 		// Only use application packet number space when handshake is complete.
-		if i == packetSpaceApplication && s.state < stateEstablished {
+		if i == packetSpaceApplication && s.state < stateActive {
 			continue
 		}
 		if s.packetNumberSpaces[i].ready() {
@@ -862,7 +918,7 @@ func (s *Conn) writeSpace() packetSpace {
 		}
 	}
 	// If there are flushable streams, use Application.
-	if s.state >= stateEstablished && s.streams.hasFlushable() {
+	if s.state >= stateActive && s.streams.hasFlushable() {
 		return packetSpaceApplication
 	}
 	// Nothing to send
@@ -870,7 +926,7 @@ func (s *Conn) writeSpace() packetSpace {
 }
 
 func (s *Conn) maxPacketSize() int {
-	if s.state >= stateEstablished && s.peerParams.MaxUDPPayloadSize > 0 {
+	if s.state >= stateActive && s.peerParams.MaxUDPPayloadSize > 0 {
 		n := int(s.peerParams.MaxUDPPayloadSize)
 		if n >= MinInitialPacketSize && n <= MaxPacketSize {
 			return n
@@ -920,7 +976,7 @@ func (s *Conn) sendFrames(op *outgoingPacket, space packetSpace, left int, now t
 			s.setDraining(now)
 		}
 	}
-	if s.state < stateClosing {
+	if s.state < stateDraining {
 		// ACK
 		if f := s.sendFrameAck(pnSpace, now); f != nil {
 			n := f.encodedLen()
@@ -1059,12 +1115,12 @@ func (s *Conn) Close(app bool, errCode uint64, reason string) {
 		errorCode:    errCode,
 		reasonPhrase: []byte(reason),
 	}
-	s.state = stateClosing
+	s.state = stateDraining
 }
 
 // IsEstablished returns true of handshake is complete and the connection is not closing.
 func (s *Conn) IsEstablished() bool {
-	return s.state == stateEstablished
+	return s.state == stateActive
 }
 
 // IsClosed returns true when the connection is in Closed state and no longer send or receive packets.
@@ -1074,10 +1130,10 @@ func (s *Conn) IsClosed() bool {
 
 // Events consumes received events. It appends to provided events slice
 // and clear received events.
-func (s *Conn) Events(events []interface{}) []interface{} {
+func (s *Conn) Events(events []Event) []Event {
 	events = append(events, s.events...)
 	for i := range s.events {
-		s.events[i] = nil
+		s.events[i] = Event{}
 	}
 	s.events = s.events[:0]
 	return events
@@ -1142,7 +1198,7 @@ func (s *Conn) sendFrameMaxStreamData(id uint64, st *Stream) *maxStreamDataFrame
 
 func (s *Conn) sendFrameHandshakeDone() *handshakeDoneFrame {
 	// HandshakeDone is sent only by server.
-	if s.isClient || s.state != stateEstablished || s.handshakeConfirmed {
+	if s.isClient || s.state != stateActive || s.handshakeConfirmed {
 		return nil
 	}
 	return &handshakeDoneFrame{}
@@ -1161,7 +1217,7 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 	}
 	// Initialize new stream
 	if local != isStreamLocal(id, s.isClient) {
-		return nil, newError(StreamStateError, "invalid type of stream %d", id)
+		return nil, newError(StreamStateError, sprint("invalid type of stream ", id))
 	}
 	bidi := isStreamBidi(id)
 	st, err := s.streams.create(id, local, bidi)
@@ -1195,10 +1251,10 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 func (s *Conn) dropPacketSpace(space packetSpace) {
 	s.packetNumberSpaces[space].drop()
 	s.recovery.dropUnackedData(space)
-	debug("dropped space=%d", space)
+	debug("dropped space=%v", space)
 }
 
-func (s *Conn) addEvent(e interface{}) {
+func (s *Conn) addEvent(e Event) {
 	s.events = append(s.events, e)
 }
 
@@ -1226,4 +1282,42 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// OnLogEvent sets handler for received events.
+func (s *Conn) OnLogEvent(fn func(LogEvent)) {
+	s.logEventFn = fn
+}
+
+func (s *Conn) logPacketDropped(p *packet, now time.Time) {
+	if s.logEventFn != nil {
+		s.logEventFn(newLogEventPacket(now, logEventPacketDropped, p))
+	}
+}
+
+func (s *Conn) logPacketReceived(p *packet, now time.Time) {
+	if s.logEventFn != nil {
+		s.logEventFn(newLogEventPacket(now, logEventPacketReceived, p))
+	}
+}
+
+func (s *Conn) logPacketSent(p *packet, frames []frame, now time.Time) {
+	if s.logEventFn != nil {
+		s.logEventFn(newLogEventPacket(now, logEventPacketSent, p))
+		for _, f := range frames {
+			s.logEventFn(newLogEventFrame(now, logEventFramesProcessed, f))
+		}
+	}
+}
+
+func (s *Conn) logFrameProcessed(f frame, now time.Time) {
+	if s.logEventFn != nil {
+		s.logEventFn(newLogEventFrame(now, logEventFramesProcessed, f))
+	}
+}
+
+func (s *Conn) logParametersSet(p *Parameters, now time.Time) {
+	if s.logEventFn != nil {
+		s.logEventFn(newLogEventParametersSet(now, p))
+	}
 }

@@ -69,7 +69,8 @@ func TestDecryptClientInitial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead := newInitialAEAD(testdata.DecodeHex("8394c8f03e515708"))
+	aead := initialAEAD{}
+	aead.init(testdata.DecodeHex("8394c8f03e515708"))
 	err = aead.client.decryptHeader(b, pnOffset)
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +111,8 @@ func TestDecryptServerInitial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead := newInitialAEAD(testdata.DecodeHex("8394c8f03e515708"))
+	aead := initialAEAD{}
+	aead.init(testdata.DecodeHex("8394c8f03e515708"))
 	err = aead.server.decryptHeader(b, pnOffset)
 	if err != nil {
 		t.Fatal(err)

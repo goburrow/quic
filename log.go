@@ -1,34 +1,96 @@
 package quic
 
 import (
+	"bytes"
 	"fmt"
-	"log"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/goburrow/quic/transport"
 )
+
+type logLevel int
 
 // Log levels
 const (
-	LevelOff = iota
-	LevelError
-	LevelInfo
-	LevelDebug
-	LevelTrace
+	levelOff logLevel = iota
+	levelError
+	levelInfo
+	levelDebug
+	levelTrace
 )
 
-// Logger logs QUIC transactions.
-type Logger interface {
-	Log(level int, format string, values ...interface{})
+const logTimeFormat = "2006-01-02T15:04:05" // RFC 3339 without timezone
+
+// logger logs QUIC transactions.
+type logger struct {
+	level  logLevel
+	mu     sync.Mutex
+	writer io.Writer
 }
 
-// LeveledLogger creates a logger with specified level.
-func LeveledLogger(level int) Logger {
-	return leveledLogger(level)
+func (s *logger) setWriter(w io.Writer) {
+	s.mu.Lock()
+	s.writer = w
+	s.mu.Unlock()
 }
 
-type leveledLogger int
+func (s *logger) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writer.Write(b)
+}
 
-func (l leveledLogger) Log(level int, format string, values ...interface{}) {
-	if level <= int(l) {
-		msg := fmt.Sprintf(format, values...)
-		log.Output(2, msg)
+func (s *logger) log(level logLevel, format string, values ...interface{}) {
+	if s.level < level || s.writer == nil {
+		return
 	}
+	b := bytes.Buffer{}
+	b.WriteString(time.Now().Format(logTimeFormat))
+	b.WriteString(" ")
+	fmt.Fprintf(&b, format, values...)
+	b.WriteString("\n")
+	s.writer.Write(b.Bytes())
+}
+
+func (s *logger) attachLogger(c *remoteConn) {
+	if s.level < levelDebug || s.writer == nil {
+		return
+	}
+	tl := transactionLogger{
+		writer: s, // Write protected
+		prefix: fmt.Sprintf("addr=%s cid=%x", c.addr, c.scid),
+	}
+	c.conn.OnLogEvent(tl.logEvent)
+}
+
+func (s *logger) detachLogger(c *remoteConn) {
+	c.conn.OnLogEvent(nil)
+}
+
+type transactionLogger struct {
+	writer io.Writer
+	prefix string
+}
+
+func (s *transactionLogger) logEvent(e transport.LogEvent) {
+	s.writer.Write(formatLogEvent(e, s.prefix))
+}
+
+func formatLogEvent(e transport.LogEvent, prefix string) []byte {
+	b := bytes.Buffer{}
+	b.WriteString(e.Time.Format(logTimeFormat))
+	b.WriteString("   ") // extra indentation for transport-level events
+	b.WriteString(e.Type)
+	if prefix != "" {
+		b.WriteString(" ")
+		b.WriteString(prefix)
+	}
+	for _, f := range e.Fields {
+		b.WriteString(" ")
+		b.WriteString(f.String())
+	}
+	b.WriteString("\n")
+	return b.Bytes()
 }

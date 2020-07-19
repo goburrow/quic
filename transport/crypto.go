@@ -11,7 +11,7 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
-type cryptoLevel int
+type cryptoLevel uint8
 
 const (
 	cryptoLevelInitial cryptoLevel = iota
@@ -32,18 +32,16 @@ type initialAEAD struct {
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#initial-secrets
-func newInitialAEAD(cid []byte) *initialAEAD {
+func (s *initialAEAD) init(cid []byte) {
 	suite := tls13.CipherSuiteByID(tls.TLS_AES_128_GCM_SHA256)
 	initialSecret := suite.Extract(cid, initialSalt)
-	aead := &initialAEAD{}
 	// client
 	clientSecret := deriveSecret(suite, initialSecret, "client in")
-	aead.client.init(suite, clientSecret)
+	s.client.init(suite, clientSecret)
 
 	// server
 	serverSecret := deriveSecret(suite, initialSecret, "server in")
-	aead.server.init(suite, serverSecret)
-	return aead
+	s.server.init(suite, serverSecret)
 }
 
 func deriveSecret(suite tls13.CipherSuite, secret []byte, label string) []byte {
@@ -70,9 +68,9 @@ func (s *packetProtection) init(suite tls13.CipherSuite, secret []byte) {
 	s.aead = suite.AEAD(key, iv)
 
 	if suite.ID() == tls.TLS_CHACHA20_POLY1305_SHA256 {
-		s.hp = newChachaHeaderProtection(hpKey)
+		s.hp.chaCha20Init(hpKey)
 	} else {
-		s.hp = newAESHeaderProtection(hpKey)
+		s.hp.aesInit(hpKey)
 	}
 }
 
@@ -138,10 +136,13 @@ func (s *packetProtection) makeNonce(packetNumber uint64) {
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 func (s *packetProtection) encryptHeader(b []byte, pnOffset int) {
 	sampleOffset := pnOffset + maxPacketNumberLength
-	mask := s.hp.encryptMask(b[sampleOffset:])
+	if len(b) < sampleOffset+headerSampleLen {
+		panic("packet too short for header protection")
+	}
+	mask := s.hp.applyMask(b[sampleOffset : sampleOffset+headerSampleLen])
 	pnLen := packetNumberLenFromHeader(b[0])
 	if len(mask) < 1+pnLen {
-		panic("insufficient header protection mask")
+		panic("invalid mask for header protection")
 	}
 	if isLongHeader(b[0]) {
 		// Long header: 4 bits masked
@@ -157,13 +158,10 @@ func (s *packetProtection) encryptHeader(b []byte, pnOffset int) {
 
 func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 	sampleOffset := pnOffset + maxPacketNumberLength
-	if len(b) < sampleOffset {
+	if len(b) < sampleOffset+headerSampleLen {
 		return errInvalidPacket
 	}
-	mask := s.hp.decryptMask(b[sampleOffset:])
-	if len(mask) < 1 {
-		return errInvalidPacket
-	}
+	mask := s.hp.applyMask(b[sampleOffset : sampleOffset+headerSampleLen])
 	if isLongHeader(b[0]) {
 		b[0] ^= mask[0] & 0x0f
 	} else {
@@ -171,7 +169,7 @@ func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 	}
 	pnLen := packetNumberLenFromHeader(b[0])
 	if len(mask) < 1+pnLen {
-		panic("insufficient header protection mask")
+		panic("invalid mask for header protection")
 	}
 	for i := 0; i < pnLen; i++ {
 		b[pnOffset+i] ^= mask[1+i]
@@ -179,85 +177,61 @@ func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 	return nil
 }
 
-type headerProtection interface {
-	encryptMask(sample []byte) []byte
-	decryptMask(sample []byte) []byte
+const (
+	headerSampleLen = aes.BlockSize
+	headerMaskLen   = maxPacketNumberLength + 1
+)
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-header-protection
+type headerProtection struct {
+	block cipher.Block          // AES
+	mask  [headerSampleLen]byte // Reuse buffer for AES encrypt
+	key   [32]byte              // ChaCha20
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-aes-based-header-protection
-// mask = AES-ECB(hp_key, sample)
-type aesHeaderProtection struct {
-	block cipher.Block
-	mask  []byte
+func (s *headerProtection) applyMask(sample []byte) [headerMaskLen]byte {
+	if len(sample) != headerSampleLen {
+		panic("invalid sample length for header protection")
+	}
+	var mask [headerMaskLen]byte
+	if s.block == nil {
+		s.chacha20Mask(sample, mask[:])
+	} else {
+		s.aesMask(sample, mask[:])
+	}
+	return mask
 }
 
-func newAESHeaderProtection(key []byte) *aesHeaderProtection {
+func (s *headerProtection) aesInit(key []byte) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		panic(err)
 	}
-	return &aesHeaderProtection{
-		block: block,
-		mask:  make([]byte, block.BlockSize()),
-	}
+	s.block = block
 }
 
-func (s *aesHeaderProtection) encryptMask(sample []byte) []byte {
-	sampleLen := s.block.BlockSize()
-	if len(sample) < sampleLen {
-		return nil
-	}
-	s.block.Encrypt(s.mask, sample[:sampleLen])
-	return s.mask
+// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-aes-based-header-protection
+// mask = AES-ECB(hp_key, sample)
+func (s *headerProtection) aesMask(sample, mask []byte) {
+	s.block.Encrypt(s.mask[:], sample)
+	copy(mask, s.mask[:])
 }
 
-func (s *aesHeaderProtection) decryptMask(sample []byte) []byte {
-	sampleLen := s.block.BlockSize()
-	if len(sample) < sampleLen {
-		return nil
-	}
-	s.block.Encrypt(s.mask, sample[:sampleLen])
-	return s.mask
+func (s *headerProtection) chaCha20Init(key []byte) {
+	copy(s.key[:], key)
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-chacha20-based-header-prote
 // counter = sample[0..3]
 // nonce = sample[4..15]
 // mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0})
-type chachaHeaderProtection struct {
-	key  [32]byte
-	mask [5]byte
-}
-
-func newChachaHeaderProtection(key []byte) *chachaHeaderProtection {
-	s := &chachaHeaderProtection{}
-	copy(s.key[:], key)
-	return s
-}
-
-func (s *chachaHeaderProtection) encryptMask(sample []byte) []byte {
-	return s.applyMask(sample)
-}
-
-func (s *chachaHeaderProtection) decryptMask(sample []byte) []byte {
-	return s.applyMask(sample)
-}
-
-func (s *chachaHeaderProtection) applyMask(sample []byte) []byte {
-	const sampleLen = 16
-	if len(sample) < sampleLen {
-		return nil
-	}
-	c, err := chacha20.NewUnauthenticatedCipher(s.key[:], sample[4:sampleLen])
+func (s *headerProtection) chacha20Mask(sample, mask []byte) {
+	c, err := chacha20.NewUnauthenticatedCipher(s.key[:], sample[4:])
 	if err != nil {
-		return nil
+		panic(err)
 	}
 	c.SetCounter(binary.LittleEndian.Uint32(sample[:4]))
-	for i := range s.mask {
-		s.mask[i] = 0
-	}
-	c.XORKeyStream(s.mask[:], s.mask[:])
-	return s.mask[:]
+	c.XORKeyStream(mask, mask)
 }
 
 // Retry Packet Integrity
@@ -281,11 +255,11 @@ func newRetryIntegrityAEAD() cipher.AEAD {
 		// XXX: Need sync.Once?
 		aes, err := aes.NewCipher(retryIntegrityKey)
 		if err != nil {
-			panic("retry packet integrity AEAD: " + err.Error())
+			panic(err)
 		}
 		gcm, err := cipher.NewGCM(aes)
 		if err != nil {
-			panic("retry packet integrity AEAD: " + err.Error())
+			panic(err)
 		}
 		retryIntegrityAEAD = gcm
 	}

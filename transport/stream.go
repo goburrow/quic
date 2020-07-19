@@ -154,7 +154,7 @@ func (s *recvStream) reset(finalSize uint64) (int, error) {
 	if finalSize < s.length {
 		return 0, errFinalSize
 	}
-	n := int(s.length - finalSize)
+	n := int(finalSize - s.length)
 	s.fin = true
 	s.length = finalSize
 	return n, nil
@@ -289,24 +289,24 @@ func (s *streamMap) create(id uint64, local, bidi bool) (*Stream, error) {
 	if local {
 		if bidi {
 			if s.openedStreams.localBidi >= s.maxStreams.peerBidi {
-				return nil, newError(StreamLimitError, "local bidi streams exceeded %d", s.maxStreams.peerBidi)
+				return nil, newError(StreamLimitError, sprint("local bidi streams exceeded ", s.maxStreams.peerBidi))
 			}
 			s.openedStreams.localBidi++
 		} else {
 			if s.openedStreams.localUni >= s.maxStreams.peerUni {
-				return nil, newError(StreamLimitError, "local uni streams exceeded %d", s.maxStreams.peerUni)
+				return nil, newError(StreamLimitError, sprint("local uni streams exceeded ", s.maxStreams.peerUni))
 			}
 			s.openedStreams.localUni++
 		}
 	} else {
 		if bidi {
 			if s.openedStreams.peerBidi >= s.maxStreams.localBidi {
-				return nil, newError(StreamLimitError, "remote bidi streams exceeded %d", s.maxStreams.localBidi)
+				return nil, newError(StreamLimitError, sprint("remote bidi streams exceeded ", s.maxStreams.localBidi))
 			}
 			s.openedStreams.peerBidi++
 		} else {
 			if s.openedStreams.peerUni >= s.maxStreams.localUni {
-				return nil, newError(StreamLimitError, "remote uni streams exceeded %d", s.maxStreams.localUni)
+				return nil, newError(StreamLimitError, sprint("remote uni streams exceeded ", s.maxStreams.localUni))
 			}
 			s.openedStreams.peerUni++
 		}

@@ -132,14 +132,10 @@ func TestConnStream(t *testing.T) {
 		t.Fatalf("server write: %v %v", n, err)
 	}
 	events := server.Events(nil)
-	if len(events) != 1 {
-		t.Fatalf("events %#v", events)
+	if len(events) != 1 || events[0].Type != EventStream || events[0].StreamID != 4 {
+		t.Fatalf("events %+v", events)
 	}
-	e, ok := events[0].(StreamRecvEvent)
-	if !ok || e.StreamID != 4 {
-		t.Fatalf("events %#v", events)
-	}
-	st, err := server.Stream(e.StreamID)
+	st, err := server.Stream(events[0].StreamID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,12 +166,12 @@ func TestSendMaxData(t *testing.T) {
 		offset:   0,
 		data:     b,
 	}
-	_, err = s.recvFrameStream(encodeFrame(stream))
+	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
 	if err != errFlowControl {
 		t.Fatalf("expect error %v, actual %v", errFlowControl, err)
 	}
 	stream.data = b[:100]
-	_, err = s.recvFrameStream(encodeFrame(stream))
+	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,16 +200,94 @@ func TestInvalidConn(t *testing.T) {
 	config := NewConfig()
 
 	_, err := Connect(validCID, nil)
-	if err == nil || err.Error() != "INTERNAL_ERROR config required" {
+	if err == nil || err.Error() != "internal_error config required" {
 		t.Errorf("expect error, actual %+v", err)
 	}
 	_, err = Accept(invalidCID, nil, config)
-	if err == nil || err.Error() != "PROTOCOL_VIOLATION cid too long" {
+	if err == nil || err.Error() != "protocol_violation cid too long" {
 		t.Errorf("expect error, actual %+v", err)
 	}
 	_, err = Accept(validCID, invalidCID, config)
-	if err == nil || err.Error() != "PROTOCOL_VIOLATION cid too long" {
+	if err == nil || err.Error() != "protocol_violation cid too long" {
 		t.Errorf("expect error, actual %+v", err)
+	}
+}
+
+func TestRecvResetStream(t *testing.T) {
+	conn, err := Connect([]byte("client"), NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Our local stream
+	f := resetStreamFrame{
+		streamID: 2,
+	}
+	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
+	if err == nil || err.Error() != "stream_state_error reset stream 2" {
+		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
+	}
+	// Too much data
+	f = resetStreamFrame{
+		streamID:  3,
+		finalSize: 2000,
+	}
+	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
+	if err != errFlowControl {
+		t.Fatalf("expect error %v, actual %v", errFlowControl, err)
+	}
+	// Reset different size
+	f = resetStreamFrame{
+		streamID:  3,
+		finalSize: 1000,
+	}
+	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
+	if err != errFinalSize {
+		t.Fatalf("expect error %v, actual %v", errFinalSize, err)
+	}
+
+	f = resetStreamFrame{
+		streamID:  5,
+		errorCode: 5,
+		finalSize: 10,
+	}
+	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.flow.totalRecv != f.finalSize {
+		t.Fatalf("expect flow recv %v, actual %+v", 10, conn.flow)
+	}
+	events := conn.Events(nil)
+	if len(events) != 1 || events[0].Type != EventResetStream || events[0].StreamID != 5 || events[0].ErrorCode != 5 {
+		t.Fatalf("event %+v", events)
+	}
+}
+
+func TestRecvStopSending(t *testing.T) {
+	conn, err := Accept([]byte("server"), nil, NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Our local stream
+	f := stopSendingFrame{
+		streamID: 1,
+	}
+	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
+	if err == nil || err.Error() != "stream_state_error stop sending stream 1" {
+		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
+	}
+	// Remote stream
+	f = stopSendingFrame{
+		streamID:  4,
+		errorCode: 9,
+	}
+	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := conn.Events(nil)
+	if len(events) != 1 || events[0].Type != EventStopSending || events[0].StreamID != 4 || events[0].ErrorCode != 9 {
+		t.Fatalf("event %+v", events)
 	}
 }
 
@@ -327,37 +401,6 @@ func BenchmarkCreateConn(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_, _ = Accept(cid, cid, config)
-	}
-}
-
-func BenchmarkConnEvents(b *testing.B) {
-	config := NewConfig()
-	conn, err := Connect([]byte{1, 2, 3, 4}, config)
-	if err != nil {
-		b.Fatal(err)
-	}
-	events := make([]interface{}, 0, 2)
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		conn.addEvent(StreamRecvEvent{
-			StreamID: uint64(i),
-		})
-		conn.addEvent(&StreamRecvEvent{
-			StreamID: uint64(i),
-		})
-		events = conn.Events(events)
-		if len(events) != 2 {
-			b.Fatalf("expect %d events. got %d", 2, len(events))
-		}
-		for _, e := range events {
-			switch e := e.(type) {
-			case StreamRecvEvent:
-				_ = e
-			case *StreamRecvEvent:
-				_ = e
-			}
-		}
-		events = events[:0]
 	}
 }
 

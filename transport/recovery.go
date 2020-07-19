@@ -32,6 +32,14 @@ type outgoingPacket struct {
 	inFlight     bool
 }
 
+func newOutgoingPacket(pn uint64, tm time.Time) *outgoingPacket {
+	return &outgoingPacket{
+		packetNumber: pn,
+		frames:       make([]frame, 0, 8),
+		timeSent:     tm,
+	}
+}
+
 // All frames other than ACK, PADDING, and CONNECTION_CLOSE are considered ack-eliciting.
 // Packets are considered in-flight when they are ack-eliciting or contain a PADDING frame.
 func (s *outgoingPacket) addFrame(f frame) {

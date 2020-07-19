@@ -18,6 +18,12 @@ const (
 	maxTokenLen     = 64 + transport.MaxCIDLength
 )
 
+// Extend transport events
+const (
+	EventConnAccept = "conn_accept"
+	EventConnClose  = "conn_close"
+)
+
 // Conn is an asynchronous QUIC connection.
 type Conn interface {
 	net.Conn
@@ -29,35 +35,31 @@ type Conn interface {
 
 // Handler defines interface to handle QUIC connection states.
 type Handler interface {
-	Serve(conn Conn, events []interface{})
+	Serve(conn Conn, events []transport.Event)
 }
 
 type noopHandler struct{}
 
-func (s noopHandler) Serve(Conn, []interface{}) {}
-
-// ConnAcceptEvent is an event where a new connection is established.
-type ConnAcceptEvent struct{}
-
-// ConnCloseEvent is an event where a connection is closed.
-type ConnCloseEvent struct{}
+func (s noopHandler) Serve(Conn, []transport.Event) {}
 
 // remoteConn implements Conn.
 type remoteConn struct {
-	scid [transport.MaxCIDLength]byte
+	scid []byte
 	addr net.Addr
 	conn *transport.Conn
 
-	events []interface{}
+	events []transport.Event
 	recvCh chan *packet
 
 	// Current stream for Read and Write
 	stream *transport.Stream
 }
 
-func newRemoteConn(addr net.Addr) *remoteConn {
+func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn) *remoteConn {
 	return &remoteConn{
 		addr:   addr,
+		scid:   scid,
+		conn:   conn,
 		recvCh: make(chan *packet, 1),
 	}
 }
@@ -126,7 +128,7 @@ type localConn struct {
 	closeCh   chan struct{}
 
 	handler Handler
-	logger  Logger
+	logger  logger
 }
 
 func (s *localConn) init(config *transport.Config) {
@@ -135,7 +137,6 @@ func (s *localConn) init(config *transport.Config) {
 	s.closeCh = make(chan struct{})
 	s.closeCond.L = &s.peersMu
 	s.handler = noopHandler{}
-	s.logger = leveledLogger(LevelInfo)
 }
 
 // SetHandler sets QUIC connection callbacks.
@@ -144,8 +145,9 @@ func (s *localConn) SetHandler(v Handler) {
 }
 
 // SetLogger sets transaction logger.
-func (s *localConn) SetLogger(v Logger) {
-	s.logger = v
+func (s *localConn) SetLogger(level int, w io.Writer) {
+	s.logger.setWriter(w)
+	s.logger.level = logLevel(level)
 }
 
 // SetListen sets listening socket connection.
@@ -170,7 +172,7 @@ func (s *localConn) handleConn(c *remoteConn) {
 			s.recvConn(c, p.data)
 		case <-timer.C:
 			// Read timeout
-			s.logger.Log(LevelDebug, "%s %x timed out after %s", c.addr, c.scid, timeout)
+			s.logger.log(levelDebug, "read_timed_out addr=%s scid=%x timeout=%s", c.addr, c.scid, timeout)
 			c.conn.Write(nil)
 		case <-s.closeCh:
 			// Server is closing (see s.close)
@@ -182,7 +184,7 @@ func (s *localConn) handleConn(c *remoteConn) {
 		} else {
 			if c.conn.IsEstablished() {
 				// Maybe also attach packet header in the event?
-				c.events = append(c.events, ConnAcceptEvent{})
+				c.events = append(c.events, transport.Event{Type: EventConnAccept})
 				established = true
 				s.serveConn(c)
 			}
@@ -199,7 +201,7 @@ func (s *localConn) handleConn(c *remoteConn) {
 func (s *localConn) recvConn(c *remoteConn, data []byte) {
 	n, err := c.conn.Write(data)
 	if err != nil {
-		s.logger.Log(LevelError, "%s receive failed: %v", c.addr, err)
+		s.logger.log(levelError, "receive_failed addr=%s scid=%x %v", c.addr, c.scid, err)
 		// Close connection when receive failed
 		if err, ok := err.(*transport.Error); ok {
 			c.conn.Close(false, err.Code, err.Message)
@@ -208,42 +210,41 @@ func (s *localConn) recvConn(c *remoteConn, data []byte) {
 		}
 		return
 	}
-	s.logger.Log(LevelTrace, "%s processed %d bytes", c.addr, n)
+	s.logger.log(levelTrace, "datagrams_processed addr=%s scid=%x byte_length=%d", c.addr, c.scid, n)
 }
 
 func (s *localConn) sendConn(c *remoteConn, buf []byte) error {
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
-			s.logger.Log(LevelError, "%s send failed: %v", c.addr, err)
+			s.logger.log(levelError, "send_failed addr=%s scid=%x %v", c.addr, c.scid, err)
 			return err
 		}
 		if n == 0 {
-			s.logger.Log(LevelDebug, "%s done sending", c.addr)
+			s.logger.log(levelTrace, "send_done addr=%s scid=%x", c.addr, c.scid)
 			return nil
 		}
 		n, err = s.socket.WriteTo(buf[:n], c.addr)
 		if err != nil {
-			s.logger.Log(LevelError, "%s send failed: %v", c.addr, err)
+			s.logger.log(levelError, "send_failed addr=%s scid=%x %v", c.addr, c.scid, err)
 			return err
 		}
-		s.logger.Log(LevelTrace, "%s sent %d bytes\n%x", c.addr, n, buf[:n])
+		s.logger.log(levelTrace, "datagrams_sent addr=%s scid=%x byte_length=%d raw=%x", c.addr, c.scid, n, buf[:n])
 	}
 }
 
 func (s *localConn) serveConn(c *remoteConn) {
 	c.events = c.conn.Events(c.events)
 	s.handler.Serve(c, c.events)
-	// Clear events
 	for i := range c.events {
-		c.events[i] = nil
+		c.events[i] = transport.Event{}
 	}
 	c.events = c.events[:0]
 }
 
 func (s *localConn) connClosed(c *remoteConn) {
-	s.logger.Log(LevelDebug, "%s %x closed", c.addr, c.scid)
-	c.events = append(c.events, ConnCloseEvent{})
+	s.logger.log(levelDebug, "connection_closed addr=%s scid=%x", c.addr, c.scid)
+	c.events = append(c.events, transport.Event{Type: EventConnClose})
 	s.serveConn(c)
 	s.peersMu.Lock()
 	delete(s.peers, string(c.scid[:]))

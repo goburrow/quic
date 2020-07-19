@@ -327,8 +327,9 @@ func (s *tlsHandshake) writeSpace() packetSpace {
 		return packetSpaceHandshake
 	case tls13.EncryptionLevelApplication:
 		return packetSpaceApplication
+	default:
+		panic(sprint("unsupported tls encryption level ", level))
 	}
-	panic(fmt.Sprintf("unsupported TLS write level: %d", level))
 }
 
 func (s *tlsHandshake) reset() {
@@ -400,6 +401,6 @@ func packetSpaceFromEncryptionLevel(level tls13.EncryptionLevel) packetSpace {
 	case tls13.EncryptionLevelApplication:
 		return packetSpaceApplication
 	default:
-		panic(fmt.Sprintf("unsupported encryption level: %v", level))
+		panic(sprint("unsupported tls encryption level ", level))
 	}
 }

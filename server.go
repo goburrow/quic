@@ -56,7 +56,7 @@ func (s *Server) Serve() error {
 	if s.socket == nil {
 		return errors.New("no listening connection")
 	}
-	s.logger.Log(LevelInfo, "listening %s", s.socket.LocalAddr())
+	s.logger.log(levelInfo, "server_listening addr=%s", s.socket.LocalAddr())
 	for {
 		p := newPacket()
 		n, addr, err := s.socket.ReadFrom(p.buf[:])
@@ -64,7 +64,7 @@ func (s *Server) Serve() error {
 			// Process returned data first before considering error
 			p.data = p.buf[:n]
 			p.addr = addr
-			s.logger.Log(LevelTrace, "%s received %d bytes\n%x", addr, n, p.data)
+			s.logger.log(levelTrace, "datagrams_received addr=%s byte_length=%d raw=%x", addr, n, p.data)
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -73,7 +73,7 @@ func (s *Server) Serve() error {
 			// Stop on socket error.
 			// FIXME: Should we stop on timeout when read deadline is set
 			if err, ok := err.(net.Error); ok && err.Timeout() {
-				s.logger.Log(LevelTrace, "read timeout: %v", err)
+				s.logger.log(levelTrace, "read timeout: %v", err)
 			} else {
 				return err
 			}
@@ -84,11 +84,10 @@ func (s *Server) Serve() error {
 func (s *Server) recv(p *packet) {
 	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
 	if err != nil {
-		s.logger.Log(LevelDebug, "%s could not decode packet: %v", p.addr, err)
+		s.logger.log(levelInfo, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
 		freePacket(p)
 		return
 	}
-	s.logger.Log(LevelDebug, "%s received packet %s", p.addr, &p.header)
 	s.peersMu.RLock()
 	if s.closing {
 		// Do not process packet when closing
@@ -102,8 +101,8 @@ func (s *Server) recv(p *packet) {
 		c.recvCh <- p
 	} else {
 		// Server must ensure the any datagram packet containing Initial packet being at least 1200 bytes
-		if p.header.Type != 0 || len(p.data) < transport.MinInitialPacketSize {
-			s.logger.Log(LevelDebug, "%s dropped invalid initial packet: %s", p.addr, &p.header)
+		if p.header.Type != "initial" || len(p.data) < transport.MinInitialPacketSize {
+			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=unexpected_packet", p.addr, &p.header)
 			freePacket(p)
 			return
 		}
@@ -122,16 +121,16 @@ func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 	defer freePacket(p)
 	n, err := transport.NegotiateVersion(p.buf[:], h.SCID, h.DCID)
 	if err != nil {
-		s.logger.Log(LevelError, "%s negotiate: %s %v", addr, h, err)
+		s.logger.log(levelError, "version_negotiation_failed addr=%s %s %v", addr, h, err)
 		return
 	}
 	n, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.Log(LevelError, "%s negotiate: %s %v", addr, h, err)
+		s.logger.log(levelError, "version_negotiation_failed addr=%s %s %v", addr, h, err)
 		return
 	}
-	s.logger.Log(LevelDebug, "%s negotiate: newversion=%d %s", addr, transport.ProtocolVersion, h)
-	s.logger.Log(LevelTrace, "%s sent %d bytes\n%x", addr, n, p.buf[:n])
+	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=version_negotiation dcid=%x scid=%x", addr, h.SCID, h.DCID)
+	s.logger.log(levelTrace, "datagrams_sent addr=%s byte_length=%d raw=%x", addr, n, p.buf[:n])
 }
 
 func (s *Server) retry(addr net.Addr, h *transport.Header) {
@@ -140,23 +139,22 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	// newCID is a new DCID client shoud send in next Initial packet
 	var newCID [transport.MaxCIDLength]byte
 	if err := s.rand(newCID[:]); err != nil {
-		s.logger.Log(LevelError, "%s retry: %s %v", addr, h, err)
+		s.logger.log(levelError, "retry_failed addr=%s %s %v", addr, h, err)
 		return
 	}
-	// Set token to current header so it will be logged
-	h.Token = s.addrValid.Generate(addr, h.DCID)
-	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, h.Token)
+	token := s.addrValid.Generate(addr, h.DCID)
+	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
 	if err != nil {
-		s.logger.Log(LevelError, "%s retry: %s %v", addr, h, err)
+		s.logger.log(levelError, "retry_failed addr=%s %s %v", addr, h, err)
 		return
 	}
 	n, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.Log(LevelError, "%s retry: %s %v", addr, h, err)
+		s.logger.log(levelError, "retry_failed addr=%s %s %v", addr, h, err)
 		return
 	}
-	s.logger.Log(LevelDebug, "%s retry: %v newcid=%x", addr, h, newCID)
-	s.logger.Log(LevelTrace, "%s sent %d bytes\n%x", addr, n, p.buf[:n])
+	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=retry dcid=%x scid=%x odcid=%x token=%x", addr, h.SCID, newCID, h.DCID, token)
+	s.logger.log(levelTrace, "datagrams_sent addr=%s byte_length=%d raw=%x", addr, n, p.buf[:n])
 }
 
 func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
@@ -178,14 +176,14 @@ func (s *Server) handleNewConn(p *packet) {
 		}
 		odcid = s.verifyToken(p.addr, p.header.Token)
 		if len(odcid) == 0 {
-			s.logger.Log(LevelInfo, "%s invalid retry token: %v", p.addr, &p.header)
+			s.logger.log(levelInfo, "packet_dropped addr=%s %s trigger=invalid_token", p.addr, &p.header)
 			freePacket(p)
 			return
 		}
 	}
 	c, err := s.newConn(p.addr, p.header.DCID, odcid)
 	if err != nil {
-		s.logger.Log(LevelError, "%s create connection: %v", err)
+		s.logger.log(levelError, "create_connection_failed addr=%s %s %v", p.addr, &p.header, err)
 		freePacket(p)
 		return
 	}
@@ -199,32 +197,34 @@ func (s *Server) handleNewConn(p *packet) {
 	if _, ok := s.peers[string(c.scid[:])]; ok {
 		// Is that server too slow that client resent the packet? Log it as Error for now.
 		s.peersMu.Unlock()
-		s.logger.Log(LevelError, "%s connection id conflict scid=%x", p.addr, c.scid)
+		s.logger.log(levelError, "create_connection_failed addr=%s cid=%x trigger=conflict", p.addr, c.scid)
 		freePacket(p)
 		return
 	}
 	s.peers[string(c.scid[:])] = c
 	s.peersMu.Unlock()
-	s.logger.Log(LevelDebug, "%s new connection scid=%x odcid=%x", p.addr, c.scid, odcid)
+	s.logger.log(levelDebug, "connection_started addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
 	c.recvCh <- p // Buffered channel
 	s.handleConn(c)
 }
 
-func (s *Server) newConn(addr net.Addr, scid, odcid []byte) (*remoteConn, error) {
-	c := newRemoteConn(addr)
-	var err error
-	if len(scid) == len(c.scid) {
-		copy(c.scid[:], scid)
+func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*remoteConn, error) {
+	scid := make([]byte, transport.MaxCIDLength)
+	if len(scid) == len(oscid) {
+		copy(scid, oscid)
 	} else {
 		// Generate id for new connection since short packets don't include CID length so
 		// we use MaxCIDLength for all connections
-		if err = s.rand(c.scid[:]); err != nil {
+		if err := s.rand(scid); err != nil {
 			return nil, err
 		}
 	}
-	if c.conn, err = transport.Accept(c.scid[:], odcid, s.config); err != nil {
+	conn, err := transport.Accept(scid, odcid, s.config)
+	if err != nil {
 		return nil, err
 	}
+	c := newRemoteConn(addr, scid, conn)
+	s.logger.attachLogger(c)
 	return c, nil
 }
 
@@ -246,7 +246,7 @@ type AddressValidator interface {
 	// Generate creates a new token from given addr and odcid.
 	Generate(addr net.Addr, odcid []byte) []byte
 	// Validate returns odcid when the address and token pair is valid,
-	// empty slice otherwize.
+	// empty slice otherwise.
 	Validate(addr net.Addr, token []byte) []byte
 }
 

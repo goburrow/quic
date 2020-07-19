@@ -39,14 +39,14 @@ func (s *Client) Serve() error {
 	if s.socket == nil {
 		return errors.New("no listening connection")
 	}
-	s.logger.Log(LevelInfo, "listening %s", s.socket.LocalAddr())
+	s.logger.log(levelInfo, "connection_started addr=%v", s.socket.LocalAddr())
 	for {
 		p := newPacket()
 		n, addr, err := s.socket.ReadFrom(p.buf[:])
 		if n > 0 {
 			p.data = p.buf[:n]
 			p.addr = addr
-			s.logger.Log(LevelTrace, "%s receveid %d bytes\n%x", addr, n, p.data)
+			s.logger.log(levelTrace, "datagrams_received addr=%s byte_length=%d raw=%x", addr, n, p.data)
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -60,11 +60,10 @@ func (s *Client) Serve() error {
 func (s *Client) recv(p *packet) {
 	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
 	if err != nil {
-		s.logger.Log(LevelInfo, "%s could not parse packet: %v", p.addr, err)
+		s.logger.log(levelInfo, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
 		freePacket(p)
 		return
 	}
-	s.logger.Log(LevelDebug, "%s received packet %s", p.addr, &p.header)
 	s.peersMu.RLock()
 	if s.closing {
 		// Server is closing
@@ -76,7 +75,7 @@ func (s *Client) recv(p *packet) {
 	if ok {
 		c.recvCh <- p
 	} else {
-		s.logger.Log(LevelDebug, "%s ignore unknown destination packet: %s", p.addr, &p.header)
+		s.logger.log(levelDebug, "packet_dropped addr=%s trigger=unknown_connection_id %s", p.addr, &p.header)
 		freePacket(p)
 	}
 }
@@ -125,13 +124,15 @@ func (s *Client) newConn(addr string) (*remoteConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := newRemoteConn(udpAddr)
-	if err = s.rand(c.scid[:]); err != nil {
+	scid := make([]byte, transport.MaxCIDLength)
+	if err = s.rand(scid); err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
-	c.conn, err = transport.Connect(c.scid[:], s.config)
+	conn, err := transport.Connect(scid, s.config)
 	if err != nil {
 		return nil, err
 	}
+	c := newRemoteConn(udpAddr, scid, conn)
+	s.logger.attachLogger(c)
 	return c, nil
 }

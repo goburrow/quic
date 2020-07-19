@@ -115,7 +115,7 @@ func TestVarint(t *testing.T) {
 
 type codecTest struct {
 	t *testing.T
-	c *codec
+	c codec
 }
 
 func (t *codecTest) assertLen(n int) {

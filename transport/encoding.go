@@ -17,8 +17,8 @@ type codec struct {
 	i int    // read/write index
 }
 
-func newCodec(b []byte) *codec {
-	return &codec{b: b}
+func newCodec(b []byte) codec {
+	return codec{b: b}
 }
 
 func (s *codec) write(b []byte) bool {

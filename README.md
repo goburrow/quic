@@ -19,7 +19,7 @@ go build
 go build -tags debug
 
 # Check heap allocations
-go build -tags debug -gcflags '-m' > debug.txt 2>&1
+go build -gcflags '-m' 2>&1 | sort -V > debug.txt
 ```
 
 ```
