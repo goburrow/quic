@@ -132,7 +132,7 @@ func TestConnStream(t *testing.T) {
 		t.Fatalf("server write: %v %v", n, err)
 	}
 	events := server.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStream || events[0].StreamID != 4 {
+	if len(events) != 1 || events[0].Type != EventStreamRecv || events[0].StreamID != 4 {
 		t.Fatalf("events %+v", events)
 	}
 	st, err := server.Stream(events[0].StreamID)
@@ -258,7 +258,7 @@ func TestRecvResetStream(t *testing.T) {
 		t.Fatalf("expect flow recv %v, actual %+v", 10, conn.flow)
 	}
 	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventResetStream || events[0].StreamID != 5 || events[0].ErrorCode != 5 {
+	if len(events) != 1 || events[0].Type != EventStreamReset || events[0].StreamID != 5 || events[0].ErrorCode != 5 {
 		t.Fatalf("event %+v", events)
 	}
 }
@@ -286,7 +286,7 @@ func TestRecvStopSending(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStopSending || events[0].StreamID != 4 || events[0].ErrorCode != 9 {
+	if len(events) != 1 || events[0].Type != EventStreamStop || events[0].StreamID != 4 || events[0].ErrorCode != 9 {
 		t.Fatalf("event %+v", events)
 	}
 }

@@ -10,6 +10,9 @@ import (
 // Supported log events
 // https://quiclog.github.io/internet-drafts/draft-marx-qlog-event-definitions-quic-h3.html
 const (
+	logEventConnectionStateUpdated = "connection_state_updated"
+	logEventMetricsUpdated         = "metrics_updated"
+
 	logEventPacketReceived  = "packet_received"
 	logEventPacketSent      = "packet_sent"
 	logEventPacketDropped   = "packet_dropped"
@@ -100,6 +103,8 @@ func newLogField(key string, val interface{}) LogField {
 		}
 		b = append(b, ']')
 		s.Str = string(b)
+	case time.Duration:
+		s.Num = uint64(val / time.Millisecond)
 	default:
 		s.Str = "<unsupported_type>"
 	}
@@ -111,6 +116,15 @@ func (s LogField) String() string {
 		return sprint(s.Key, "=", s.Num)
 	}
 	return s.Key + "=" + s.Str
+}
+
+// Log connection state
+
+func newLogEventConnectionState(tm time.Time, old, new connectionState) LogEvent {
+	e := newLogEvent(tm, logEventConnectionStateUpdated)
+	e.addField("old", old.String())
+	e.addField("new", new.String())
+	return e
 }
 
 // Log packets
@@ -163,7 +177,7 @@ func logParameters(e *LogEvent, p *Parameters) {
 		e.addField("stateless_reset_token", p.StatelessResetToken)
 	}
 	if p.MaxIdleTimeout > 0 {
-		e.addField("max_idle_timeout", uint64(p.MaxIdleTimeout/time.Millisecond))
+		e.addField("max_idle_timeout", p.MaxIdleTimeout)
 	}
 	if p.MaxUDPPayloadSize > 0 {
 		e.addField("max_udp_payload_size", p.MaxUDPPayloadSize)
@@ -172,7 +186,7 @@ func logParameters(e *LogEvent, p *Parameters) {
 		e.addField("ack_delay_exponent", p.AckDelayExponent)
 	}
 	if p.MaxAckDelay > 0 {
-		e.addField("max_ack_delay", uint64(p.MaxAckDelay/time.Millisecond))
+		e.addField("max_ack_delay", p.MaxAckDelay)
 	}
 	if p.InitialMaxData > 0 {
 		e.addField("initial_max_data", p.InitialMaxData)
@@ -339,4 +353,31 @@ func logFrameConnectionClose(e *LogEvent, s *connectionCloseFrame) {
 
 func logFrameHandshakeDone(e *LogEvent, s *handshakeDoneFrame) {
 	e.addField("frame_type", "handshake_done")
+}
+
+// Recovery
+
+func newLogEventRecovery(tm time.Time, recovery *lossRecovery) LogEvent {
+	e := newLogEvent(tm, logEventMetricsUpdated)
+	// XXX: Move this to logRecovery?
+	if recovery.lossDetectionTimer.IsZero() || recovery.lossDetectionTimer.Before(tm) {
+		e.addField("loss_timer", "0")
+	} else {
+		e.addField("loss_timer", recovery.lossDetectionTimer.Sub(tm))
+	}
+	logRecovery(&e, recovery)
+	return e
+}
+
+func logRecovery(e *LogEvent, s *lossRecovery) {
+	// Loss detection
+	e.addField("min_rtt", s.minRTT)
+	e.addField("smoothed_rtt", s.roundTripTime())
+	e.addField("latest_rtt", s.latestRTT)
+	e.addField("rtt_variance", s.rttVariance)
+	e.addField("pto_count", s.ptoCount)
+	// Congestion control
+	e.addField("congestion_window", s.congestion.congestionWindow)
+	e.addField("bytes_in_flight", s.congestion.bytesInFlight)
+	e.addField("ssthresh", s.congestion.slowStartThreshold)
 }

@@ -60,7 +60,7 @@ func (s *logger) attachLogger(c *remoteConn) {
 	}
 	tl := transactionLogger{
 		writer: s, // Write protected
-		prefix: fmt.Sprintf("addr=%s cid=%x", c.addr, c.scid),
+		prefix: fmt.Sprintf("cid=%x", c.scid),
 	}
 	c.conn.OnLogEvent(tl.logEvent)
 }

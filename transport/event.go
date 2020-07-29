@@ -2,10 +2,10 @@ package transport
 
 // Suppported event types
 const (
-	EventStream         = "stream"
-	EventStopSending    = "stop_sending"
-	EventResetStream    = "reset_stream"
-	EventStreamComplete = "stream_complete"
+	EventStreamRecv     = "stream_recv"     // Received stream data and readable
+	EventStreamStop     = "stream_stop"     // Received stream stop sending
+	EventStreamReset    = "stream_reset"    // Received stream reset
+	EventStreamComplete = "stream_complete" // All sending data has been acked.
 )
 
 // Event is a union structure of all events.
@@ -15,34 +15,34 @@ type Event struct {
 	ErrorCode uint64
 }
 
-// newStreamRecvEvent creates an event where a STREAM frame was received and data is readable.
-func newStreamRecvEvent(id uint64) Event {
+// newEventStreamRecv creates an event where a STREAM frame was received and data is readable.
+func newEventStreamRecv(id uint64) Event {
 	return Event{
-		Type:     EventStream,
+		Type:     EventStreamRecv,
 		StreamID: id,
 	}
 }
 
-// newStreamStopEvent creates an event where a STOP_SENDING frame was received.
-func newStreamStopEvent(id, code uint64) Event {
+// newEventStreamStop creates an event where a STOP_SENDING frame was received.
+func newEventStreamStop(id, code uint64) Event {
 	return Event{
-		Type:      EventStopSending,
+		Type:      EventStreamStop,
 		StreamID:  id,
 		ErrorCode: code,
 	}
 }
 
-// newStreamResetEvent creates an event where a RESET_STREAM frame was received.
-func newStreamResetEvent(id, code uint64) Event {
+// newEventStreamReset creates an event where a RESET_STREAM frame was received.
+func newEventStreamReset(id, code uint64) Event {
 	return Event{
-		Type:      EventResetStream,
+		Type:      EventStreamReset,
 		StreamID:  id,
 		ErrorCode: code,
 	}
 }
 
-// newStreamComplete creates an event where all data of the stream has been acked by peer.
-func newStreamCompleteEvent(id uint64) Event {
+// newEventStreamComplete creates an event where all data of the stream has been acked by peer.
+func newEventStreamComplete(id uint64) Event {
 	return Event{
 		Type:     EventStreamComplete,
 		StreamID: id,

@@ -39,7 +39,6 @@ func (s *Client) Serve() error {
 	if s.socket == nil {
 		return errors.New("no listening connection")
 	}
-	s.logger.log(levelInfo, "connection_started addr=%v", s.socket.LocalAddr())
 	for {
 		p := newPacket()
 		n, addr, err := s.socket.ReadFrom(p.buf[:])
@@ -98,6 +97,7 @@ func (s *Client) Connect(addr string) error {
 	s.peers[string(c.scid[:])] = c
 	s.peersMu.Unlock()
 	// Send initial packet
+	s.logger.log(levelDebug, "connection_started addr=%v cid=%x", c.addr, c.scid)
 	p := newPacket()
 	defer freePacket(p)
 	if err = s.sendConn(c, p.buf[:maxDatagramSize]); err != nil {

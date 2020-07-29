@@ -26,7 +26,7 @@ func TestServerAndClient(t *testing.T) {
 		for _, e := range events {
 			switch e.Type {
 			case EventConnAccept:
-			case transport.EventStream:
+			case transport.EventStreamRecv:
 				st := conn.Stream(e.StreamID)
 				buf := make([]byte, 8)
 				n, err := st.Read(buf)
@@ -76,7 +76,7 @@ func TestServerAndClient(t *testing.T) {
 					st.Write([]byte("ping"))
 					st.Close()
 				}
-			case transport.EventStream:
+			case transport.EventStreamRecv:
 				st := conn.Stream(e.StreamID)
 				buf := make([]byte, 8)
 				n, err := st.Read(buf)

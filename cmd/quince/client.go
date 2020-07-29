@@ -56,7 +56,7 @@ func (s *clientHandler) Serve(c quic.Conn, events []transport.Event) {
 			st := c.Stream(4)
 			_, _ = st.Write([]byte(s.data))
 			_ = st.Close()
-		case transport.EventStream:
+		case transport.EventStreamRecv:
 			st := c.Stream(e.StreamID)
 			if st != nil {
 				buf := make([]byte, 512)

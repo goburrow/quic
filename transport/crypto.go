@@ -26,22 +26,18 @@ var initialSalt = []byte{
 	0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99,
 }
 
-type initialAEAD struct {
-	client packetProtection
-	server packetProtection
-}
-
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#initial-secrets
-func (s *initialAEAD) init(cid []byte) {
+func newInitialSecrets(cid []byte) (client, server packetProtection) {
 	suite := tls13.CipherSuiteByID(tls.TLS_AES_128_GCM_SHA256)
 	initialSecret := suite.Extract(cid, initialSalt)
 	// client
 	clientSecret := deriveSecret(suite, initialSecret, "client in")
-	s.client.init(suite, clientSecret)
+	client.init(suite, clientSecret)
 
 	// server
 	serverSecret := deriveSecret(suite, initialSecret, "server in")
-	s.server.init(suite, serverSecret)
+	server.init(suite, serverSecret)
+	return
 }
 
 func deriveSecret(suite tls13.CipherSuite, secret []byte, label string) []byte {
@@ -184,9 +180,8 @@ const (
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-header-protection
 type headerProtection struct {
-	block cipher.Block          // AES
-	mask  [headerSampleLen]byte // Reuse buffer for AES encrypt
-	key   [32]byte              // ChaCha20
+	block cipher.Block // AES Cipher
+	key   [32]byte     // ChaCha20 key. For AES it is used as buffer to avoid allocating to heap
 }
 
 func (s *headerProtection) applyMask(sample []byte) [headerMaskLen]byte {
@@ -213,8 +208,8 @@ func (s *headerProtection) aesInit(key []byte) {
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-aes-based-header-protection
 // mask = AES-ECB(hp_key, sample)
 func (s *headerProtection) aesMask(sample, mask []byte) {
-	s.block.Encrypt(s.mask[:], sample)
-	copy(mask, s.mask[:])
+	s.block.Encrypt(s.key[:headerSampleLen], sample)
+	copy(mask, s.key[:headerSampleLen])
 }
 
 func (s *headerProtection) chaCha20Init(key []byte) {

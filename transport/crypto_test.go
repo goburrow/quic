@@ -69,15 +69,14 @@ func TestDecryptClientInitial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead := initialAEAD{}
-	aead.init(testdata.DecodeHex("8394c8f03e515708"))
-	err = aead.client.decryptHeader(b, pnOffset)
+	client, _ := newInitialSecrets(testdata.DecodeHex("8394c8f03e515708"))
+	err = client.decryptHeader(b, pnOffset)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.header.flags = b[0]
 	n, err := p.decodeBody(b)
-	payload, err := aead.client.decryptPayload(b[:headerLen+n+p.payloadLen], p.packetNumber, p.payloadLen)
+	payload, err := client.decryptPayload(b[:headerLen+n+p.payloadLen], p.packetNumber, p.payloadLen)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,15 +110,14 @@ func TestDecryptServerInitial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead := initialAEAD{}
-	aead.init(testdata.DecodeHex("8394c8f03e515708"))
-	err = aead.server.decryptHeader(b, pnOffset)
+	_, server := newInitialSecrets(testdata.DecodeHex("8394c8f03e515708"))
+	err = server.decryptHeader(b, pnOffset)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.header.flags = b[0]
 	n, err := p.decodeBody(b)
-	payload, err := aead.server.decryptPayload(b[:headerLen+n+p.payloadLen], p.packetNumber, p.payloadLen)
+	payload, err := server.decryptPayload(b[:headerLen+n+p.payloadLen], p.packetNumber, p.payloadLen)
 	if err != nil {
 		t.Fatal(err)
 	}

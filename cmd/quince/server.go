@@ -49,7 +49,7 @@ func (s *serverHandler) Serve(c quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		fmt.Printf("%s connection event: %v\n", c.RemoteAddr(), e.Type)
 		switch e.Type {
-		case transport.EventStream:
+		case transport.EventStreamRecv:
 			st := c.Stream(e.StreamID)
 			if st != nil {
 				// echo data back

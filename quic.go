@@ -3,7 +3,6 @@ package quic
 
 import (
 	"crypto/rand"
-	"errors"
 	"io"
 	"net"
 	"sync"
@@ -14,8 +13,7 @@ import (
 
 const (
 	maxDatagramSize = transport.MaxIPv6PacketSize
-	bufferSize      = 1536
-	maxTokenLen     = 64 + transport.MaxCIDLength
+	bufferSize      = 1500
 )
 
 // Extend transport events
@@ -26,11 +24,14 @@ const (
 
 // Conn is an asynchronous QUIC connection.
 type Conn interface {
-	net.Conn
-	// Stream returns QUIC stream by ID.
+	// Stream creates or returns an existing QUIC stream given the ID.
 	Stream(id uint64) io.ReadWriteCloser
-	// SetStream sets or creates stream for Read and Write.
-	SetStream(id uint64)
+	// LocalAddr returns the local network address.
+	LocalAddr() net.Addr
+	// RemoteAddr returns the remote network address.
+	RemoteAddr() net.Addr
+	// Close sets state of the connection to closing.
+	Close() error
 }
 
 // Handler defines interface to handle QUIC connection states.
@@ -50,9 +51,6 @@ type remoteConn struct {
 
 	events []transport.Event
 	recvCh chan *packet
-
-	// Current stream for Read and Write
-	stream *transport.Stream
 }
 
 func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn) *remoteConn {
@@ -64,22 +62,9 @@ func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn) *remoteConn
 	}
 }
 
-func (s *remoteConn) Read(b []byte) (int, error) {
-	if s.stream == nil {
-		return 0, errors.New("invalid stream")
-	}
-	return s.stream.Read(b)
-}
-
-func (s *remoteConn) Write(b []byte) (int, error) {
-	if s.stream == nil {
-		return 0, errors.New("invalid stream")
-	}
-	return s.stream.Write(b)
-}
-
+// Close sets the connection status to close state.
 func (s *remoteConn) Close() error {
-	s.conn.Close(true, transport.NoError, "close")
+	s.conn.Close(true, transport.NoError, "bye")
 	return nil
 }
 
@@ -92,10 +77,6 @@ func (s *remoteConn) Stream(id uint64) io.ReadWriteCloser {
 	return st
 }
 
-func (s *remoteConn) SetStream(id uint64) {
-	s.stream, _ = s.conn.Stream(id)
-}
-
 func (s *remoteConn) LocalAddr() net.Addr {
 	return nil // TODO: get from socket
 }
@@ -104,18 +85,7 @@ func (s *remoteConn) RemoteAddr() net.Addr {
 	return s.addr
 }
 
-func (s *remoteConn) SetDeadline(t time.Time) error {
-	return errors.New("not implemented")
-}
-
-func (s *remoteConn) SetReadDeadline(t time.Time) error {
-	return errors.New("not implemented")
-}
-
-func (s *remoteConn) SetWriteDeadline(t time.Time) error {
-	return errors.New("not implemented")
-}
-
+// localConn is a local quic connection.
 type localConn struct {
 	config *transport.Config
 	socket net.PacketConn
@@ -155,6 +125,7 @@ func (s *localConn) SetListen(conn net.PacketConn) {
 	s.socket = conn
 }
 
+// handleConn handles data sending to the connection c.
 func (s *localConn) handleConn(c *remoteConn) {
 	defer s.connClosed(c)
 	established := false
@@ -294,11 +265,11 @@ func (s *localConn) rand(b []byte) error {
 }
 
 type packet struct {
-	buf  [bufferSize]byte
-	data []byte // Always points to buf
-	addr net.Addr
-
+	data   []byte // Always points to buf
+	addr   net.Addr
 	header transport.Header
+
+	buf [bufferSize]byte
 }
 
 var packetPool = sync.Pool{}

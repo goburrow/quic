@@ -5,6 +5,13 @@ import (
 	"time"
 )
 
+func TestLogConnectionState(t *testing.T) {
+	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
+	e := newLogEventConnectionState(tm, stateHandshake, stateActive)
+	expect := "2020-01-05T00:00:00Z connection_state_updated old=handshake new=active"
+	assertLogEvent(t, e, expect)
+}
+
 func TestLogParameters(t *testing.T) {
 	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
 	p := &Parameters{
@@ -31,10 +38,7 @@ func TestLogParameters(t *testing.T) {
 		"max_idle_timeout=60000 max_udp_payload_size=1500 ack_delay_exponent=3 max_ack_delay=100 " +
 		"initial_max_data=1000 initial_max_stream_data_bidi_local=200 initial_max_stream_data_bidi_remote=300 " +
 		"initial_max_stream_data_uni=100 initial_max_streams_bidi=10 initial_max_streams_uni=5"
-	actual := e.String()
-	if expect != actual {
-		t.Fatalf("\nexpect %v\nactual %v", expect, actual)
-	}
+	assertLogEvent(t, e, expect)
 }
 
 func TestLogFramePadding(t *testing.T) {
@@ -128,6 +132,23 @@ func testLogFrame(t *testing.T, f frame, expect string) {
 	tm := time.Date(2020, time.January, 5, 2, 3, 4, 5, time.UTC)
 	e := newLogEventFrame(tm, logEventFramesProcessed, f)
 	expect = "2020-01-05T02:03:04Z frames_processed " + expect
+	actual := e.String()
+	if expect != actual {
+		t.Helper()
+		t.Fatalf("\nexpect %v\nactual %v", expect, actual)
+	}
+}
+
+func TestLogRecovery(t *testing.T) {
+	r := lossRecovery{}
+	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
+	e := newLogEventRecovery(tm, &r)
+	expect := "2020-01-05T00:00:00Z metrics_updated loss_timer=0 min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=0 " +
+		"pto_count=0 congestion_window=0 bytes_in_flight=0 ssthresh=0"
+	assertLogEvent(t, e, expect)
+}
+
+func assertLogEvent(t *testing.T, e LogEvent, expect string) {
 	actual := e.String()
 	if expect != actual {
 		t.Helper()

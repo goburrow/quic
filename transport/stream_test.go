@@ -15,6 +15,9 @@ func TestStreamRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !s.isReadable() {
+		t.Fatalf("expect readable: %v", &s)
+	}
 	// Consume
 	b = make([]byte, 10)
 	n, err := s.Read(b[:4])
@@ -28,6 +31,9 @@ func TestStreamRecv(t *testing.T) {
 	}
 	// End
 	_, err = s.Read(b)
+	if s.isReadable() {
+		t.Fatalf("expect not readable: %v", &s)
+	}
 	if err != io.EOF {
 		t.Fatalf("expect error %v, actual %v", io.EOF, err)
 	}

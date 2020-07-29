@@ -75,6 +75,11 @@ func (s *Stream) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// isReadable returns true if the stream has any data to read.
+func (s *Stream) isReadable() bool {
+	return s.recv.ready()
+}
+
 // isFlushable returns true if the stream has data to send
 func (s *Stream) isFlushable() bool {
 	// flow maxSend is controlled by peer via MAX_STREAM_DATA
@@ -168,6 +173,11 @@ func (s *recvStream) Read(b []byte) (int, error) {
 	n := s.buf.read(b, s.offset)
 	s.offset += uint64(n)
 	return n, nil
+}
+
+// ready returns true if data is available at the current read offset.
+func (s *recvStream) ready() bool {
+	return s.offset < s.length && len(s.buf) > 0 && s.buf[0].offset == s.offset
 }
 
 func (s *recvStream) isFin() bool {
