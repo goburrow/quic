@@ -30,12 +30,15 @@ func TestStreamRecv(t *testing.T) {
 		t.Fatalf("expect read %v %v %s, actual %v %v %s", 6, nil, "stream", n, err, b[:n])
 	}
 	// End
-	_, err = s.Read(b)
-	if s.isReadable() {
-		t.Fatalf("expect not readable: %v", &s)
+	if !s.isReadable() {
+		t.Fatalf("expect readable: %v", &s)
 	}
+	_, err = s.Read(b)
 	if err != io.EOF {
 		t.Fatalf("expect error %v, actual %v", io.EOF, err)
+	}
+	if s.isReadable() {
+		t.Fatalf("expect not readable: %v", &s)
 	}
 	// Receive wrong offset
 	s.flow.maxRecv++
@@ -51,22 +54,35 @@ func TestStreamSend(t *testing.T) {
 	s.flow.init(0, 10)
 	// Send
 	b := []byte("sendstream")
-	n, err := s.Write(b)
-	if err != nil || n != len(b) {
-		t.Fatalf("expect write %v %v, actual %v %v", len(b), nil, n, err)
+	n, err := s.Write(b[:4])
+	if err != nil || n != 4 {
+		t.Fatalf("expect write %v %v, actual %v %v", 4, nil, n, err)
+	}
+	if !s.isWriteable() {
+		t.Fatalf("expect writeable: %v", &s)
+	}
+	n, err = s.Write(b[4:])
+	if err != nil || n != 6 {
+		t.Fatalf("expect write %v %v, actual %v %v", 6, nil, n, err)
+	}
+	if s.isWriteable() {
+		t.Fatalf("expect not writeable: %v", &s)
 	}
 	// Done sending
 	err = s.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if s.isWriteable() {
+		t.Fatalf("expect not writeable: %v", &s)
+	}
 	// Consume
-	b, off, fin := s.send.pop(4)
+	b, off, fin := s.popSend(4)
 	if string(b) != "send" || off != 0 || fin != false {
 		t.Fatalf("expect pop %q %v %v, actual %s %v %v", "send", 0, false, b, off, fin)
 	}
 	// Continue consume
-	b, off, fin = s.send.pop(20)
+	b, off, fin = s.popSend(20)
 	if string(b) != "stream" || off != 4 || fin != true {
 		t.Fatalf("expect pop %q %v %v, actual %s %v %v", "stream", 4, true, b, off, fin)
 	}
@@ -79,6 +95,33 @@ func TestStreamSend(t *testing.T) {
 	n, err = s.Write(b[:1])
 	if n != 0 || err != errFinalSize {
 		t.Fatalf("expect write %v %v, actual %v %v", 0, errFinalSize, n, err)
+	}
+}
+
+func TestStreamClose(t *testing.T) {
+	s := Stream{}
+	s.init(false, true)
+	s.flow.init(0, 10)
+
+	_, err := s.Write([]byte("stream"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read all data before close
+	b, off, fin := s.popSend(20)
+	if string(b) != "stream" || off != 0 || fin != false {
+		t.Fatalf("expect pop %q %v %v, actual %s %v %v", "stream", 0, false, b, off, fin)
+	}
+	err = s.Close()
+	if err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+	if !s.isFlushable() {
+		t.Fatalf("expect flushable: %+v", &s)
+	}
+	b, off, fin = s.popSend(20)
+	if len(b) != 0 || off != 6 || fin != true {
+		t.Fatalf("expect pop %q %v %v, actual %s %v %v", "", 6, true, b, off, fin)
 	}
 }
 
@@ -116,9 +159,9 @@ func TestStreamLocalBidi(t *testing.T) {
 		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.totalSend)
 	}
 	// Send too much data
-	_, err = s.Write(b[:1])
-	if err != errFlowControl {
-		t.Fatalf("expect error %v, actual %v", errFlowControl, err)
+	n, err = s.Write(b[:1])
+	if err != nil || n != 0 {
+		t.Fatalf("expect nothing written, actual %v %v", n, err)
 	}
 	if s.flow.totalSend != 10 {
 		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.totalSend)

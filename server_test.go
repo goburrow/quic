@@ -77,7 +77,7 @@ func TestServerNoConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	s = newServer()
-	s.SetListen(socket)
+	s.SetListener(socket)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {

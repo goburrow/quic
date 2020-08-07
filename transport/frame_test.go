@@ -94,6 +94,20 @@ func TestFrameAckRangeSet(t *testing.T) {
 	}
 }
 
+func TestFrameAckContinuous(t *testing.T) {
+	var f ackFrame
+	var ranges rangeSet
+	for i := 0; i < 1000; i++ {
+		n := uint64(i)
+		ranges.push(n, n)
+		f.fromRangeSet(ranges)
+		actual := f.toRangeSet()
+		if len(actual) != 1 || actual[0].start != 0 || actual[0].end != n {
+			t.Fatalf("expect range %v, actual %v", ranges, actual)
+		}
+	}
+}
+
 func TestFrameConnectionClose(t *testing.T) {
 	f := &connectionCloseFrame{
 		errorCode:    0x5678,

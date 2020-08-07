@@ -1,5 +1,7 @@
 package transport
 
+import "fmt"
+
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#flow-control
 type flowControl struct {
 	totalRecv   uint64 // Total bytes received from peer - updated when data is received.
@@ -25,7 +27,7 @@ func (s *flowControl) canRecv() uint64 {
 }
 
 // addRecv adds to number of bytes received.
-// This function is called when data is succesfully received.
+// This function is called when data is successfully received.
 func (s *flowControl) addRecv(n int) {
 	s.totalRecv += uint64(n)
 }
@@ -72,4 +74,9 @@ func (s *flowControl) setMaxSend(n uint64) {
 	if n > s.maxSend {
 		s.maxSend = n
 	}
+}
+
+func (s *flowControl) String() string {
+	return fmt.Sprintf("recv=%d maxRecv=%d maxRecvNext=%d send=%d maxSend=%d",
+		s.totalRecv, s.maxRecv, s.maxRecvNext, s.totalSend, s.maxSend)
 }

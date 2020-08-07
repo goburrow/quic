@@ -132,10 +132,11 @@ func TestConnStream(t *testing.T) {
 		t.Fatalf("server write: %v %v", n, err)
 	}
 	events := server.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStreamRecv || events[0].StreamID != 4 {
+	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
+		events[1].Type != EventStreamWritable || events[1].ID != 4 {
 		t.Fatalf("events %+v", events)
 	}
-	st, err := server.Stream(events[0].StreamID)
+	st, err := server.Stream(events[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +215,8 @@ func TestInvalidConn(t *testing.T) {
 }
 
 func TestRecvResetStream(t *testing.T) {
-	conn, err := Connect([]byte("client"), NewConfig())
+	config := NewConfig()
+	conn, err := Connect([]byte("client"), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +231,7 @@ func TestRecvResetStream(t *testing.T) {
 	// Too much data
 	f = resetStreamFrame{
 		streamID:  3,
-		finalSize: 2000,
+		finalSize: config.Params.InitialMaxStreamDataBidiLocal + 1,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
 	if err != errFlowControl {
@@ -258,7 +260,7 @@ func TestRecvResetStream(t *testing.T) {
 		t.Fatalf("expect flow recv %v, actual %+v", 10, conn.flow)
 	}
 	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStreamReset || events[0].StreamID != 5 || events[0].ErrorCode != 5 {
+	if len(events) != 1 || events[0].Type != EventStreamReset || events[0].ID != 5 || events[0].Data != 5 {
 		t.Fatalf("event %+v", events)
 	}
 }
@@ -286,7 +288,7 @@ func TestRecvStopSending(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStreamStop || events[0].StreamID != 4 || events[0].ErrorCode != 9 {
+	if len(events) != 1 || events[0].Type != EventStreamStop || events[0].ID != 4 || events[0].Data != 9 {
 		t.Fatalf("event %+v", events)
 	}
 }

@@ -143,6 +143,7 @@ func (s *Conn) Write(b []byte) (int, error) {
 		n += i
 	}
 	s.checkTimeout(now)
+	s.addStreamEvents()
 	return n, nil
 }
 
@@ -311,43 +312,46 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 		s.logPacketDropped(p, now)
 		return len(b), nil
 	}
-	payload, length, err := pnSpace.decryptPacket(b, p)
+	payload, err := pnSpace.decryptPacket(b, p)
 	if err != nil {
 		return 0, err
 	}
-	debug("decrypted packet %v payload=%d", p, len(payload))
+	debug("received packet %v payload=%d", p, len(payload))
 	if pnSpace.isPacketReceived(p.packetNumber) {
 		// Ignore duplicate packet
 		s.logPacketDropped(p, now)
-		return length, nil
+		return p.packetSize, nil
 	}
 	s.logPacketReceived(p, now)
-	if err = s.recvFrames(payload, space, now); err != nil {
+	if err = s.recvFrames(payload, p.typ, space, now); err != nil {
 		return 0, err
 	}
-
 	// Process acked frames
 	s.processAckedPackets(space)
 
+	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-abandoning-initial-packets
+	// A server stops sending and processing Initial packets when it receives its first Handshake packet.
+	if space == packetSpaceHandshake {
+		if !s.isClient && pnSpace.largestRecvPacketTime.IsZero() {
+			s.dropPacketSpace(packetSpaceInitial)
+		}
+		if s.state < stateHandshake {
+			s.setState(stateHandshake, now)
+		}
+	}
 	// Mark this packet received
 	pnSpace.onPacketReceived(p.packetNumber, now)
 
 	if s.localParams.MaxIdleTimeout > 0 {
 		s.idleTimer = now.Add(s.localParams.MaxIdleTimeout)
 	}
-	// An Handshake packet has been received from the client and has been successfully processed,
-	// so we can drop the initial state and consider the client's address to be verified.
-	if !s.isClient && space == packetSpaceHandshake && s.state == stateAttempted {
-		s.setState(stateHandshake, now)
-		s.dropPacketSpace(packetSpaceInitial)
-	}
 	s.ackElicitingSent = false
-	return length, nil
+	return p.packetSize, nil
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#frames
 // recvFrames sets ackElicited if a received frame is an ack eliciting.
-func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
+func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now time.Time) error {
 	// To avoid sending an ACK in response to an ACK-only packet, we need
 	// to keep track of whether this packet contains any frame other than
 	// ACK, PADDING and CONNECTION_CLOSE.
@@ -357,6 +361,9 @@ func (s *Conn) recvFrames(b []byte, space packetSpace, now time.Time) error {
 		n := getVarint(b, &typ)
 		if n == 0 {
 			return newError(FrameEncodingError, "")
+		}
+		if !isFrameAllowedInPacket(typ, pktType) {
+			return newError(ProtocolViolation, sprint("unexpected frame ", typ))
 		}
 		var err error
 		// TODO: Check allowed frames for current packet type
@@ -437,19 +444,6 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 	}
 	ackDelay := time.Duration((1<<s.peerParams.AckDelayExponent)*f.ackDelay) * time.Microsecond
 	s.recovery.onAckReceived(ranges, ackDelay, space, now)
-
-	if !s.packetNumberSpaces[space].firstPacketAcked {
-		s.packetNumberSpaces[space].firstPacketAcked = true
-		// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-handshake-confirmed
-		// When we receive an ACK for a 1-RTT packet after handshake completion,
-		// it means the handshake has been confirmed.
-		if space == packetSpaceApplication && s.state == stateActive {
-			s.dropPacketSpace(packetSpaceHandshake)
-			if s.isClient && !s.handshakeConfirmed {
-				s.handshakeConfirmed = true
-			}
-		}
-	}
 	s.logFrameProcessed(&f, now)
 	return n, nil
 }
@@ -474,7 +468,7 @@ func (s *Conn) recvFrameResetStream(b []byte, now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	mayRecv, err := st.recv.reset(f.finalSize)
+	mayRecv, err := st.resetRecv(f.finalSize)
 	if err != nil {
 		return 0, err
 	}
@@ -575,7 +569,7 @@ func (s *Conn) recvFrameStream(b []byte, now time.Time) (int, error) {
 	// which is used to check for flow control violations
 	s.flow.addRecv(len(f.data))
 	if st.isReadable() {
-		s.addEvent(newEventStreamRecv(f.streamID))
+		s.addEvent(newEventStreamReadable(f.streamID))
 	}
 	s.logFrameProcessed(&f, now)
 	return n, nil
@@ -698,12 +692,12 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 			// Stop sending ack for packets when receiving is confirmed
 			pnSpace.recvPacketNeedAck.removeUntil(f.largestAck)
 		case *cryptoFrame:
-			pnSpace.cryptoStream.send.ack(f.offset, uint64(len(f.data)))
+			pnSpace.cryptoStream.ackSend(f.offset, uint64(len(f.data)))
 		case *streamFrame:
 			st := s.streams.get(f.streamID)
 			if st != nil {
-				st.send.ack(f.offset, uint64(len(f.data)))
-				if st.send.complete() {
+				complete := st.ackSend(f.offset, uint64(len(f.data)))
+				if complete {
 					s.addEvent(newEventStreamComplete(f.streamID))
 					// TODO: Garbage collect the stream
 				}
@@ -853,9 +847,11 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 	pktOverhead := p.encodedLen() + overhead - p.payloadLen // Packet length without payload
 	left := avail - pktOverhead
 	if left <= minPayloadLength {
-		return 0, errShortBuffer
+		// May due to congestion control
+		debug("short buffer: avail=%d left=%d", avail, left)
+		return 0, nil
 	}
-	s.processLostPackets(space)
+	s.processLostPackets(space, now)
 	// Add frames
 	op := newSentPacket(p.packetNumber, now)
 	p.payloadLen = s.sendFrames(op, space, left, now)
@@ -892,27 +888,36 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 		return 0, err
 	}
 	// Encode frames to sending packet then encrypt it
-	n, err := encodeFrames(b[payloadOffset:], op.frames)
+	p.packetSize, err = encodeFrames(b[payloadOffset:], op.frames)
 	if err != nil {
 		return 0, err
 	}
-	n += payloadOffset + overhead
-	if n != payloadOffset+p.payloadLen || n > len(b) {
-		return 0, newError(InternalError, sprint("encoded payload length ", n, " exceeded buffer capacity ", len(b)))
+	p.packetSize += payloadOffset + overhead
+	if p.packetSize != payloadOffset+p.payloadLen || p.packetSize > len(b) {
+		return 0, newError(InternalError, sprint("encoded payload length ", p.packetSize, " exceeded buffer capacity ", len(b)))
 	}
-	pnSpace.encryptPacket(b[:n], &p)
-	op.sentBytes = uint64(n)
+	pnSpace.encryptPacket(b[:p.packetSize], &p)
+	op.sentBytes = uint64(p.packetSize)
 	// Finish preparing sending packet
 	debug("sending packet %s %s", &p, op)
 	s.onPacketSent(op, space)
 	// TODO: Log real payload length without crypto overhead
 	s.logPacketSent(&p, op.frames, now)
-	// On the client, drop initial state after sending an Handshake packet.
-	if s.isClient && p.typ == packetTypeHandshake && s.state == stateAttempted {
-		s.setState(stateHandshake, now)
-		s.dropPacketSpace(packetSpaceInitial)
+	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-abandoning-initial-packets
+	// A client stops both sending and processing Initial packets when it sends its first Handshake packet.
+	if p.typ == packetTypeHandshake {
+		if s.isClient && p.packetNumber == 0 {
+			s.dropPacketSpace(packetSpaceInitial)
+		}
+		if s.state < stateHandshake {
+			s.setState(stateHandshake, now)
+		}
 	}
-	return n, nil
+	if p.packetNumber == 0 && !s.isClient && space == packetSpaceApplication {
+		// First Application packet from server is HandshakeDone
+		s.dropPacketSpace(packetSpaceHandshake)
+	}
+	return p.packetSize, nil
 }
 
 func (s *Conn) writeSpace() packetSpace {
@@ -966,16 +971,17 @@ func (s *Conn) maxPacketSize() int {
 	return int(n)
 }
 
-func (s *Conn) processLostPackets(space packetSpace) {
+func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
+	s.logPacketsLost(s.recovery.lost[space], space, now)
 	pnSpace := &s.packetNumberSpaces[space]
 	s.recovery.drainLost(space, func(f frame) {
-		debug("lost frame %v", f)
+		debug("lost frame space=%v %v", space, f)
 		switch f := f.(type) {
 		case *ackFrame:
 			pnSpace.ackElicited = true
 		case *cryptoFrame:
 			// Push data back to send again
-			err := pnSpace.cryptoStream.send.push(f.data, f.offset, false)
+			err := pnSpace.cryptoStream.pushSend(f.data, f.offset, false)
 			if err != nil {
 				debug("process lost crypto frame %s: %v", f, err)
 			}
@@ -983,7 +989,7 @@ func (s *Conn) processLostPackets(space packetSpace) {
 			st := s.streams.get(f.streamID)
 			if st != nil {
 				// Push data back to send again
-				err := st.send.push(f.data, f.offset, f.fin)
+				err := st.pushSend(f.data, f.offset, f.fin)
 				if err != nil {
 					debug("process lost stream frame %s: %v", f, err)
 				}
@@ -1211,8 +1217,7 @@ func (s *Conn) sendFrameStream(id uint64, st *Stream, left int) *streamFrame {
 	}
 	if left > 0 {
 		data, offset, fin := st.popSend(left)
-		if len(data) > 0 {
-			debug("stream: %v", st)
+		if len(data) > 0 || fin {
 			return newStreamFrame(id, data, offset, fin)
 		}
 	}
@@ -1297,12 +1302,24 @@ func (s *Conn) setState(state connectionState, now time.Time) {
 		s.logEventFn(newLogEventConnectionState(now, s.state, state))
 	}
 	s.state = state
+	debug("set state=%v", state)
 }
 
 func (s *Conn) dropPacketSpace(space packetSpace) {
 	s.packetNumberSpaces[space].drop()
 	s.recovery.onPacketNumberSpaceDiscarded(space)
 	debug("dropped space=%v", space)
+}
+
+func (s *Conn) addStreamEvents() {
+	if s.state != stateActive || s.flow.canSend() == 0 {
+		return
+	}
+	for id, st := range s.streams.streams {
+		if st.isWriteable() {
+			s.addEvent(newEventStreamWritable(id))
+		}
+	}
 }
 
 func (s *Conn) addEvent(e Event) {
@@ -1357,6 +1374,18 @@ func (s *Conn) logPacketSent(p *packet, frames []frame, now time.Time) {
 		s.logEventFn(newLogEventPacket(now, logEventPacketSent, p))
 		for _, f := range frames {
 			s.logEventFn(newLogEventFrame(now, logEventFramesProcessed, f))
+		}
+	}
+}
+
+func (s *Conn) logPacketsLost(packets []*sentPacket, space packetSpace, now time.Time) {
+	if s.logEventFn != nil {
+		p := packet{
+			typ: packetTypeFromSpace(space),
+		}
+		for _, sp := range packets {
+			p.packetNumber = sp.packetNumber
+			s.logEventFn(newLogEventPacket(now, logEventPacketLost, &p))
 		}
 	}
 }

@@ -21,7 +21,7 @@ const (
 )
 
 // version ff00001d
-var initialSalt = []byte{
+var initialSalt = [...]byte{
 	0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97,
 	0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99,
 }
@@ -29,7 +29,7 @@ var initialSalt = []byte{
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#initial-secrets
 func newInitialSecrets(cid []byte) (client, server packetProtection) {
 	suite := tls13.CipherSuiteByID(tls.TLS_AES_128_GCM_SHA256)
-	initialSecret := suite.Extract(cid, initialSalt)
+	initialSecret := suite.Extract(cid, initialSalt[:])
 	// client
 	clientSecret := deriveSecret(suite, initialSecret, "client in")
 	client.init(suite, clientSecret)
@@ -233,12 +233,12 @@ func (s *headerProtection) chacha20Mask(sample, mask []byte) {
 
 const retryIntegrityTagLen = 16
 
-var retryIntegrityKey = []byte{
+var retryIntegrityKey = [...]byte{
 	0xcc, 0xce, 0x18, 0x7e, 0xd0, 0x9a, 0x09, 0xd0,
 	0x57, 0x28, 0x15, 0x5a, 0x6c, 0xb9, 0x6b, 0xe1,
 }
 
-var retryIntegrityNonce = []byte{
+var retryIntegrityNonce = [...]byte{
 	0xe5, 0x49, 0x30, 0xf9, 0x7f, 0x21, 0x36, 0xf0,
 	0x53, 0x0a, 0x8c, 0x1c,
 }
@@ -248,7 +248,7 @@ var retryIntegrityAEAD cipher.AEAD
 func newRetryIntegrityAEAD() cipher.AEAD {
 	if retryIntegrityAEAD == nil {
 		// XXX: Need sync.Once?
-		aes, err := aes.NewCipher(retryIntegrityKey)
+		aes, err := aes.NewCipher(retryIntegrityKey[:])
 		if err != nil {
 			panic(err)
 		}
@@ -269,7 +269,7 @@ func computeRetryIntegrity(pseudo []byte) ([]byte, error) {
 		// Avoid allocating
 		return nil, errShortBuffer
 	}
-	b := aead.Seal(pseudo, retryIntegrityNonce, nil, pseudo)
+	b := aead.Seal(pseudo, retryIntegrityNonce[:], nil, pseudo)
 	return b, nil
 }
 

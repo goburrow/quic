@@ -21,7 +21,7 @@ const (
 	levelTrace
 )
 
-const logTimeFormat = "2006-01-02T15:04:05" // RFC 3339 without timezone
+const logTimeFormat = "2006/01/02 15:04:05.000000" // Similar to log package
 
 // logger logs QUIC transactions.
 type logger struct {
@@ -54,7 +54,7 @@ func (s *logger) log(level logLevel, format string, values ...interface{}) {
 	s.writer.Write(b.Bytes())
 }
 
-func (s *logger) attachLogger(c *remoteConn) {
+func (s *logger) attachLogger(c *Conn) {
 	if s.level < levelDebug || s.writer == nil {
 		return
 	}
@@ -65,7 +65,7 @@ func (s *logger) attachLogger(c *remoteConn) {
 	c.conn.OnLogEvent(tl.logEvent)
 }
 
-func (s *logger) detachLogger(c *remoteConn) {
+func (s *logger) detachLogger(c *Conn) {
 	c.conn.OnLogEvent(nil)
 }
 

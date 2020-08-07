@@ -59,7 +59,7 @@ func (s *Client) Serve() error {
 func (s *Client) recv(p *packet) {
 	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
 	if err != nil {
-		s.logger.log(levelInfo, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
+		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
 		freePacket(p)
 		return
 	}
@@ -92,12 +92,12 @@ func (s *Client) Connect(addr string) error {
 	}
 	if _, ok := s.peers[string(c.scid[:])]; ok {
 		s.peersMu.Unlock()
-		return fmt.Errorf("connection id conflict scid=%x", c.scid)
+		return fmt.Errorf("connection id conflict cid=%x", c.scid)
 	}
 	s.peers[string(c.scid[:])] = c
 	s.peersMu.Unlock()
 	// Send initial packet
-	s.logger.log(levelDebug, "connection_started addr=%v cid=%x", c.addr, c.scid)
+	s.logger.log(levelInfo, "connection_started cid=%x addr=%v", c.scid, c.addr)
 	p := newPacket()
 	defer freePacket(p)
 	if err = s.sendConn(c, p.buf[:maxDatagramSize]); err != nil {
@@ -119,7 +119,7 @@ func (s *Client) Close() error {
 	return nil
 }
 
-func (s *Client) newConn(addr string) (*remoteConn, error) {
+func (s *Client) newConn(addr string) (*Conn, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err

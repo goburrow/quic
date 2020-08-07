@@ -24,7 +24,7 @@ go build -gcflags '-m' 2>&1 | sort -V > debug.txt
 
 ```
 # Client
-./quince client quic.tech:4433
+./quince client https://quic.tech:4433/
 
 # Server
 ./quince server
@@ -52,6 +52,15 @@ go tool cover -html=coverage.out
 Generating test certificate:
 ```
 go run $GOROOT/src/crypto/tls/generate_cert.go -ecdsa-curve P256 --host localhost,127.0.0.1
+```
+
+Interop:
+```
+cd /path/to/quic-interop-runner
+python3 -m venv venv
+. venv/bin/activate
+pip install -r requirements.txt
+./run.py -c quince -s quince
 ```
 
 ## Fuzzing

@@ -935,3 +935,16 @@ func isFrameAckEliciting(typ uint64) bool {
 		return true
 	}
 }
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-frames-and-frame-types
+func isFrameAllowedInPacket(typ uint64, pktType packetType) bool {
+	switch pktType {
+	case packetTypeInitial, packetTypeHandshake:
+		return typ == frameTypePadding || typ == frameTypePing || typ == frameTypeAck ||
+			typ == frameTypeCrypto || typ == frameTypeConnectionClose
+	case packetTypeShort:
+		return true
+	default:
+		return false
+	}
+}

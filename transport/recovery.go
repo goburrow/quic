@@ -124,8 +124,8 @@ type lossRecovery struct {
 
 	// sent is an association of packet numbers in a packet number space to information about them.
 	sent  [packetSpaceCount][]*sentPacket
-	lost  [packetSpaceCount][]frame
-	acked [packetSpaceCount][]frame
+	lost  [packetSpaceCount][]*sentPacket
+	acked [packetSpaceCount][]*sentPacket
 
 	// Metrics
 	lostCount uint64
@@ -246,7 +246,7 @@ func (s *lossRecovery) updateRTT(latestRTT time.Duration, ackDelay time.Duration
 
 func (s *lossRecovery) onPacketsAcked(packets []*sentPacket, space packetSpace) {
 	for _, p := range packets {
-		s.acked[space] = append(s.acked[space], p.frames...)
+		s.acked[space] = append(s.acked[space], p)
 		if p.inFlight {
 			s.congestion.onPacketAcked(p.sentBytes, p.timeSent)
 		}
@@ -316,9 +316,10 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 		}
 		for i := n; i < len(sent); i++ {
 			p := sent[i]
-			if p.inFlight {
-				s.lost[space] = append(s.lost[space], p.frames...)
+			if p.ackEliciting {
+				s.lost[space] = append(s.lost[space], p)
 			}
+			// The packet may not really lost, so do not change congestion control.
 			sent[i] = nil
 		}
 		s.sent[space] = sent[:n]
@@ -472,7 +473,9 @@ func (s *lossRecovery) inPersistentCongestion(largestLostPacket *sentPacket) boo
 func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, now time.Time) {
 	s.lostCount += uint64(len(packets))
 	for _, p := range packets {
-		s.lost[space] = append(s.lost[space], p.frames...)
+		if p.ackEliciting {
+			s.lost[space] = append(s.lost[space], p)
+		}
 		if p.inFlight {
 			s.congestion.onPacketLost(p.sentBytes)
 		}
@@ -503,21 +506,25 @@ func (s *lossRecovery) filterSent(space packetSpace, filter func(*sentPacket) bo
 }
 
 func (s *lossRecovery) drainLost(space packetSpace, fn func(frame)) {
-	frames := s.lost[space]
-	for i, f := range frames {
-		fn(f)
-		frames[i] = nil
+	packets := s.lost[space]
+	for i, p := range packets {
+		for _, f := range p.frames {
+			fn(f)
+		}
+		packets[i] = nil
 	}
-	s.lost[space] = frames[:0]
+	s.lost[space] = packets[:0]
 }
 
 func (s *lossRecovery) drainAcked(space packetSpace, fn func(frame)) {
-	frames := s.acked[space]
-	for i, f := range frames {
-		fn(f)
-		frames[i] = nil
+	packets := s.acked[space]
+	for i, p := range packets {
+		for _, f := range p.frames {
+			fn(f)
+		}
+		packets[i] = nil
 	}
-	s.acked[space] = frames[:0]
+	s.acked[space] = packets[:0]
 }
 
 func (s *lossRecovery) setMaxAckDelay(maxAckDelay time.Duration) {

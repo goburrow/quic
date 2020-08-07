@@ -22,53 +22,43 @@ const (
 	EventConnClose  = "conn_close"
 )
 
-// Conn is an asynchronous QUIC connection.
-type Conn interface {
-	// Stream creates or returns an existing QUIC stream given the ID.
-	Stream(id uint64) io.ReadWriteCloser
-	// LocalAddr returns the local network address.
-	LocalAddr() net.Addr
-	// RemoteAddr returns the remote network address.
-	RemoteAddr() net.Addr
-	// Close sets state of the connection to closing.
-	Close() error
-}
-
 // Handler defines interface to handle QUIC connection states.
 type Handler interface {
-	Serve(conn Conn, events []transport.Event)
+	Serve(conn *Conn, events []transport.Event)
 }
 
 type noopHandler struct{}
 
-func (s noopHandler) Serve(Conn, []transport.Event) {}
+func (s noopHandler) Serve(*Conn, []transport.Event) {}
 
-// remoteConn implements Conn.
-type remoteConn struct {
+// Conn is an asynchronous QUIC connection.
+type Conn struct {
 	scid []byte
 	addr net.Addr
 	conn *transport.Conn
 
 	events []transport.Event
 	recvCh chan *packet
+
+	userData interface{}
 }
 
-func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn) *remoteConn {
-	return &remoteConn{
+func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn) *Conn {
+	return &Conn{
 		addr:   addr,
 		scid:   scid,
 		conn:   conn,
-		recvCh: make(chan *packet, 1),
+		recvCh: make(chan *packet, 8),
 	}
 }
 
-// Close sets the connection status to close state.
-func (s *remoteConn) Close() error {
-	s.conn.Close(true, transport.NoError, "bye")
-	return nil
+// ID returns connection id. The returned data must not be modified.
+func (s *Conn) ID() []byte {
+	return s.scid
 }
 
-func (s *remoteConn) Stream(id uint64) io.ReadWriteCloser {
+// Stream creates or returns an existing QUIC stream given the ID.
+func (s *Conn) Stream(id uint64) io.ReadWriteCloser {
 	st, err := s.conn.Stream(id)
 	if err != nil {
 		// TODO: log error
@@ -77,12 +67,30 @@ func (s *remoteConn) Stream(id uint64) io.ReadWriteCloser {
 	return st
 }
 
-func (s *remoteConn) LocalAddr() net.Addr {
+// LocalAddr returns the local network address.
+func (s *Conn) LocalAddr() net.Addr {
 	return nil // TODO: get from socket
 }
 
-func (s *remoteConn) RemoteAddr() net.Addr {
+// RemoteAddr returns the remote network address.
+func (s *Conn) RemoteAddr() net.Addr {
 	return s.addr
+}
+
+// SetUserData attachs (or remove) data to the connection.
+func (s *Conn) SetUserData(data interface{}) {
+	s.userData = data
+}
+
+// UserData returns attached data.
+func (s *Conn) UserData() interface{} {
+	return s.userData
+}
+
+// Close sets the connection status to close state.
+func (s *Conn) Close() error {
+	s.conn.Close(true, transport.NoError, "bye")
+	return nil
 }
 
 // localConn is a local quic connection.
@@ -91,7 +99,7 @@ type localConn struct {
 	socket net.PacketConn
 
 	peersMu sync.RWMutex
-	peers   map[string]*remoteConn
+	peers   map[string]*Conn
 
 	closing   bool      // locked by peersMu.
 	closeCond sync.Cond // locked by peersMu. Closing a connection will broadcast when connections is empty
@@ -103,7 +111,7 @@ type localConn struct {
 
 func (s *localConn) init(config *transport.Config) {
 	s.config = config
-	s.peers = make(map[string]*remoteConn)
+	s.peers = make(map[string]*Conn)
 	s.closeCh = make(chan struct{})
 	s.closeCond.L = &s.peersMu
 	s.handler = noopHandler{}
@@ -120,36 +128,17 @@ func (s *localConn) SetLogger(level int, w io.Writer) {
 	s.logger.level = logLevel(level)
 }
 
-// SetListen sets listening socket connection.
-func (s *localConn) SetListen(conn net.PacketConn) {
+// SetListener sets listening socket connection.
+func (s *localConn) SetListener(conn net.PacketConn) {
 	s.socket = conn
 }
 
 // handleConn handles data sending to the connection c.
-func (s *localConn) handleConn(c *remoteConn) {
+func (s *localConn) handleConn(c *Conn) {
 	defer s.connClosed(c)
 	established := false
 	for !c.conn.IsClosed() {
-		timeout := c.conn.Timeout()
-		if timeout < 0 {
-			// TODO
-			timeout = 10 * time.Second
-		}
-		timer := time.NewTimer(timeout)
-		var p *packet
-		select {
-		case p = <-c.recvCh:
-			// Got packet
-			s.recvConn(c, p.data)
-		case <-timer.C:
-			// Read timeout
-			s.logger.log(levelDebug, "read_timed_out addr=%s scid=%x timeout=%s", c.addr, c.scid, timeout)
-			c.conn.Write(nil)
-		case <-s.closeCh:
-			// Server is closing (see s.close)
-			c.conn.Close(true, transport.NoError, "bye")
-		}
-		timer.Stop()
+		p := s.pollConn(c)
 		if established {
 			s.serveConn(c)
 		} else {
@@ -169,42 +158,91 @@ func (s *localConn) handleConn(c *remoteConn) {
 	}
 }
 
-func (s *localConn) recvConn(c *remoteConn, data []byte) {
+func (s *localConn) pollConn(c *Conn) *packet {
+	timeout := c.conn.Timeout()
+	if timeout < 0 {
+		// TODO
+		timeout = 10 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	var p *packet
+	select {
+	case p = <-c.recvCh:
+		// Got packet
+		err := s.recvConn(c, p.data)
+		if err == nil {
+			// Maybe another packets arrived too while we processed the first one.
+			s.pollConnDelayed(c)
+		}
+	case <-timer.C:
+		// Read timeout
+		s.logger.log(levelTrace, "read_timed_out cid=%x addr=%s timeout=%s", c.scid, c.addr, timeout)
+		c.conn.Write(nil)
+	case <-s.closeCh:
+		// Server is closing (see s.close)
+		c.conn.Close(true, transport.NoError, "bye")
+	}
+	timer.Stop()
+	return p
+}
+
+func (s *localConn) pollConnDelayed(c *Conn) {
+	if !c.conn.IsEstablished() {
+		return
+	}
+	// TODO: check whether we only need to send back ACK, then we can delay it.
+	timer := time.NewTimer(2 * time.Millisecond) // FIXME: timer granularity
+	for {
+		select {
+		case <-timer.C:
+			return
+		case p := <-c.recvCh:
+			err := s.recvConn(c, p.data)
+			freePacket(p)
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *localConn) recvConn(c *Conn, data []byte) error {
 	n, err := c.conn.Write(data)
 	if err != nil {
-		s.logger.log(levelError, "receive_failed addr=%s scid=%x %v", c.addr, c.scid, err)
+		s.logger.log(levelError, "receive_failed cid=%x addr=%s %v", c.scid, c.addr, err)
 		// Close connection when receive failed
 		if err, ok := err.(*transport.Error); ok {
 			c.conn.Close(false, err.Code, err.Message)
 		} else {
 			c.conn.Close(false, transport.InternalError, "")
 		}
-		return
+		return err
 	}
-	s.logger.log(levelTrace, "datagrams_processed addr=%s scid=%x byte_length=%d", c.addr, c.scid, n)
+	s.logger.log(levelTrace, "datagrams_processed cid=%x addr=%s byte_length=%d", c.scid, c.addr, n)
+	return nil
 }
 
-func (s *localConn) sendConn(c *remoteConn, buf []byte) error {
+func (s *localConn) sendConn(c *Conn, buf []byte) error {
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
-			s.logger.log(levelError, "send_failed addr=%s scid=%x %v", c.addr, c.scid, err)
+			s.logger.log(levelError, "send_failed cid=%x addr=%s %v", c.scid, c.addr, err)
 			return err
 		}
 		if n == 0 {
-			s.logger.log(levelTrace, "send_done addr=%s scid=%x", c.addr, c.scid)
+			s.logger.log(levelTrace, "send_done cid=%x addr=%s", c.scid, c.addr)
 			return nil
 		}
 		n, err = s.socket.WriteTo(buf[:n], c.addr)
 		if err != nil {
-			s.logger.log(levelError, "send_failed addr=%s scid=%x %v", c.addr, c.scid, err)
+			s.logger.log(levelError, "send_failed cid=%x addr=%s %v", c.scid, c.addr, err)
 			return err
 		}
-		s.logger.log(levelTrace, "datagrams_sent addr=%s scid=%x byte_length=%d raw=%x", c.addr, c.scid, n, buf[:n])
+		s.logger.log(levelTrace, "datagrams_sent cid=%x addr=%s byte_length=%d raw=%x", c.scid, c.addr, n, buf[:n])
 	}
 }
 
-func (s *localConn) serveConn(c *remoteConn) {
+func (s *localConn) serveConn(c *Conn) {
 	c.events = c.conn.Events(c.events)
 	s.handler.Serve(c, c.events)
 	for i := range c.events {
@@ -213,8 +251,8 @@ func (s *localConn) serveConn(c *remoteConn) {
 	c.events = c.events[:0]
 }
 
-func (s *localConn) connClosed(c *remoteConn) {
-	s.logger.log(levelDebug, "connection_closed addr=%s scid=%x", c.addr, c.scid)
+func (s *localConn) connClosed(c *Conn) {
+	s.logger.log(levelInfo, "connection_closed cid=%x addr=%s", c.scid, c.addr)
 	c.events = append(c.events, transport.Event{Type: EventConnClose})
 	s.serveConn(c)
 	s.peersMu.Lock()

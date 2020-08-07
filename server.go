@@ -84,7 +84,7 @@ func (s *Server) Serve() error {
 func (s *Server) recv(p *packet) {
 	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
 	if err != nil {
-		s.logger.log(levelInfo, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
+		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
 		freePacket(p)
 		return
 	}
@@ -176,7 +176,7 @@ func (s *Server) handleNewConn(p *packet) {
 		}
 		odcid = s.verifyToken(p.addr, p.header.Token)
 		if len(odcid) == 0 {
-			s.logger.log(levelInfo, "packet_dropped addr=%s %s trigger=invalid_token", p.addr, &p.header)
+			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=invalid_token", p.addr, &p.header)
 			freePacket(p)
 			return
 		}
@@ -203,12 +203,12 @@ func (s *Server) handleNewConn(p *packet) {
 	}
 	s.peers[string(c.scid[:])] = c
 	s.peersMu.Unlock()
-	s.logger.log(levelDebug, "connection_started addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
+	s.logger.log(levelInfo, "connection_started addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
 	c.recvCh <- p // Buffered channel
 	s.handleConn(c)
 }
 
-func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*remoteConn, error) {
+func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
 	scid := make([]byte, transport.MaxCIDLength)
 	if len(scid) == len(oscid) {
 		copy(scid, oscid)

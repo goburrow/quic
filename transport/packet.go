@@ -225,6 +225,7 @@ type packet struct {
 	token             []byte   // Only in Initial and Retry
 
 	packetNumber uint64
+	packetSize   int
 	payloadLen   int
 }
 
@@ -823,8 +824,7 @@ type packetNumberSpace struct {
 	// recvPacketNumbers tracks packet numbers received.
 	recvPacketNumbers packetNumberWindow
 	// ackElicited indicates received packets need to be acknowledged.
-	ackElicited      bool
-	firstPacketAcked bool
+	ackElicited bool
 
 	opener packetProtection
 	sealer packetProtection
@@ -865,28 +865,28 @@ func (s *packetNumberSpace) canDecrypt() bool {
 	return s.opener.aead != nil
 }
 
-func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, int, error) {
+func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, error) {
 	pnOffset, err := p.packetNumberOffset(b)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	err = s.opener.decryptHeader(b, pnOffset)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	p.header.flags = b[0]
 	n, err := p.decodeBody(b)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	pnLen := packetNumberLenFromHeader(p.header.flags)
 	p.packetNumber = decodePacketNumber(s.largestRecvPacketNumber, p.packetNumber, pnLen)
-	length := p.headerLen + n + p.payloadLen
-	payload, err := s.opener.decryptPayload(b[:length], p.packetNumber, p.payloadLen)
+	p.packetSize = p.headerLen + n + p.payloadLen
+	payload, err := s.opener.decryptPayload(b[:p.packetSize], p.packetNumber, p.payloadLen)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return payload, length, nil
+	return payload, nil
 }
 
 func (s *packetNumberSpace) isPacketReceived(pn uint64) bool {

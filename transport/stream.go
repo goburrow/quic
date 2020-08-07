@@ -64,8 +64,12 @@ func (s *Stream) Write(b []byte) (int, error) {
 	if !s.bidi && !s.local {
 		return 0, newError(StreamStateError, "cannot write to uni stream")
 	}
-	if s.flow.canSend() < uint64(len(b)) {
-		return 0, errFlowControl
+	n := int(s.flow.canSend())
+	if n == 0 {
+		return 0, nil
+	}
+	if n < len(b) {
+		b = b[:n]
 	}
 	n, err := s.send.Write(b)
 	if err == nil {
@@ -75,15 +79,27 @@ func (s *Stream) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// WriteString writes the contents of string b to the stream.
+func (s *Stream) WriteString(b string) (int, error) {
+	// b will be copied so hopefully complier does not allocate memory for byte conversion
+	return s.Write([]byte(b))
+}
+
 // isReadable returns true if the stream has any data to read.
 func (s *Stream) isReadable() bool {
-	return s.recv.ready()
+	return s.recv.ready() || (s.recv.fin && !s.recv.finRead)
+}
+
+// isWriteable returns true if the stream has enough flow control capacity to be written to,
+// and is not finished.
+func (s *Stream) isWriteable() bool {
+	return !s.send.fin && s.flow.canSend() > 0
 }
 
 // isFlushable returns true if the stream has data to send
 func (s *Stream) isFlushable() bool {
 	// flow maxSend is controlled by peer via MAX_STREAM_DATA
-	return s.send.ready(s.flow.maxSend)
+	return s.send.ready(s.flow.maxSend) || (s.send.fin && !s.send.finSent)
 }
 
 // popSend returns continuous data from send buffer that size less than max bytes.
@@ -93,6 +109,22 @@ func (s *Stream) popSend(max int) (data []byte, offset uint64, fin bool) {
 		return nil, 0, false
 	}
 	return s.send.pop(max)
+}
+
+// pushSend pushes data back to send stream to resend.
+func (s *Stream) pushSend(data []byte, offset uint64, fin bool) error {
+	return s.send.push(data, offset, fin)
+}
+
+// ackSend acknowleges data is received.
+// It returns true if all data has been sent and confirmed.
+func (s *Stream) ackSend(offset, length uint64) bool {
+	s.send.ack(offset, length)
+	return s.send.complete()
+}
+
+func (s *Stream) resetRecv(finalSize uint64) (int, error) {
+	return s.recv.reset(finalSize)
 }
 
 // ackMaxData acknowledges that the MAX_STREAM_DATA frame delivery is confirmed.
@@ -120,7 +152,8 @@ type recvStream struct {
 	offset uint64 // read offset
 	length uint64 // total length
 
-	fin bool
+	fin     bool
+	finRead bool // Whether reader is notified about closing
 }
 
 func (s *recvStream) push(data []byte, offset uint64, fin bool) error {
@@ -168,6 +201,7 @@ func (s *recvStream) reset(finalSize uint64) (int, error) {
 // Read makes recvStream an io.Reader.
 func (s *recvStream) Read(b []byte) (int, error) {
 	if s.isFin() {
+		s.finRead = true
 		return 0, io.EOF
 	}
 	n := s.buf.read(b, s.offset)
@@ -196,7 +230,8 @@ type sendStream struct {
 	offset uint64 // read offset
 	length uint64 // total length
 
-	fin bool
+	fin     bool
+	finSent bool // finSent is needed when sender closes the stream after data has already been read.
 }
 
 // push would only be called directly when it needs to bypass flow control.
@@ -227,8 +262,15 @@ func (s *sendStream) push(data []byte, offset uint64, fin bool) error {
 // pop would be called after checking ready().
 func (s *sendStream) pop(max int) (data []byte, offset uint64, fin bool) {
 	data, offset = s.buf.pop(max)
+	if len(data) == 0 {
+		// Use current read offset when there is no data available.
+		offset = s.offset
+	}
 	end := offset + uint64(len(data))
 	fin = s.fin && end >= s.length
+	if fin {
+		s.finSent = true
+	}
 	if end > s.offset {
 		s.offset = end
 	}

@@ -52,11 +52,11 @@ func TestLogFramePing(t *testing.T) {
 
 func TestLogFrameAck(t *testing.T) {
 	f := &ackFrame{
-		largestAck:    1,
+		largestAck:    3,
 		ackDelay:      2,
-		firstAckRange: 3,
+		firstAckRange: 1,
 	}
-	testLogFrame(t, f, "frame_type=ack ack_delay=2")
+	testLogFrame(t, f, "frame_type=ack ack_delay=2 acked_ranges=[[2,3]]")
 }
 
 func TestLogFrameResetStream(t *testing.T) {
@@ -139,12 +139,30 @@ func testLogFrame(t *testing.T, f frame, expect string) {
 	}
 }
 
+func TestLogPacket(t *testing.T) {
+	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
+	p := &packet{
+		typ: packetTypeHandshake,
+		header: packetHeader{
+			version: 1,
+			dcid:    []byte{1, 2, 3},
+			scid:    []byte{4, 5},
+		},
+		packetNumber: 1,
+		payloadLen:   10,
+		packetSize:   20,
+	}
+	e := newLogEventPacket(tm, "packet_sent", p)
+	expect := "2020-01-05T00:00:00Z packet_sent packet_type=handshake version=1 dcid=010203 scid=0405 packet_number=1 packet_size=20 payload_length=10"
+	assertLogEvent(t, e, expect)
+}
+
 func TestLogRecovery(t *testing.T) {
 	r := lossRecovery{}
 	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
 	e := newLogEventRecovery(tm, &r)
 	expect := "2020-01-05T00:00:00Z metrics_updated loss_timer=0 min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=0 " +
-		"pto_count=0 congestion_window=0 bytes_in_flight=0 ssthresh=0"
+		"pto_count=0 congestion_window=0 bytes_in_flight=0"
 	assertLogEvent(t, e, expect)
 }
 

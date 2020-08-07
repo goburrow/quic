@@ -16,6 +16,7 @@ const (
 	logEventPacketReceived  = "packet_received"
 	logEventPacketSent      = "packet_sent"
 	logEventPacketDropped   = "packet_dropped"
+	logEventPacketLost      = "packet_lost"
 	logEventFramesProcessed = "frames_processed"
 	logEventParametersSet   = "parameters_set"
 )
@@ -105,6 +106,21 @@ func newLogField(key string, val interface{}) LogField {
 		s.Str = string(b)
 	case time.Duration:
 		s.Num = uint64(val / time.Millisecond)
+	case rangeSet:
+		b := make([]byte, 0, 32)
+		b = append(b, '[')
+		for i, v := range val {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = append(b, '[')
+			b = strconv.AppendUint(b, uint64(v.start), 10)
+			b = append(b, ',')
+			b = strconv.AppendUint(b, uint64(v.end), 10)
+			b = append(b, ']')
+		}
+		b = append(b, ']')
+		s.Str = string(b)
 	default:
 		s.Str = "<unsupported_type>"
 	}
@@ -147,8 +163,9 @@ func logPacket(e *LogEvent, s *packet) {
 	if len(s.header.scid) > 0 {
 		e.addField("scid", s.header.scid)
 	}
-	if s.packetNumber > 0 {
-		e.addField("packet_number", s.packetNumber)
+	e.addField("packet_number", s.packetNumber)
+	if s.packetSize > 0 {
+		e.addField("packet_size", s.packetSize)
 	}
 	if s.payloadLen > 0 {
 		e.addField("payload_length", s.payloadLen)
@@ -260,6 +277,7 @@ func logFramePing(e *LogEvent, s *pingFrame) {
 func logFrameAck(e *LogEvent, s *ackFrame) {
 	e.addField("frame_type", "ack")
 	e.addField("ack_delay", s.ackDelay)
+	e.addField("acked_ranges", s.toRangeSet())
 }
 
 func logFrameResetStream(e *LogEvent, s *resetStreamFrame) {
@@ -379,5 +397,4 @@ func logRecovery(e *LogEvent, s *lossRecovery) {
 	// Congestion control
 	e.addField("congestion_window", s.congestion.congestionWindow)
 	e.addField("bytes_in_flight", s.congestion.bytesInFlight)
-	e.addField("ssthresh", s.congestion.slowStartThreshold)
 }

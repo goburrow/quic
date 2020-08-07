@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Usage: quince <command> [options]")
 		flag.PrintDefaults()
@@ -27,6 +27,8 @@ func main() {
 		err = serverCommand(flag.Args()[1:])
 	case "client":
 		err = clientCommand(flag.Args()[1:])
+	case "qlog":
+		err = qlogCommand(flag.Args()[1:])
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -40,12 +42,12 @@ func newConfig() *transport.Config {
 	c := transport.NewConfig()
 	c.Params.MaxUDPPayloadSize = transport.MaxIPv6PacketSize
 	c.Params.MaxIdleTimeout = 5 * time.Second
-	c.Params.InitialMaxData = 100000
+	c.Params.InitialMaxData = 800000
 	c.Params.InitialMaxStreamDataBidiLocal = 100000
 	c.Params.InitialMaxStreamDataBidiRemote = 100000
 	c.Params.InitialMaxStreamDataUni = 100000
-	c.Params.InitialMaxStreamsBidi = 10
-	c.Params.InitialMaxStreamsUni = 10
+	c.Params.InitialMaxStreamsBidi = 8
+	c.Params.InitialMaxStreamsUni = 8
 	c.TLS = &tls.Config{
 		NextProtos: []string{
 			fmt.Sprintf("hq-%d", transport.ProtocolVersion&0xff),

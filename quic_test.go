@@ -9,9 +9,9 @@ import (
 	"github.com/goburrow/quic/transport"
 )
 
-type handlerFunc func(Conn, []transport.Event)
+type handlerFunc func(*Conn, []transport.Event)
 
-func (f handlerFunc) Serve(c Conn, e []transport.Event) {
+func (f handlerFunc) Serve(c *Conn, e []transport.Event) {
 	f(c, e)
 }
 
@@ -21,13 +21,13 @@ func TestServerAndClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := newServer()
-	s.SetListen(socket)
-	s.SetHandler(handlerFunc(func(conn Conn, events []transport.Event) {
+	s.SetListener(socket)
+	s.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
 		for _, e := range events {
 			switch e.Type {
 			case EventConnAccept:
-			case transport.EventStreamRecv:
-				st := conn.Stream(e.StreamID)
+			case transport.EventStreamReadable:
+				st := conn.Stream(e.ID)
 				buf := make([]byte, 8)
 				n, err := st.Read(buf)
 				if err != nil {
@@ -43,6 +43,10 @@ func TestServerAndClient(t *testing.T) {
 					t.Errorf("server stream send: %v", err)
 					conn.Close()
 					return
+				}
+			case transport.EventStreamWritable:
+				if e.ID != 4 {
+					t.Errorf("expect writable stream %d, actual %d", 4, e.ID)
 				}
 			case EventConnClose:
 			default:
@@ -64,20 +68,20 @@ func TestServerAndClient(t *testing.T) {
 	}()
 	recvData := make(chan []byte, 1)
 	c := newClient()
-	c.SetHandler(handlerFunc(func(conn Conn, events []transport.Event) {
+	c.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
 		for _, e := range events {
 			switch e.Type {
 			case EventConnAccept:
 				st := conn.Stream(4)
 				if st == nil {
-					t.Errorf("expect client stream created. Got %v", st)
+					t.Errorf("expect client stream created, actual %v", st)
 					conn.Close()
 				} else {
 					st.Write([]byte("ping"))
 					st.Close()
 				}
-			case transport.EventStreamRecv:
-				st := conn.Stream(e.StreamID)
+			case transport.EventStreamReadable:
+				st := conn.Stream(e.ID)
 				buf := make([]byte, 8)
 				n, err := st.Read(buf)
 				if err == nil {
@@ -87,6 +91,10 @@ func TestServerAndClient(t *testing.T) {
 					recvData <- nil
 				}
 				conn.Close()
+			case transport.EventStreamWritable:
+				if e.ID != 4 {
+					t.Errorf("expect writable stream %d, actual %d", 4, e.ID)
+				}
 			case transport.EventStreamComplete:
 				close(recvData)
 			case EventConnClose:
