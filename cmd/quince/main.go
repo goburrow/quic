@@ -42,7 +42,7 @@ func newConfig() *transport.Config {
 	c := transport.NewConfig()
 	c.Params.MaxUDPPayloadSize = transport.MaxIPv6PacketSize
 	c.Params.MaxIdleTimeout = 5 * time.Second
-	c.Params.InitialMaxData = 800000
+	c.Params.InitialMaxData = 1000000
 	c.Params.InitialMaxStreamDataBidiLocal = 100000
 	c.Params.InitialMaxStreamDataBidiRemote = 100000
 	c.Params.InitialMaxStreamDataUni = 100000
@@ -79,4 +79,39 @@ func (w *keyLogWriter) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.w.Write(b)
+}
+
+type buffers struct {
+	list chan []byte
+	size int
+}
+
+func newBuffers(size, length int) buffers {
+	return buffers{
+		list: make(chan []byte, length),
+		size: size,
+	}
+}
+
+func (s *buffers) pop() []byte {
+	var b []byte
+	select {
+	case b = <-s.list:
+		// Got one
+	default:
+		b = make([]byte, s.size)
+	}
+	return b
+}
+
+func (s *buffers) push(b []byte) {
+	if cap(b) != s.size {
+		panic("invalid buffer capacity")
+	}
+	b = b[:s.size]
+	select {
+	case s.list <- b:
+	default:
+		// Full
+	}
 }

@@ -73,7 +73,7 @@ func (s *Server) Serve() error {
 			// Stop on socket error.
 			// FIXME: Should we stop on timeout when read deadline is set
 			if err, ok := err.(net.Error); ok && err.Timeout() {
-				s.logger.log(levelTrace, "read timeout: %v", err)
+				s.logger.log(levelTrace, "verbose message=read_timed_out: %v", err)
 			} else {
 				return err
 			}
@@ -84,7 +84,7 @@ func (s *Server) Serve() error {
 func (s *Server) recv(p *packet) {
 	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
 	if err != nil {
-		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
+		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error message=%v", p.addr, len(p.data), err)
 		freePacket(p)
 		return
 	}
@@ -95,11 +95,14 @@ func (s *Server) recv(p *packet) {
 		freePacket(p)
 		return
 	}
-	c, ok := s.peers[string(p.header.DCID)]
-	s.peersMu.RUnlock()
-	if ok {
-		c.recvCh <- p
+	var c *Conn
+	if len(p.header.DCID) > 0 {
+		c = s.peers[string(p.header.DCID)]
 	} else {
+		c = s.peersAddr[p.addr.String()]
+	}
+	s.peersMu.RUnlock()
+	if c == nil {
 		// Server must ensure the any datagram packet containing Initial packet being at least 1200 bytes
 		if p.header.Type != "initial" || len(p.data) < transport.MinInitialPacketSize {
 			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=unexpected_packet", p.addr, &p.header)
@@ -113,6 +116,8 @@ func (s *Server) recv(p *packet) {
 			return
 		}
 		go s.handleNewConn(p)
+	} else {
+		c.recvCh <- p
 	}
 }
 
@@ -121,12 +126,12 @@ func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 	defer freePacket(p)
 	n, err := transport.NegotiateVersion(p.buf[:], h.SCID, h.DCID)
 	if err != nil {
-		s.logger.log(levelError, "version_negotiation_failed addr=%s %s %v", addr, h, err)
+		s.logger.log(levelError, "internal_error addr=%s %s description=version_negotiation_failed: %v", addr, h, err)
 		return
 	}
 	n, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.log(levelError, "version_negotiation_failed addr=%s %s %v", addr, h, err)
+		s.logger.log(levelError, "internal_error addr=%s %s description=version_negotiation_failed: %v", addr, h, err)
 		return
 	}
 	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=version_negotiation dcid=%x scid=%x", addr, h.SCID, h.DCID)
@@ -136,21 +141,21 @@ func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	p := newPacket()
 	defer freePacket(p)
-	// newCID is a new DCID client shoud send in next Initial packet
+	// newCID is a new DCID client should send in next Initial packet
 	var newCID [transport.MaxCIDLength]byte
 	if err := s.rand(newCID[:]); err != nil {
-		s.logger.log(levelError, "retry_failed addr=%s %s %v", addr, h, err)
+		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
 		return
 	}
 	token := s.addrValid.Generate(addr, h.DCID)
 	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
 	if err != nil {
-		s.logger.log(levelError, "retry_failed addr=%s %s %v", addr, h, err)
+		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
 		return
 	}
 	n, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.log(levelError, "retry_failed addr=%s %s %v", addr, h, err)
+		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
 		return
 	}
 	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=retry dcid=%x scid=%x odcid=%x token=%x", addr, h.SCID, newCID, h.DCID, token)
@@ -183,7 +188,7 @@ func (s *Server) handleNewConn(p *packet) {
 	}
 	c, err := s.newConn(p.addr, p.header.DCID, odcid)
 	if err != nil {
-		s.logger.log(levelError, "create_connection_failed addr=%s %s %v", p.addr, &p.header, err)
+		s.logger.log(levelError, "internal_error addr=%s %s description=create_connection_failed: %v", p.addr, &p.header, err)
 		freePacket(p)
 		return
 	}
@@ -197,11 +202,12 @@ func (s *Server) handleNewConn(p *packet) {
 	if _, ok := s.peers[string(c.scid[:])]; ok {
 		// Is that server too slow that client resent the packet? Log it as Error for now.
 		s.peersMu.Unlock()
-		s.logger.log(levelError, "create_connection_failed addr=%s cid=%x trigger=conflict", p.addr, c.scid)
+		s.logger.log(levelError, "internal_error addr=%s cid=%x description=create_connection_failed: cid conflict", p.addr, c.scid)
 		freePacket(p)
 		return
 	}
 	s.peers[string(c.scid[:])] = c
+	s.peersAddr[c.addr.String()] = c
 	s.peersMu.Unlock()
 	s.logger.log(levelInfo, "connection_started addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
 	c.recvCh <- p // Buffered channel
@@ -224,6 +230,9 @@ func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
 		return nil, err
 	}
 	c := newRemoteConn(addr, scid, conn)
+	// XXX: Handle in transport package?
+	c.nextStreamIDBidi++
+	c.nextStreamIDUni++
 	s.logger.attachLogger(c)
 	return c, nil
 }

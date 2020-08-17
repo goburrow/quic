@@ -22,6 +22,8 @@ const (
 	paramInitialMaxStreamsUni           = 0x09
 	paramAckDelayExponent               = 0x0a
 	paramMaxAckDelay                    = 0x0b
+	paramDisableActiveMigration         = 0x0c
+	paramActiveConnectionIDLimit        = 0x0e
 	paramInitialSourceCID               = 0x0f
 	paramRetrySourceCID                 = 0x10
 )
@@ -50,6 +52,12 @@ type Parameters struct {
 
 	AckDelayExponent uint64
 	MaxAckDelay      time.Duration
+
+	// ActiveConnectionIDLimit is the maximum number of connection IDs from the peer that
+	// an endpoint is willing to store.
+	ActiveConnectionIDLimit uint64
+
+	DisableActiveMigration bool
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#transport-parameter-encoding
@@ -111,6 +119,13 @@ func (s *Parameters) marshal() []byte {
 	if s.MaxAckDelay > 0 {
 		b.writeVarint(paramMaxAckDelay)
 		b.writeUint(uint64(s.MaxAckDelay / time.Millisecond))
+	}
+	if s.DisableActiveMigration {
+		b.writeVarint(paramDisableActiveMigration)
+	}
+	if s.ActiveConnectionIDLimit > 0 {
+		b.writeVarint(paramActiveConnectionIDLimit)
+		b.writeUint(s.ActiveConnectionIDLimit)
 	}
 	if len(s.InitialSourceCID) > 0 {
 		b.writeVarint(paramInitialSourceCID)
@@ -183,6 +198,12 @@ func (s *Parameters) unmarshal(data []byte) bool {
 				return false
 			}
 			s.MaxAckDelay = time.Duration(v) * time.Millisecond
+		case paramDisableActiveMigration:
+			s.DisableActiveMigration = true
+		case paramActiveConnectionIDLimit:
+			if !b.readUint(&s.ActiveConnectionIDLimit) {
+				return false
+			}
 		case paramInitialSourceCID:
 			if !b.readBytes(&s.InitialSourceCID) {
 				return false
@@ -201,6 +222,37 @@ func (s *Parameters) unmarshal(data []byte) bool {
 		}
 	}
 	return true
+}
+
+func (s *Parameters) validate(isClient bool) error {
+	// Original destination CID is only sent by server.
+	if len(s.OriginalDestinationCID) != 0 && isClient {
+		return newError(TransportParameterError, "original_destination_connection_id")
+	}
+	// Stateless reset token must not be sent by a client, but may be sent by a server.
+	if len(s.StatelessResetToken) != 0 {
+		if isClient || len(s.StatelessResetToken) != 16 {
+			return newError(TransportParameterError, "stateless_reset_token")
+		}
+	}
+	if s.MaxUDPPayloadSize > 0 && s.MaxUDPPayloadSize < MinInitialPacketSize {
+		return newError(TransportParameterError, "max_udp_payload_size")
+	}
+	if s.AckDelayExponent > 20 {
+		return newError(TransportParameterError, "ack_delay_exponent")
+	}
+	if s.MaxAckDelay < 0 || s.MaxAckDelay >= 1<<14*time.Millisecond {
+		return newError(TransportParameterError, "max_ack_delay")
+	}
+	// If a max_streams transport parameter or MAX_STREAMS frame is received with a value greater than 2^60,
+	// the connection MUST be closed immediately with a connection error of type STREAM_LIMIT_ERROR
+	if s.InitialMaxStreamsBidi > maxStreams {
+		return newError(StreamLimitError, "initial_max_streams_bidi")
+	}
+	if s.InitialMaxStreamsUni > maxStreams {
+		return newError(StreamLimitError, "initial_max_streams_uni")
+	}
+	return nil
 }
 
 // Each transport parameter is encoded as an (identifier, length, value) tuple.

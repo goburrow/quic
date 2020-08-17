@@ -30,22 +30,17 @@ case "$TESTCASE" in
 esac
 
 run_client() {
-    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -v 3"
+    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -qlog "$QLOGDIR/client.qlog" -v 3"
     if [ "$TESTCASE" == chacha20 ]; then
-        CLIENT_PARAMS="$CLIENT_PARAMS -cipher 0x1303"
+        CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256"
     fi
     cd "$APPDIR"
     echo "# CLIENT_PARAMS:" "$CLIENT_PARAMS"
-    # TODO: Support multiple requests
-    for REQ in $REQUESTS; do
-        NAME="$(basename $REQ)"
-        ./quince client $CLIENT_PARAMS "$REQ" 2>"$LOGDIR/client-$NAME.txt" 1>"$DLDIR/$NAME"
-        ./quince qlog "$LOGDIR/client-$NAME.txt" >"$QLOGDIR/client-$NAME.qlog" || true
-    done
+    ./quince client $CLIENT_PARAMS $REQUESTS 2>"$LOGDIR/client.txt"
 }
 
 run_server() {
-    SERVER_PARAMS="$SERVER_PARAMS -listen 0.0.0.0:443 -cert cert.pem -key key.pem -root $WWWDIR -v 3"
+    SERVER_PARAMS="$SERVER_PARAMS -listen 0.0.0.0:443 -cert cert.pem -key key.pem -root $WWWDIR -qlog "$QLOGDIR/server.qlog" -v 3"
     if [ "$TESTCASE" == retry ]; then
         SERVER_PARAMS="$SERVER_PARAMS -retry"
     fi
@@ -53,7 +48,6 @@ run_server() {
     echo "# SERVER_PARAMS:" "$SERVER_PARAMS"
     ./quince server $SERVER_PARAMS 2>"$LOGDIR/server.txt"
     # FIXME: no qlog transformation as the script is terminated
-    ./quince qlog "$LOGDIR/server.txt" >"$QLOGDIR/server.qlog" || true
 }
 
 if [ "$ROLE" == "client" ]; then

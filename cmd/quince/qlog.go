@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/goburrow/quic/qlog"
@@ -25,13 +26,26 @@ func qlogCommand(args []string) error {
 		return err
 	}
 	defer in.Close()
-	data, err := qlog.Decode(in)
+	return qlogTransform(os.Stdout, in, *pretty)
+}
+
+func qlogTransform(w io.Writer, r io.Reader, pretty bool) error {
+	data, err := qlog.Decode(r)
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	if *pretty {
+	enc := json.NewEncoder(w)
+	if pretty {
 		enc.SetIndent("", "\t")
 	}
 	return enc.Encode(data)
+}
+
+func qlogTransformToFile(name string, r io.Reader) error {
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return qlogTransform(f, r, false)
 }

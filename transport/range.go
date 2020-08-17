@@ -320,6 +320,16 @@ func (s rangeBufferList) insertPos(offset uint64) int {
 	return left
 }
 
+// size returns current maximum size of the buffer.
+func (s rangeBufferList) size() uint64 {
+	if len(s) > 0 {
+		left := s[0]
+		right := s[len(s)-1]
+		return right.offset - left.offset + uint64(len(right.data))
+	}
+	return 0
+}
+
 func (s rangeBufferList) String() string {
 	buf := bytes.Buffer{}
 	fmt.Fprintf(&buf, "ranges=%d", len(s))

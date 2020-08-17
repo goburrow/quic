@@ -17,14 +17,14 @@ func TestRecoveryInitialRTT(t *testing.T) {
 	x.assertInFlight(101)
 	x.assertTimer(now.Add(999 * time.Millisecond))
 
-	// expire
+	// Timeout
 	now = now.Add(1 * time.Second)
 	x.r.onLossDetectionTimeout(now)
 	if x.r.lossProbes[packetSpaceInitial] == 0 {
 		t.Fatalf("expect probes > 0, actual: %v", x.r.lossProbes[packetSpaceInitial])
 	}
 	x.assertTimer(now.Add(998 * time.Millisecond))
-	x.assertSent(packetSpaceInitial, 0)
+	x.assertSent(packetSpaceInitial, 1)
 	x.assertLost(packetSpaceInitial, 1)
 }
 

@@ -195,7 +195,12 @@ func parseEventData(line string) eventData {
 			data["message"] = line // Take whole remaining
 			break
 		}
-		data[field[:sep]] = parseEventValue(field[sep+1:])
+		key := field[:sep]
+		if key == "message" || key == "description" || key == "reason" {
+			data[key] = line[sep+1:]
+			break
+		}
+		data[key] = parseEventValue(field[sep+1:])
 		if idx > 0 {
 			line = line[idx+1:]
 		} else {

@@ -59,7 +59,7 @@ func (s *Client) Serve() error {
 func (s *Client) recv(p *packet) {
 	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
 	if err != nil {
-		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error %v", p.addr, len(p.data), err)
+		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error message=%v", p.addr, len(p.data), err)
 		freePacket(p)
 		return
 	}
@@ -69,19 +69,35 @@ func (s *Client) recv(p *packet) {
 		s.peersMu.RUnlock()
 		return
 	}
-	c, ok := s.peers[string(p.header.DCID)]
-	s.peersMu.RUnlock()
-	if ok {
-		c.recvCh <- p
+	var c *Conn
+	if len(p.header.DCID) > 0 {
+		c = s.peers[string(p.header.DCID)]
 	} else {
+		c = s.peersAddr[p.addr.String()]
+	}
+	s.peersMu.RUnlock()
+	if c == nil {
 		s.logger.log(levelDebug, "packet_dropped addr=%s trigger=unknown_connection_id %s", p.addr, &p.header)
 		freePacket(p)
+	} else {
+		c.recvCh <- p
 	}
 }
 
 // Connect establishes a new connection to UDP network address addr.
 func (s *Client) Connect(addr string) error {
-	c, err := s.newConn(addr)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+	s.peersMu.RLock()
+	_, ok := s.peersAddr[udpAddr.String()]
+	s.peersMu.RUnlock()
+	if ok {
+		// Already connected
+		return nil
+	}
+	c, err := s.newConn(udpAddr)
 	if err != nil {
 		return err
 	}
@@ -95,6 +111,7 @@ func (s *Client) Connect(addr string) error {
 		return fmt.Errorf("connection id conflict cid=%x", c.scid)
 	}
 	s.peers[string(c.scid[:])] = c
+	s.peersAddr[c.addr.String()] = c
 	s.peersMu.Unlock()
 	// Send initial packet
 	s.logger.log(levelInfo, "connection_started cid=%x addr=%v", c.scid, c.addr)
@@ -110,7 +127,7 @@ func (s *Client) Connect(addr string) error {
 	return nil
 }
 
-// Close closes all current establised connections and listening socket.
+// Close closes all current established connections and listening socket.
 func (s *Client) Close() error {
 	s.close(10 * time.Second)
 	if s.socket != nil {
@@ -119,20 +136,16 @@ func (s *Client) Close() error {
 	return nil
 }
 
-func (s *Client) newConn(addr string) (*Conn, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
+func (s *Client) newConn(addr net.Addr) (*Conn, error) {
 	scid := make([]byte, transport.MaxCIDLength)
-	if err = s.rand(scid); err != nil {
+	if err := s.rand(scid); err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
 	conn, err := transport.Connect(scid, s.config)
 	if err != nil {
 		return nil, err
 	}
-	c := newRemoteConn(udpAddr, scid, conn)
+	c := newRemoteConn(addr, scid, conn)
 	s.logger.attachLogger(c)
 	return c, nil
 }

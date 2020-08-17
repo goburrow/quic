@@ -11,6 +11,11 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
+const (
+	// Crypto is not under flow control, but we still enforce a hard limit.
+	cryptoMaxData = 1 << 20
+)
+
 type cryptoLevel uint8
 
 const (

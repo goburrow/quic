@@ -19,6 +19,8 @@ const (
 	logEventPacketLost      = "packet_lost"
 	logEventFramesProcessed = "frames_processed"
 	logEventParametersSet   = "parameters_set"
+
+	logEventStreamStateUpdated = "stream_state_updated"
 )
 
 // LogEvent is event sent by connection
@@ -190,20 +192,14 @@ func logParameters(e *LogEvent, p *Parameters) {
 	if len(p.OriginalDestinationCID) > 0 {
 		e.addField("original_connection_id", p.OriginalDestinationCID)
 	}
-	if len(p.OriginalDestinationCID) > 0 {
-		e.addField("stateless_reset_token", p.StatelessResetToken)
-	}
 	if p.MaxIdleTimeout > 0 {
 		e.addField("max_idle_timeout", p.MaxIdleTimeout)
 	}
+	if len(p.OriginalDestinationCID) > 0 {
+		e.addField("stateless_reset_token", p.StatelessResetToken)
+	}
 	if p.MaxUDPPayloadSize > 0 {
 		e.addField("max_udp_payload_size", p.MaxUDPPayloadSize)
-	}
-	if p.AckDelayExponent > 0 {
-		e.addField("ack_delay_exponent", p.AckDelayExponent)
-	}
-	if p.MaxAckDelay > 0 {
-		e.addField("max_ack_delay", p.MaxAckDelay)
 	}
 	if p.InitialMaxData > 0 {
 		e.addField("initial_max_data", p.InitialMaxData)
@@ -222,6 +218,24 @@ func logParameters(e *LogEvent, p *Parameters) {
 	}
 	if p.InitialMaxStreamsUni > 0 {
 		e.addField("initial_max_streams_uni", p.InitialMaxStreamsUni)
+	}
+	if p.AckDelayExponent > 0 {
+		e.addField("ack_delay_exponent", p.AckDelayExponent)
+	}
+	if p.MaxAckDelay > 0 {
+		e.addField("max_ack_delay", p.MaxAckDelay)
+	}
+	if p.DisableActiveMigration {
+		e.addField("disable_active_migration", p.DisableActiveMigration)
+	}
+	if p.ActiveConnectionIDLimit > 0 {
+		e.addField("active_connection_id_limit", p.ActiveConnectionIDLimit)
+	}
+	if len(p.InitialSourceCID) > 0 {
+		e.addField("initial_source_connection_id", p.InitialSourceCID)
+	}
+	if len(p.RetrySourceCID) > 0 {
+		e.addField("retry_source_connection_id", p.RetrySourceCID)
 	}
 }
 
@@ -363,10 +377,10 @@ func logFrameConnectionClose(e *LogEvent, s *connectionCloseFrame) {
 	}
 	e.addField("error_code", errorCodeString(s.errorCode))
 	e.addField("raw_error_code", s.errorCode)
-	e.addField("reason", string(s.reasonPhrase))
 	if s.frameType > 0 {
 		e.addField("trigger_frame_type", s.frameType)
 	}
+	e.addField("reason", string(s.reasonPhrase))
 }
 
 func logFrameHandshakeDone(e *LogEvent, s *handshakeDoneFrame) {
@@ -397,4 +411,11 @@ func logRecovery(e *LogEvent, s *lossRecovery) {
 	// Congestion control
 	e.addField("congestion_window", s.congestion.congestionWindow)
 	e.addField("bytes_in_flight", s.congestion.bytesInFlight)
+}
+
+func newLogEventStreamClosed(tm time.Time, id uint64) LogEvent {
+	e := newLogEvent(tm, logEventStreamStateUpdated)
+	e.addField("stream_id", id)
+	e.addField("new", "closed")
+	return e
 }

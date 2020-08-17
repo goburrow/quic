@@ -12,10 +12,10 @@ import (
 
 func TestClientConnInitialState(t *testing.T) {
 	config := NewConfig()
-	config.Params.OriginalDestinationCID = []byte{0}
-	config.Params.InitialSourceCID = []byte{0}
-	config.Params.RetrySourceCID = []byte{0}
-	config.Params.StatelessResetToken = []byte{0}
+	config.Params.OriginalDestinationCID = []byte("01234")
+	config.Params.InitialSourceCID = []byte("56789")
+	config.Params.RetrySourceCID = []byte("abcdef")
+	config.Params.StatelessResetToken = []byte("xyz")
 	scid := []byte{1, 2, 3}
 
 	c, err := Connect(scid, config)
@@ -39,10 +39,10 @@ func TestClientConnInitialState(t *testing.T) {
 
 func TestServerConnInitialState(t *testing.T) {
 	config := NewConfig()
-	config.Params.OriginalDestinationCID = []byte{0}
-	config.Params.InitialSourceCID = []byte{0}
-	config.Params.RetrySourceCID = []byte{0}
-	config.Params.StatelessResetToken = []byte{8, 9}
+	config.Params.OriginalDestinationCID = []byte("01234")
+	config.Params.InitialSourceCID = []byte("56789")
+	config.Params.RetrySourceCID = []byte("abcdef")
+	config.Params.StatelessResetToken = []byte("1234567890123456")
 	scid := []byte{1, 2, 3}
 	odcid := []byte{4, 5}
 
@@ -78,14 +78,15 @@ func TestHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = negotiateClient(client)
+	p := &testEndpoint{client: client}
+	err = p.negotiateVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if client.version != ProtocolVersion {
 		t.Fatalf("expect negotiated version %v, actual %v", ProtocolVersion, client.version)
 	}
-	err = retryClient(client)
+	err = p.retry()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +99,8 @@ func TestHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = handshake(client, server)
+	p.server = server
+	err = p.handshake()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,16 +108,15 @@ func TestHandshake(t *testing.T) {
 }
 
 func TestConnStream(t *testing.T) {
-	client, server, err := newTestConn()
+	p, err := newTestConn()
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := make([]byte, 1400)
-	ct, err := client.Stream(4)
+	ct, err := p.client.Stream(4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := ct.Write([]byte("hello"))
+	n, err := ct.WriteString("hello")
 	if n != 5 || err != nil {
 		t.Fatalf("stream write: %v %v", n, err)
 	}
@@ -123,37 +124,61 @@ func TestConnStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err = client.Read(b)
+	n, err = p.sendToServer()
 	if err != nil {
-		t.Fatalf("client read: %v %v", n, err)
+		t.Fatal(err)
 	}
-	n, err = server.Write(b[:n])
-	if err != nil {
-		t.Fatalf("server write: %v %v", n, err)
-	}
-	events := server.Events(nil)
+	events := p.server.Events(nil)
 	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
 		events[1].Type != EventStreamWritable || events[1].ID != 4 {
 		t.Fatalf("events %+v", events)
 	}
-	st, err := server.Stream(events[0].ID)
+	st, err := p.server.Stream(events[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err = st.Read(b)
+	n, err = st.Read(p.buf[:])
 	if n != 5 || err != nil {
 		t.Fatalf("server stream read %v %v", n, err)
 	}
-	if string(b[:n]) != "hello" {
-		t.Fatalf("server received %v", b[:n])
+	if string(p.buf[:n]) != "hello" {
+		t.Fatalf("server received %v", p.buf[:n])
 	}
-	n, err = st.Read(b)
+	n, err = st.Read(p.buf[:])
 	if n != 0 || err != io.EOF {
 		t.Fatalf("server stream read %v %v, expect %v", n, err, io.EOF)
 	}
+	n, err = st.WriteString("hi!")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err = p.sendToClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events = p.client.Events(nil)
+	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
+		events[1].Type != EventStreamComplete || events[1].ID != 4 {
+		t.Fatalf("events %+v", events)
+	}
+	n, err = ct.Read(p.buf[:])
+	if n != 3 || err != nil {
+		t.Fatalf("client stream read %v %v", n, err)
+	}
+	if string(p.buf[:n]) != "hi!" {
+		t.Fatalf("client received %v", p.buf[:n])
+	}
+	n, err = st.Read(p.buf[:])
+	if n != 0 || err != io.EOF {
+		t.Fatalf("client stream read %v %v, expect %v", n, err, io.EOF)
+	}
 }
 
-func TestSendMaxData(t *testing.T) {
+func TestConnSendMaxData(t *testing.T) {
 	config := newTestConfig()
 	config.Params.InitialMaxData = 200
 	config.Params.InitialMaxStreamDataBidiRemote = 150
@@ -168,8 +193,8 @@ func TestSendMaxData(t *testing.T) {
 		data:     b,
 	}
 	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
-	if err != errFlowControl {
-		t.Fatalf("expect error %v, actual %v", errFlowControl, err)
+	if err == nil || err.Error() != "flow_control_error stream: connection data exceeded 200" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(FlowControlError), err)
 	}
 	stream.data = b[:100]
 	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
@@ -214,8 +239,13 @@ func TestInvalidConn(t *testing.T) {
 	}
 }
 
-func TestRecvResetStream(t *testing.T) {
+func TestConnRecvResetStream(t *testing.T) {
 	config := NewConfig()
+	config.Params.InitialMaxData = 1000
+	config.Params.InitialMaxStreamDataBidiRemote = 300
+	config.Params.InitialMaxStreamDataBidiLocal = 200
+	config.Params.InitialMaxStreamDataUni = 100
+	config.Params.InitialMaxStreamsBidi = 2
 	conn, err := Connect([]byte("client"), config)
 	if err != nil {
 		t.Fatal(err)
@@ -225,28 +255,30 @@ func TestRecvResetStream(t *testing.T) {
 		streamID: 2,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
-	if err == nil || err.Error() != "stream_state_error reset stream 2" {
+	if err == nil || err.Error() != "stream_state_error reset_stream: invalid id 2" {
 		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
 	}
-	// Too much data
+	// Too much connection data
 	f = resetStreamFrame{
 		streamID:  3,
-		finalSize: config.Params.InitialMaxStreamDataBidiLocal + 1,
+		finalSize: config.Params.InitialMaxData + 1,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
-	if err != errFlowControl {
-		t.Fatalf("expect error %v, actual %v", errFlowControl, err)
+	if err == nil || err.Error() != "flow_control_error reset_stream: connection data exceeded 1000" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(FlowControlError), err)
 	}
 	// Reset different size
+	st := conn.streams.get(3)
+	st.pushRecv(make([]byte, 10), 0, true)
 	f = resetStreamFrame{
 		streamID:  3,
-		finalSize: 1000,
+		finalSize: 11,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
 	if err != errFinalSize {
 		t.Fatalf("expect error %v, actual %v", errFinalSize, err)
 	}
-
+	// Succeed
 	f = resetStreamFrame{
 		streamID:  5,
 		errorCode: 5,
@@ -265,22 +297,37 @@ func TestRecvResetStream(t *testing.T) {
 	}
 }
 
-func TestRecvStopSending(t *testing.T) {
+func TestConnRecvStopSending(t *testing.T) {
 	conn, err := Accept([]byte("server"), nil, NewConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
+	conn.peerParams.InitialMaxStreamDataUni = 10
+	conn.streams.maxStreams.peerUni = 1
 	// Our local stream
 	f := stopSendingFrame{
 		streamID: 1,
 	}
 	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
-	if err == nil || err.Error() != "stream_state_error stop sending stream 1" {
+	if err == nil || err.Error() != "stream_state_error stop_sending: stream not existed 1" {
 		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
 	}
-	// Remote stream
+	f.streamID = 2
+	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
+	if err == nil || err.Error() != "stream_state_error stop_sending: stream readonly 2" {
+		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
+	}
+	st, err := conn.Stream(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := st.WriteString("data")
+	if n != 4 || err != nil {
+		t.Fatalf("expect write %v %v, actual: %v %v", 4, nil, n, err)
+	}
+	// Peer wants us to stop sending
 	f = stopSendingFrame{
-		streamID:  4,
+		streamID:  3,
 		errorCode: 9,
 	}
 	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
@@ -288,103 +335,132 @@ func TestRecvStopSending(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStreamStop || events[0].ID != 4 || events[0].Data != 9 {
+	if len(events) != 1 || events[0].Type != EventStreamStop || events[0].ID != f.streamID || events[0].Data != 9 {
 		t.Fatalf("event %+v", events)
+	}
+	resetFrame := conn.sendFrameResetStream(f.streamID, st)
+	if resetFrame == nil || resetFrame.streamID != f.streamID || resetFrame.errorCode != 9 || resetFrame.finalSize != 4 {
+		t.Fatalf("expect reset frame %v %v %v, actual %+v", f.streamID, 9, 4, resetFrame)
 	}
 }
 
-func newTestConn() (client, server *Conn, err error) {
+func newTestConn() (*testEndpoint, error) {
 	clientCID := []byte("client-cid")
 	clientConfig := newTestConfig()
 	clientConfig.TLS.ServerName = "localhost"
 	clientConfig.TLS.RootCAs = testCA
 
-	client, err = Connect(clientCID, clientConfig)
+	client, err := Connect(clientCID, clientConfig)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	serverConfig := newTestConfig()
 	serverConfig.TLS.Certificates = testCerts
-
 	serverCID := []byte("server-cid")
-	server, err = Accept(serverCID, nil, serverConfig)
+	server, err := Accept(serverCID, nil, serverConfig)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	err = handshake(client, server)
+	p := &testEndpoint{
+		client: client,
+		server: server,
+	}
+	err = p.handshake()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return client, server, nil
+	return p, nil
 }
 
-func negotiateClient(client *Conn) error {
-	b := make([]byte, 1400)
-	n, err := client.Read(b)
+type testEndpoint struct {
+	client *Conn
+	server *Conn
+	buf    [1400]byte
+}
+
+func (t *testEndpoint) sendToServer() (int, error) {
+	return t.send(t.server, t.client)
+}
+
+func (t *testEndpoint) sendToClient() (int, error) {
+	return t.send(t.client, t.server)
+}
+
+func (t *testEndpoint) send(to *Conn, from *Conn) (int, error) {
+	n, err := from.Read(t.buf[:])
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		m, err := to.Write(t.buf[:n])
+		if err != nil {
+			return 0, err
+		}
+		if n != m {
+			return 0, fmt.Errorf("expect write %v, actual %v", n, m)
+		}
+	}
+	return n, nil
+}
+
+func (t *testEndpoint) negotiateVersion() error {
+	n, err := t.client.Read(t.buf[:])
 	if err != nil {
 		return err
 	}
 	h := Header{}
-	_, err = h.Decode(b[:n], 0)
+	_, err = h.Decode(t.buf[:n], 0)
 	if err != nil {
 		return err
 	}
-	b = make([]byte, 200)
+	b := make([]byte, 256)
 	n, err = NegotiateVersion(b, h.SCID, h.DCID)
 	if err != nil {
 		return err
 	}
-	_, err = client.Write(b[:n])
-	if err != nil {
-		return err
-	}
-	return nil
+	_, err = t.client.Write(b[:n])
+	return err
 }
 
-func retryClient(client *Conn) error {
-	b := make([]byte, 1400)
-	n, err := client.Read(b)
+func (t *testEndpoint) retry() error {
+	n, err := t.client.Read(t.buf[:])
 	if err != nil {
 		return err
 	}
 	h := Header{}
-	_, err = h.Decode(b[:n], 0)
+	_, err = h.Decode(t.buf[:n], 0)
 	if err != nil {
 		return err
 	}
-	b = make([]byte, 200)
+	b := make([]byte, 256)
 	n, err = Retry(b, h.SCID, []byte("server-cid"), h.DCID, []byte("retry-token"))
 	if err != nil {
 		return err
 	}
-	_, err = client.Write(b[:n])
-	if err != nil {
-		return err
-	}
-	return nil
+	_, err = t.client.Write(b[:n])
+	return err
 }
 
-func handshake(client, server *Conn) error {
-	b := make([]byte, 1400)
+func (t *testEndpoint) handshake() error {
 	start := time.Now()
-	for !client.IsEstablished() || !server.IsEstablished() {
-		n, err := client.Read(b)
+	for !t.client.IsEstablished() || !t.server.IsEstablished() {
+		n, err := t.client.Read(t.buf[:])
 		if err != nil {
 			return err
 		}
 		if n > 0 {
-			_, err = server.Write(b[:n])
+			_, err = t.server.Write(t.buf[:n])
 			if err != nil {
 				return err
 			}
 		}
-		n, err = server.Read(b)
+		n, err = t.server.Read(t.buf[:])
 		if err != nil {
 			return err
 		}
 		if n > 0 {
-			_, err = client.Write(b[:n])
+			_, err = t.client.Write(t.buf[:n])
 			if err != nil {
 				return err
 			}

@@ -28,8 +28,8 @@ func (s *flowControl) canRecv() uint64 {
 
 // addRecv adds to number of bytes received.
 // This function is called when data is successfully received.
-func (s *flowControl) addRecv(n int) {
-	s.totalRecv += uint64(n)
+func (s *flowControl) addRecv(n uint64) {
+	s.totalRecv += n
 }
 
 func (s *flowControl) setRecv(n uint64) {

@@ -25,6 +25,9 @@ func TestTransportParams(t *testing.T) {
 		InitialMaxStreamDataUni:        262144,
 		InitialMaxStreamsBidi:          8,
 		InitialMaxStreamsUni:           8,
+
+		ActiveConnectionIDLimit: 2,
+		DisableActiveMigration:  true,
 	}
 	b := testdata.DecodeHex(`
 	00050102030405
@@ -37,6 +40,8 @@ func TestTransportParams(t *testing.T) {
 	070480040000
 	080108
 	090108
+	0c
+	0e0102
 	0f020204
 	1003030507`)
 	encoded := tp.marshal()

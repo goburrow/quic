@@ -50,7 +50,8 @@ func (s packetType) String() string {
 }
 
 const (
-	maxPacketNumberLength = 4
+	maxPacketNumberLength  = 4
+	minPacketPayloadLength = 4
 )
 
 func isLongHeader(b byte) bool {

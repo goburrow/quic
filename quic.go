@@ -40,6 +40,9 @@ type Conn struct {
 	events []transport.Event
 	recvCh chan *packet
 
+	nextStreamIDBidi uint64
+	nextStreamIDUni  uint64
+
 	userData interface{}
 }
 
@@ -49,6 +52,9 @@ func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn) *Conn {
 		scid:   scid,
 		conn:   conn,
 		recvCh: make(chan *packet, 8),
+
+		nextStreamIDBidi: 0, // client by default
+		nextStreamIDUni:  2, // client by default
 	}
 }
 
@@ -58,13 +64,28 @@ func (s *Conn) ID() []byte {
 }
 
 // Stream creates or returns an existing QUIC stream given the ID.
-func (s *Conn) Stream(id uint64) io.ReadWriteCloser {
+func (s *Conn) Stream(id uint64) (*transport.Stream, error) {
+	return s.conn.Stream(id)
+}
+
+// NewStream creates and returns a new local stream and id.
+func (s *Conn) NewStream(bidi bool) (*transport.Stream, uint64, error) {
+	var id uint64
+	if bidi {
+		id = s.nextStreamIDBidi
+	} else {
+		id = s.nextStreamIDUni
+	}
 	st, err := s.conn.Stream(id)
 	if err != nil {
-		// TODO: log error
-		return nil
+		return nil, 0, err
 	}
-	return st
+	if bidi {
+		s.nextStreamIDBidi += 4
+	} else {
+		s.nextStreamIDUni += 4
+	}
+	return st, id, nil
 }
 
 // LocalAddr returns the local network address.
@@ -77,7 +98,7 @@ func (s *Conn) RemoteAddr() net.Addr {
 	return s.addr
 }
 
-// SetUserData attachs (or remove) data to the connection.
+// SetUserData attaches (or removes) user data to the connection.
 func (s *Conn) SetUserData(data interface{}) {
 	s.userData = data
 }
@@ -93,13 +114,19 @@ func (s *Conn) Close() error {
 	return nil
 }
 
+// CloseWithError sets the connection to close state with provided code and reason sending to peer.
+func (s *Conn) CloseWithError(code uint64, reason string) {
+	s.conn.Close(true, code, reason)
+}
+
 // localConn is a local quic connection.
 type localConn struct {
 	config *transport.Config
 	socket net.PacketConn
 
-	peersMu sync.RWMutex
-	peers   map[string]*Conn
+	peersMu   sync.RWMutex
+	peers     map[string]*Conn // by cid
+	peersAddr map[string]*Conn // by address
 
 	closing   bool      // locked by peersMu.
 	closeCond sync.Cond // locked by peersMu. Closing a connection will broadcast when connections is empty
@@ -112,6 +139,7 @@ type localConn struct {
 func (s *localConn) init(config *transport.Config) {
 	s.config = config
 	s.peers = make(map[string]*Conn)
+	s.peersAddr = make(map[string]*Conn)
 	s.closeCh = make(chan struct{})
 	s.closeCond.L = &s.peersMu
 	s.handler = noopHandler{}
@@ -176,7 +204,7 @@ func (s *localConn) pollConn(c *Conn) *packet {
 		}
 	case <-timer.C:
 		// Read timeout
-		s.logger.log(levelTrace, "read_timed_out cid=%x addr=%s timeout=%s", c.scid, c.addr, timeout)
+		s.logger.log(levelTrace, "verbose cid=%x addr=%s message=read_timed_out: %s", c.scid, c.addr, timeout)
 		c.conn.Write(nil)
 	case <-s.closeCh:
 		// Server is closing (see s.close)
@@ -209,7 +237,7 @@ func (s *localConn) pollConnDelayed(c *Conn) {
 func (s *localConn) recvConn(c *Conn, data []byte) error {
 	n, err := c.conn.Write(data)
 	if err != nil {
-		s.logger.log(levelError, "receive_failed cid=%x addr=%s %v", c.scid, c.addr, err)
+		s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
 		// Close connection when receive failed
 		if err, ok := err.(*transport.Error); ok {
 			c.conn.Close(false, err.Code, err.Message)
@@ -226,16 +254,16 @@ func (s *localConn) sendConn(c *Conn, buf []byte) error {
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
-			s.logger.log(levelError, "send_failed cid=%x addr=%s %v", c.scid, c.addr, err)
+			s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
 			return err
 		}
 		if n == 0 {
-			s.logger.log(levelTrace, "send_done cid=%x addr=%s", c.scid, c.addr)
+			s.logger.log(levelTrace, "verbose cid=%x addr=%s message=send_done", c.scid, c.addr)
 			return nil
 		}
 		n, err = s.socket.WriteTo(buf[:n], c.addr)
 		if err != nil {
-			s.logger.log(levelError, "send_failed cid=%x addr=%s %v", c.scid, c.addr, err)
+			s.logger.log(levelError, "internal_error cid=%x addr=%s description=send_failed: %v", c.scid, c.addr, err)
 			return err
 		}
 		s.logger.log(levelTrace, "datagrams_sent cid=%x addr=%s byte_length=%d raw=%x", c.scid, c.addr, n, buf[:n])
@@ -244,11 +272,14 @@ func (s *localConn) sendConn(c *Conn, buf []byte) error {
 
 func (s *localConn) serveConn(c *Conn) {
 	c.events = c.conn.Events(c.events)
-	s.handler.Serve(c, c.events)
-	for i := range c.events {
-		c.events[i] = transport.Event{}
+	if len(c.events) > 0 {
+		s.logger.log(levelDebug, "debug cid=%x message=events: %v", c.scid, c.events)
+		s.handler.Serve(c, c.events)
+		for i := range c.events {
+			c.events[i] = transport.Event{}
+		}
+		c.events = c.events[:0]
 	}
-	c.events = c.events[:0]
 }
 
 func (s *localConn) connClosed(c *Conn) {
@@ -257,6 +288,7 @@ func (s *localConn) connClosed(c *Conn) {
 	s.serveConn(c)
 	s.peersMu.Lock()
 	delete(s.peers, string(c.scid[:]))
+	delete(s.peersAddr, c.addr.String())
 	// If server is closing and this is the last one, tell others
 	if s.closing && len(s.peers) == 0 {
 		s.closeCond.Broadcast()
@@ -264,7 +296,7 @@ func (s *localConn) connClosed(c *Conn) {
 	s.peersMu.Unlock()
 }
 
-// close closes receving packet channel of all connections to signal terminating handleConn gorotines.
+// close closes receiving packet channel of all connections to signal terminating handleConn gorotines.
 func (s *localConn) close(timeout time.Duration) {
 	s.peersMu.Lock()
 	if s.closing {

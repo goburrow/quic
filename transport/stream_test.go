@@ -48,6 +48,44 @@ func TestStreamRecv(t *testing.T) {
 	}
 }
 
+func TestStreamRecvRetry(t *testing.T) {
+	s := Stream{}
+	s.init(false, true)
+	s.flow.init(100, 0)
+
+	data := []byte("recvstream")
+	s.pushRecv(data, 0, false)
+	s.pushRecv(data, 20, true)
+	b := make([]byte, 100)
+	n, err := s.Read(b)
+	if err != nil || n != 10 || string(b[:n]) != "recvstream" {
+		t.Fatalf("expect read %v %v %s, actual %v %v %s", 10, nil, "recvstream", n, err, b[:n])
+	}
+	n, err = s.Read(b)
+	if err != nil || n != 0 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
+	}
+	s.pushRecv(data, 0, false)
+	n, err = s.Read(b)
+	if err != nil || n != 0 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
+	}
+	s.pushRecv(data, 6, false)
+	n, err = s.Read(b)
+	if err != nil || n != 6 || string(b[:n]) != "stream" {
+		t.Fatalf("expect read %v %v %s, actual %v %v %s", 6, nil, "stream", n, err, b[:n])
+	}
+	s.pushRecv(data, 10, false)
+	n, err = s.Read(b)
+	if err != nil || n != 14 || string(b[:n]) != "reamrecvstream" {
+		t.Fatalf("expect read %v %v %s, actual %v %v %s", 14, nil, "reamrecvstream", n, err, b[:n])
+	}
+	n, err = s.Read(b)
+	if err != io.EOF || n != 0 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, io.EOF, n, err)
+	}
+}
+
 func TestStreamSend(t *testing.T) {
 	s := Stream{}
 	s.init(false, true)
@@ -58,14 +96,14 @@ func TestStreamSend(t *testing.T) {
 	if err != nil || n != 4 {
 		t.Fatalf("expect write %v %v, actual %v %v", 4, nil, n, err)
 	}
-	if !s.isWriteable() {
+	if !s.isWritable() {
 		t.Fatalf("expect writeable: %v", &s)
 	}
 	n, err = s.Write(b[4:])
 	if err != nil || n != 6 {
 		t.Fatalf("expect write %v %v, actual %v %v", 6, nil, n, err)
 	}
-	if s.isWriteable() {
+	if s.isWritable() {
 		t.Fatalf("expect not writeable: %v", &s)
 	}
 	// Done sending
@@ -73,7 +111,7 @@ func TestStreamSend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.isWriteable() {
+	if s.isWritable() {
 		t.Fatalf("expect not writeable: %v", &s)
 	}
 	// Consume
@@ -98,12 +136,102 @@ func TestStreamSend(t *testing.T) {
 	}
 }
 
+func TestStreamCloseWriteBidi(t *testing.T) {
+	s := Stream{}
+	s.init(true, true)
+	s.flow.init(10, 10)
+
+	_, err := s.WriteString("stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.isFlushable() {
+		t.Fatalf("expect flushable %v, actual %v", true, s.isFlushable())
+	}
+	err = s.CloseWrite(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, ok := s.updateResetStream()
+	if ok || code != 0 {
+		t.Fatalf("expect send error code %v(%v), actual %v(%v)", 0, false, code, ok)
+	}
+	if !s.isFlushable() {
+		t.Fatalf("expect flushable %v, actual %v", true, s.isFlushable())
+	}
+	if s.isWritable() {
+		t.Fatalf("expect writable %v, actual %v", false, s.isWritable())
+	}
+	n, err := s.WriteString("more")
+	if n != 0 || err != nil {
+		t.Fatalf("expect write %v %v, actual %v %v", 0, nil, n, err)
+	}
+	// Sending
+	b, off, fin := s.popSend(10)
+	if string(b) != "stream" || off != 0 || fin != true {
+		t.Fatalf("expect pop %q %v %v, actual %q %v %v", "stream", 0, true, b, off, fin)
+	}
+	code, ok = s.updateResetStream()
+	if !ok || code != 100 {
+		t.Fatalf("expect send error code %v(%v), actual %v(%v)", 100, true, code, ok)
+	}
+	s.setResetStream(deliverySending)
+	code, ok = s.updateResetStream()
+	if ok || code != 0 {
+		t.Fatalf("expect send error code %v(%v), actual %v(%v)", 0, true, code, ok)
+	}
+}
+
+func TestStreamCloseWriteUni(t *testing.T) {
+	s := Stream{}
+	s.init(false, false)
+
+	err := s.CloseWrite(100)
+	if err == nil || err.Error() != "stream_state_error cannot close sending remote unidirectional stream" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(StreamStateError), err)
+	}
+}
+
+func TestStreamCloseReadBidi(t *testing.T) {
+	s := Stream{}
+	s.init(false, true)
+	s.flow.init(10, 10)
+
+	err := s.CloseRead(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, ok := s.updateStopSending()
+	if !ok || code != 100 {
+		t.Fatalf("expect recv error code %v(%v), actual %v(%v)", 100, true, code, ok)
+	}
+	err = s.pushRecv([]byte("stream"), 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.setStopSending(deliverySending)
+	code, ok = s.updateStopSending()
+	if ok || code != 0 {
+		t.Fatalf("expect recv error code %v(%v), actual %v(%v)", 0, false, code, ok)
+	}
+}
+
+func TestStreamCloseReadUni(t *testing.T) {
+	s := Stream{}
+	s.init(true, false)
+
+	err := s.CloseRead(100)
+	if err == nil || err.Error() != "stream_state_error cannot close receiving local unidirectional stream" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(StreamStateError), err)
+	}
+}
+
 func TestStreamClose(t *testing.T) {
 	s := Stream{}
 	s.init(false, true)
 	s.flow.init(0, 10)
 
-	_, err := s.Write([]byte("stream"))
+	_, err := s.WriteString("stream")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,9 +347,10 @@ func TestStreamRemoteUni(t *testing.T) {
 	if err, ok := err.(*Error); !ok || err.Code != StreamStateError {
 		t.Fatalf("expect error %+v, actual %+v", errorText[StreamStateError], err)
 	}
+	// Close should have no effect.
 	err = s.Close()
-	if err, ok := err.(*Error); !ok || err.Code != StreamStateError {
-		t.Fatalf("expect error %+v, actual %+v", errorText[StreamStateError], err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	// Receive data out of order
 	err = s.pushRecv(b, 5, false)
@@ -240,7 +369,92 @@ func TestStreamRemoteUni(t *testing.T) {
 	}
 	// Exceeds limits
 	err = s.pushRecv(b, 11, false)
-	if err != errFlowControl {
-		t.Fatalf("expect error %v, actual %v", errFinalSize, err)
+	if err == nil || err.Error() != "flow_control_error stream: data exceeded 20" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(FlowControlError), err)
+	}
+}
+
+func TestStreamUpdateMaxStreamsBidi(t *testing.T) {
+	sm := streamMap{}
+	sm.init(3, 0)
+
+	for i := 0; i < 3; i++ {
+		st, err := sm.create(uint64(i*4), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.flow.init(1, 2)
+	}
+	_, err := sm.create(12, false)
+	if err == nil || err.Error() != "stream_limit_error remote bidi streams exceeded 3" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(StreamLimitError), err)
+	}
+	var b [8]byte
+	st := sm.get(0)
+	st.pushRecv(b[:1], 0, true)
+	st.Read(b[:])
+	if st.recv.isClosed() {
+		t.Fatalf("expect recv stream not closed, actual %v", st.recv.isClosed())
+	}
+	st.Read(b[:])
+	if !st.recv.isClosed() {
+		t.Fatalf("expect recv stream closed, actual %v", st.recv.isClosed())
+	}
+	st.Write(b[:2])
+	st.Close()
+	st.popSend(2)
+	if st.send.isClosed() {
+		t.Fatalf("expect send stream not closed, actual %v", st.send.isClosed())
+	}
+	st.ackSend(0, 2)
+	if !st.send.isClosed() {
+		t.Fatalf("expect send stream closed, actual %v", st.send.isClosed())
+	}
+	sm.checkClosed(func(uint64) {})
+	_, existed := sm.closedStreams[0]
+	if len(sm.closedStreams) != 1 || !existed {
+		t.Fatalf("expect stream moved to closed list, actual %v", sm.closedStreams)
+	}
+	if sm.maxStreamsNext.localBidi != 4 {
+		t.Fatalf("expect localBidi %v, actual %v", 4, sm.maxStreamsNext.localBidi)
+	}
+	if !sm.updateMaxStreamsBidi {
+		t.Fatalf("expect updateMaxStreamsBidi %v, actual %v", true, sm.updateMaxStreamsBidi)
+	}
+}
+
+func TestStreamUpdateMaxStreamsUni(t *testing.T) {
+	sm := streamMap{}
+	sm.init(0, 2)
+
+	for i := 0; i < 2; i++ {
+		st, err := sm.create(uint64(i*4)+3, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.flow.init(0, 1)
+	}
+	_, err := sm.create(11, true)
+	if err == nil || err.Error() != "stream_limit_error remote uni streams exceeded 2" {
+		t.Fatalf("expect error %v, actual %v", errorCodeString(StreamLimitError), err)
+	}
+	st := sm.get(7)
+	if st.recv.isClosed() {
+		t.Fatalf("expect recv stream not closed, actual %v", st.recv.isClosed())
+	}
+	st.stopSend(0)
+	if !st.send.isClosed() {
+		t.Fatalf("expect send stream closed, actual %v", st.send.isClosed())
+	}
+	sm.checkClosed(func(uint64) {})
+	_, existed := sm.closedStreams[7]
+	if len(sm.closedStreams) != 1 || !existed {
+		t.Fatalf("expect stream moved to closed list, actual %v", sm.closedStreams)
+	}
+	if sm.maxStreamsNext.localUni != 3 {
+		t.Fatalf("expect localUni %v, actual %v", 3, sm.maxStreamsNext.localUni)
+	}
+	if !sm.updateMaxStreamsUni {
+		t.Fatalf("expect updateMaxStreamsBidi %v, actual %v", true, sm.updateMaxStreamsUni)
 	}
 }

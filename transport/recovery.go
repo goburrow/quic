@@ -169,8 +169,6 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 	// Finds packets that are newly acknowledged and removes them from sent packets.
 	var ackedPackets []*sentPacket
 	hasAckEliciting := false
-	largestAckedPacketNumber := uint64(0)
-	largestAckedTimeSent := now
 	for _, r := range ranges {
 		s.filterSent(space, func(p *sentPacket) bool {
 			if p.packetNumber < r.start || p.packetNumber > r.end {
@@ -179,8 +177,6 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 			if p.ackEliciting {
 				hasAckEliciting = true
 			}
-			largestAckedPacketNumber = p.packetNumber
-			largestAckedTimeSent = p.timeSent
 			ackedPackets = append(ackedPackets, p)
 			return true
 		})
@@ -189,10 +185,11 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 	if len(ackedPackets) == 0 {
 		return
 	}
+	largestPacket := ackedPackets[len(ackedPackets)-1]
 	// If the largest acknowledged is newly acked and
 	// at least one ack-eliciting was newly acked, update the RTT.
-	if largestAckedPacketNumber == largestAcked && hasAckEliciting {
-		latestRTT := now.Sub(largestAckedTimeSent)
+	if largestPacket.packetNumber == largestAcked && hasAckEliciting {
+		latestRTT := now.Sub(largestPacket.timeSent)
 		if space != packetSpaceApplication {
 			ackDelay = 0
 		}
@@ -320,9 +317,8 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 				s.lost[space] = append(s.lost[space], p)
 			}
 			// The packet may not really lost, so do not change congestion control.
-			sent[i] = nil
+			// It is kept in the sent list so we can actually declare it lost or acked later.
 		}
-		s.sent[space] = sent[:n]
 	}
 	s.setLossDetectionTimer()
 }
@@ -434,7 +430,6 @@ func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 // earliestTimeout returns ealieast PTO timeout.
 func (s *lossRecovery) earliestProbeTime() (time.Time, packetSpace) {
 	duration := s.probeTimeout() * (1 << s.ptoCount)
-
 	space := packetSpaceInitial
 	timeout := s.timeOfLastAckElicitingPacket[space]
 	if !timeout.IsZero() {
@@ -528,11 +523,23 @@ func (s *lossRecovery) drainAcked(space packetSpace, fn func(frame)) {
 }
 
 func (s *lossRecovery) setMaxAckDelay(maxAckDelay time.Duration) {
-	s.maxAckDelay = maxAckDelay
+	if s.maxAckDelay > 0 {
+		s.maxAckDelay = maxAckDelay
+	} else {
+		s.maxAckDelay = 25 * time.Millisecond
+	}
 }
 
 func (s *lossRecovery) setHandshakeComplete() {
 	s.handshakeComplete = true
+}
+
+func (s *lossRecovery) canSend() uint64 {
+	if s.ptoCount > 0 {
+		// Ignore congestion window if packet is sent on PTO timer expiration.
+		return minimumWindow
+	}
+	return s.congestion.canSend()
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-variables-of-interest-2

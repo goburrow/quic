@@ -27,7 +27,12 @@ func TestServerAndClient(t *testing.T) {
 			switch e.Type {
 			case EventConnAccept:
 			case transport.EventStreamReadable:
-				st := conn.Stream(e.ID)
+				st, err := conn.Stream(e.ID)
+				if st == nil || err != nil {
+					t.Errorf("expect client stream created, actual %v %v", st, err)
+					conn.Close()
+					return
+				}
 				buf := make([]byte, 8)
 				n, err := st.Read(buf)
 				if err != nil {
@@ -72,16 +77,21 @@ func TestServerAndClient(t *testing.T) {
 		for _, e := range events {
 			switch e.Type {
 			case EventConnAccept:
-				st := conn.Stream(4)
-				if st == nil {
-					t.Errorf("expect client stream created, actual %v", st)
+				st, err := conn.Stream(4)
+				if st == nil || err != nil {
+					t.Errorf("expect client stream created, actual %v %v", st, err)
 					conn.Close()
-				} else {
-					st.Write([]byte("ping"))
-					st.Close()
+					return
 				}
+				st.Write([]byte("ping"))
+				st.Close()
 			case transport.EventStreamReadable:
-				st := conn.Stream(e.ID)
+				st, err := conn.Stream(e.ID)
+				if st == nil || err != nil {
+					t.Errorf("expect client stream created, actual %v %v", st, err)
+					conn.Close()
+					return
+				}
 				buf := make([]byte, 8)
 				n, err := st.Read(buf)
 				if err == nil {

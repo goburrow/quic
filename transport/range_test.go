@@ -114,14 +114,21 @@ func (t *rangeSetTest) assertNotContain(v uint64) {
 func TestRangeBufferInsertPos(t *testing.T) {
 	x := rangeBufferListTest{t: t}
 	n := rand.Intn(1000)
+	min, max := maxUint64, uint64(0)
 	for i := 0; i < n; i++ {
 		b := &rangeBuffer{
 			data:   nil,
 			offset: rand.Uint64(),
 		}
+		if max < b.offset {
+			max = b.offset
+		}
+		if b.offset < min {
+			min = b.offset
+		}
 		idx := x.ls.insertPos(b.offset)
 		x.ls.insert(idx, b)
-		x.assertSize(i + 1)
+		x.assertSize(i+1, max-min)
 		x.assertOrdered()
 	}
 }
@@ -162,7 +169,7 @@ func TestRangeBufferWriteNoOverlap(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("expect read: %d actual: %d", 5, n)
 	}
-	x.assertSize(0)
+	x.assertSize(0, 0)
 	if !bytes.Equal(data, read[:15]) {
 		t.Fatalf("data does not match:\nexpect: %x\nactual: %x", data, read[:15])
 	}
@@ -182,6 +189,7 @@ func TestRangeBufferPushDataOverlap(t *testing.T) {
 	x.ls.write(data[150:200], 150)
 	x.assertSnapshot("ranges=4 [40,50) [50,100) [100,120) [150,200)")
 	x.assertOrdered()
+	x.assertSize(4, 160)
 
 	read := make([]byte, len(data))
 	n := x.ls.read(read, 150)
@@ -262,11 +270,15 @@ func (t *rangeBufferListTest) assertOrdered() {
 	}
 }
 
-func (t *rangeBufferListTest) assertSize(expect int) {
+func (t *rangeBufferListTest) assertSize(length int, size uint64) {
 	ls := t.ls
-	if len(ls) != expect {
+	if len(ls) != length {
 		t.t.Helper()
-		t.t.Fatalf("size does not match:\nexpect: %d\nactual: %+v", expect, ls)
+		t.t.Fatalf("length does not match:\nexpect: %d\nactual: %+v", length, ls)
+	}
+	if ls.size() != size {
+		t.t.Helper()
+		t.t.Fatalf("size does not match:\nexpect: %d\nactual: %d %+v", size, ls.size(), ls)
 	}
 }
 

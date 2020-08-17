@@ -5,6 +5,19 @@ import (
 	"io"
 )
 
+const (
+	maxStreams = 1 << 60
+)
+
+type deliveryState uint8
+
+const (
+	deliveryNone deliveryState = iota
+	deliveryReady
+	deliverySending
+	deliveryConfirmed
+)
+
 // Stream is a data stream.
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-streams
 type Stream struct {
@@ -31,7 +44,7 @@ func (s *Stream) init(local, bidi bool) {
 // pushRecv checks for maximum data can be received and pushes data to recv stream.
 func (s *Stream) pushRecv(data []byte, offset uint64, fin bool) error {
 	if offset+uint64(len(data)) > s.flow.maxRecv {
-		return errFlowControl
+		return newError(FlowControlError, sprint("stream: data exceeded ", s.flow.maxRecv))
 	}
 	err := s.recv.push(data, offset, fin)
 	if err == nil {
@@ -64,6 +77,9 @@ func (s *Stream) Write(b []byte) (int, error) {
 	if !s.bidi && !s.local {
 		return 0, newError(StreamStateError, "cannot write to uni stream")
 	}
+	if s.send.stopReceived || s.send.resetStream != deliveryNone {
+		return 0, nil
+	}
 	n := int(s.flow.canSend())
 	if n == 0 {
 		return 0, nil
@@ -90,16 +106,36 @@ func (s *Stream) isReadable() bool {
 	return s.recv.ready() || (s.recv.fin && !s.recv.finRead)
 }
 
-// isWriteable returns true if the stream has enough flow control capacity to be written to,
-// and is not finished.
-func (s *Stream) isWriteable() bool {
-	return !s.send.fin && s.flow.canSend() > 0
+// updateStopSending returns application error code for terminating receiving part of the stream,
+// if it is available and has not been sent. This error code is used in STOP_SENDING frame.
+func (s *Stream) updateStopSending() (uint64, bool) {
+	if s.recv.stopSending != deliveryReady {
+		return 0, false
+	}
+	return s.recv.stopError, true
 }
 
-// isFlushable returns true if the stream has data to send
+// setStopSending sets or resets whether the receiving stop error has been sent.
+func (s *Stream) setStopSending(state deliveryState) {
+	s.recv.stopSending = state
+}
+
+func (s *Stream) resetRecv(finalSize uint64) error {
+	return s.recv.reset(finalSize)
+}
+
+// isWritable returns true if the stream has enough flow control capacity to be written to,
+// and is not finished.
+func (s *Stream) isWritable() bool {
+	// XXX: To avoid over buffer, we only tell application to fill the send buffer
+	// when there is only some data left (8KB) to send.
+	return !s.send.stopReceived && !s.send.fin && s.flow.canSend() > 0 && s.send.buf.size() < 8192
+}
+
+// isFlushable returns true if the stream has data and is allowed to send.
 func (s *Stream) isFlushable() bool {
-	// flow maxSend is controlled by peer via MAX_STREAM_DATA
-	return s.send.ready(s.flow.maxSend) || (s.send.fin && !s.send.finSent)
+	// flow maxSend is controlled by peer via MAX_STREAM_DATA.
+	return !s.send.stopReceived && (s.send.ready(s.flow.maxSend) || (s.send.fin && !s.send.finSent))
 }
 
 // popSend returns continuous data from send buffer that size less than max bytes.
@@ -113,31 +149,77 @@ func (s *Stream) popSend(max int) (data []byte, offset uint64, fin bool) {
 
 // pushSend pushes data back to send stream to resend.
 func (s *Stream) pushSend(data []byte, offset uint64, fin bool) error {
+	if s.send.stopReceived {
+		return nil
+	}
 	return s.send.push(data, offset, fin)
 }
 
-// ackSend acknowleges data is received.
+// ackSend acknowledges that the data sent by stream has been received.
 // It returns true if all data has been sent and confirmed.
 func (s *Stream) ackSend(offset, length uint64) bool {
 	s.send.ack(offset, length)
 	return s.send.complete()
 }
 
-func (s *Stream) resetRecv(finalSize uint64) (int, error) {
-	return s.recv.reset(finalSize)
-}
-
 // ackMaxData acknowledges that the MAX_STREAM_DATA frame delivery is confirmed.
-func (s *Stream) ackMaxData() {
-	s.updateMaxData = false
+func (s *Stream) setUpdateMaxData(update bool) {
+	s.updateMaxData = update
 }
 
-// Close sets end of the sending stream.
-func (s *Stream) Close() error {
-	if !s.bidi && !s.local {
-		return newError(StreamStateError, "cannot close uni stream")
+// updateResetStream returns application error code for terminating sending part of the stream,
+// if it is available and has not been sent. This error code is used in RESET_STREAM frame.
+func (s *Stream) updateResetStream() (uint64, bool) {
+	// Try to send all pending data first if RESET_STREAM is initiated by local.
+	if s.send.resetStream != deliveryReady || (!s.send.stopReceived && len(s.send.buf) > 0) {
+		return 0, false
 	}
-	s.send.fin = true
+	return s.send.resetError, true
+}
+
+// setSendErrorSent sets or resets whether the sending reset error has been sent.
+func (s *Stream) setResetStream(state deliveryState) {
+	s.send.resetStream = state
+}
+
+// stopSend handles peer's STOP_SENDING frame sending to this stream.
+func (s *Stream) stopSend(errorCode uint64) {
+	s.send.stop(errorCode)
+}
+
+// isClosed returns true if both receiving and sending are closed and the stream is no longer needed.
+func (s *Stream) isClosed() bool {
+	return (s.flow.maxRecv == 0 || s.recv.isClosed()) &&
+		(s.flow.maxSend == 0 || s.send.isClosed())
+}
+
+// CloseWrite resets the stream (abrupt termination) the sending part of the stream.
+func (s *Stream) CloseWrite(errorCode uint64) error {
+	if !s.bidi && !s.local {
+		return newError(StreamStateError, "cannot close sending remote unidirectional stream")
+	}
+	// Results in sending RESET_STREAM frame.
+	s.send.terminate(errorCode)
+	return nil
+}
+
+// CloseRead aborts the reading part of the stream and requests closure.
+func (s *Stream) CloseRead(errorCode uint64) error {
+	if !s.bidi && s.local {
+		return newError(StreamStateError, "cannot close receiving local unidirectional stream")
+	}
+	// Results in sending STOP_SENDING frame.
+	s.recv.terminate(errorCode)
+	return nil
+}
+
+// Close ends the sending part of the stream (clean termination) if it is a bidirectional stream
+// or locally created.
+func (s *Stream) Close() error {
+	// The stream will no longer send data.
+	if s.bidi || s.local {
+		s.send.fin = true
+	}
 	return nil
 }
 
@@ -151,6 +233,10 @@ type recvStream struct {
 
 	offset uint64 // read offset
 	length uint64 // total length
+
+	stopError     uint64        // Error code for sending STOP_SENDING.
+	stopSending   deliveryState // Whether the stream needs to send STOP_SENDING.
+	resetReceived bool          // Received peer's RESET_STREAM.
 
 	fin     bool
 	finRead bool // Whether reader is notified about closing
@@ -171,9 +257,14 @@ func (s *recvStream) push(data []byte, offset uint64, fin bool) error {
 		}
 		s.fin = true
 	}
-	if s.offset >= end {
+	if end <= s.offset {
 		// Data has been read
 		return nil
+	}
+	if offset < s.offset {
+		// Overlap old and new data
+		data = data[s.offset-offset:]
+		offset = s.offset
 	}
 	s.buf.write(data, offset)
 	if end > s.length {
@@ -182,25 +273,28 @@ func (s *recvStream) push(data []byte, offset uint64, fin bool) error {
 	return nil
 }
 
-// reset returns how many bytes need to be removed from the flow control.
-func (s *recvStream) reset(finalSize uint64) (int, error) {
+// reset handles receiving RESET_STREAM.
+func (s *recvStream) reset(finalSize uint64) error {
+	if s.resetReceived {
+		return nil
+	}
 	if s.fin {
 		if finalSize != s.length {
-			return 0, errFinalSize
+			return errFinalSize
 		}
 	}
 	if finalSize < s.length {
-		return 0, errFinalSize
+		return errFinalSize
 	}
-	n := int(finalSize - s.length)
 	s.fin = true
 	s.length = finalSize
-	return n, nil
+	s.resetReceived = true
+	return nil
 }
 
 // Read makes recvStream an io.Reader.
 func (s *recvStream) Read(b []byte) (int, error) {
-	if s.isFin() {
+	if s.fin && s.offset >= s.length {
 		s.finRead = true
 		return 0, io.EOF
 	}
@@ -214,12 +308,31 @@ func (s *recvStream) ready() bool {
 	return s.offset < s.length && len(s.buf) > 0 && s.buf[0].offset == s.offset
 }
 
-func (s *recvStream) isFin() bool {
-	return s.fin && s.offset >= s.length
+func (s *recvStream) terminate(errorCode uint64) {
+	// STOP_SENDING should only be sent for a stream that has not been reset by the peer.
+	if s.stopSending == deliveryNone {
+		s.stopError = errorCode
+		if s.resetReceived {
+			s.stopSending = deliveryConfirmed
+		} else {
+			s.stopSending = deliveryReady
+		}
+		// It also means that application acknowledged closure.
+		s.finRead = true
+	}
+}
+
+// isClosed returns true when receiving part of the stream either:
+// 1. Fully read by application (got io.EOF),
+// 2. Terminated by application (STOP_SENDING sent and confirmed by peer).
+// It is not when terminated by peer (RESET_STREAM received) because application might want
+// to read all the data and explicitly allow creating new stream.
+func (s *recvStream) isClosed() bool {
+	return (s.fin && s.finRead) || s.stopSending == deliveryConfirmed
 }
 
 func (s *recvStream) String() string {
-	return fmt.Sprintf("offset=%v length=%v fin=%v", s.offset, s.length, s.fin)
+	return fmt.Sprintf("offset=%v length=%v fin=%v %v", s.offset, s.length, s.fin, s.buf)
 }
 
 // sendStream is buffer for sending data.
@@ -229,6 +342,10 @@ type sendStream struct {
 
 	offset uint64 // read offset
 	length uint64 // total length
+
+	resetError   uint64        // Error code for sending RESET_STREAM.
+	resetStream  deliveryState // Whether the stream needs to sent RESET_STREAM.
+	stopReceived bool          // Received peer's STOP_SENDING.
 
 	fin     bool
 	finSent bool // finSent is needed when sender closes the stream after data has already been read.
@@ -250,6 +367,7 @@ func (s *sendStream) push(data []byte, offset uint64, fin bool) error {
 			return errFinalSize
 		}
 		s.fin = true
+		s.finSent = false // For resending fin flag when lost
 	}
 	s.buf.write(data, offset)
 	if end > s.length {
@@ -291,73 +409,147 @@ func (s *sendStream) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (s *sendStream) String() string {
-	return fmt.Sprintf("offset=%v length=%v fin=%v", s.offset, s.length, s.fin)
-}
-
 // ack acknowledges stream data received.
 func (s *sendStream) ack(offset, length uint64) {
 	s.acked.push(offset, offset+length)
 }
 
-// complete returns true if all data in the stream has been sent.
+// complete returns true if all data in the stream has been sent and acknowledged.
 func (s *sendStream) complete() bool {
 	return s.fin && s.offset >= s.length && s.acked.equals(0, s.length)
+}
+
+// stop indicates peer no longer reads the data that this stream sends.
+func (s *sendStream) stop(errorCode uint64) {
+	if s.stopReceived {
+		return
+	}
+	s.stopReceived = true
+	// An endpoint that receives a STOP_SENDING frame MUST send a RESET_STREAM frame
+	// if the stream is in the Ready or Send state.
+	// An endpoint should copy the error code from the STOP_SENDING frame to the
+	// RESET_STREAM frame it sends.
+	if s.resetStream == deliveryNone && !s.fin {
+		s.resetError = errorCode
+		s.resetStream = deliveryReady
+	}
+}
+
+func (s *sendStream) terminate(errorCode uint64) {
+	if s.resetStream == deliveryNone {
+		s.fin = true
+		s.resetError = errorCode
+		if s.stopReceived {
+			s.resetStream = deliveryConfirmed
+		} else {
+			s.resetStream = deliveryReady
+		}
+	}
+}
+
+// isClosed returns true when sending part of the stream is either:
+// 1. Fully sent and confirmed by peer (ack received),
+// 2. Terminated by peer (STOP_SENDING received),
+// 3. Terminated by application (RESET_STREAM is sent and confirmed).
+func (s *sendStream) isClosed() bool {
+	return s.complete() || s.resetStream == deliveryConfirmed || s.stopReceived
+}
+
+func (s *sendStream) String() string {
+	return fmt.Sprintf("offset=%v length=%v fin=%v %v", s.offset, s.length, s.fin, s.buf)
 }
 
 /// streamMap keeps track of QUIC streams and enforces stream limits.
 type streamMap struct {
 	// Streams indexed by stream ID
 	streams map[uint64]*Stream
+	// Closed stream tracking
+	closedStreams map[uint64]struct{}
+	closedStream  Stream // dummy stream returned for closed streams
 
+	// Total streams opened by peer and local.
 	openedStreams struct {
 		peerBidi  uint64
 		peerUni   uint64
 		localBidi uint64
 		localUni  uint64
 	}
-
-	// Maximum stream count limit
+	// Maximum stream count allowed by peer and local.
 	maxStreams struct {
 		peerBidi  uint64
 		peerUni   uint64
 		localBidi uint64
 		localUni  uint64
 	}
+	// Maximum streams to send MAX_STREAMS update.
+	maxStreamsNext struct {
+		localBidi uint64
+		localUni  uint64
+	}
+
+	updateMaxStreamsBidi bool
+	updateMaxStreamsUni  bool
 }
 
 func (s *streamMap) init(maxBidi, maxUni uint64) {
 	s.streams = make(map[uint64]*Stream)
+	s.closedStreams = make(map[uint64]struct{})
 	s.maxStreams.localBidi = maxBidi
 	s.maxStreams.localUni = maxUni
+	s.maxStreamsNext.localBidi = maxBidi
+	s.maxStreamsNext.localUni = maxUni
+	// Shared stream object for all closed streams
+	s.closedStream = Stream{
+		recv: recvStream{
+			fin:           true,
+			finRead:       true,
+			stopSending:   deliveryConfirmed,
+			resetReceived: true,
+		},
+		send: sendStream{
+			fin:          true,
+			finSent:      true,
+			resetStream:  deliveryConfirmed,
+			stopReceived: true,
+		},
+		bidi: true,
+	}
 }
 
 func (s *streamMap) get(id uint64) *Stream {
+	if _, ok := s.closedStreams[id]; ok {
+		return &s.closedStream
+	}
 	return s.streams[id]
 }
 
 // create adds and returns new stream or error if it exceeds limits.
-func (s *streamMap) create(id uint64, local, bidi bool) (*Stream, error) {
+// Only streams with a stream ID less than (max_stream * 4 + initial_stream_id_for_type)
+// can be opened.
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-controlling-concurrency
+func (s *streamMap) create(id uint64, isClient bool) (*Stream, error) {
+	local := isStreamLocal(id, isClient)
+	bidi := isStreamBidi(id)
 	if local {
 		if bidi {
-			if s.openedStreams.localBidi >= s.maxStreams.peerBidi {
+			if s.openedStreams.localBidi >= s.maxStreams.peerBidi || id > s.maxStreams.peerBidi*4 {
 				return nil, newError(StreamLimitError, sprint("local bidi streams exceeded ", s.maxStreams.peerBidi))
 			}
 			s.openedStreams.localBidi++
 		} else {
-			if s.openedStreams.localUni >= s.maxStreams.peerUni {
+			if s.openedStreams.localUni >= s.maxStreams.peerUni || id > s.maxStreams.peerUni*4 {
 				return nil, newError(StreamLimitError, sprint("local uni streams exceeded ", s.maxStreams.peerUni))
 			}
 			s.openedStreams.localUni++
 		}
 	} else {
 		if bidi {
-			if s.openedStreams.peerBidi >= s.maxStreams.localBidi {
+			if s.openedStreams.peerBidi >= s.maxStreams.localBidi || id > s.maxStreams.localBidi*4 {
 				return nil, newError(StreamLimitError, sprint("remote bidi streams exceeded ", s.maxStreams.localBidi))
 			}
 			s.openedStreams.peerBidi++
 		} else {
-			if s.openedStreams.peerUni >= s.maxStreams.localUni {
+			if s.openedStreams.peerUni >= s.maxStreams.localUni || id > s.maxStreams.localUni*4 {
 				return nil, newError(StreamLimitError, sprint("remote uni streams exceeded ", s.maxStreams.localUni))
 			}
 			s.openedStreams.peerUni++
@@ -381,19 +573,36 @@ func (s *streamMap) setPeerMaxStreamsUni(v uint64) {
 	}
 }
 
-func (s *streamMap) setLocalMaxStreamsBidi(v uint64) {
-	if v > s.maxStreams.localBidi {
-		s.maxStreams.localBidi = v
-	}
+func (s *streamMap) setUpdateMaxStreamsBidi(update bool) {
+	s.updateMaxStreamsBidi = update
 }
 
-func (s *streamMap) setLocalMaxStreamsUni(v uint64) {
-	if v > s.maxStreams.localUni {
-		s.maxStreams.localUni = v
-	}
+func (s *streamMap) setUpdateMaxStreamsUni(update bool) {
+	s.updateMaxStreamsUni = update
 }
 
-func (s *streamMap) hasFlushable() bool {
+func (s *streamMap) shouldUpdateMaxStreamsBidi() bool {
+	return s.maxStreamsNext.localBidi != s.maxStreams.localBidi && s.maxStreams.localBidi >= s.openedStreams.peerBidi &&
+		s.maxStreamsNext.localBidi/2 > s.maxStreams.localBidi-s.openedStreams.peerBidi
+}
+
+func (s *streamMap) shouldUpdateMaxStreamsUni() bool {
+	return s.maxStreamsNext.localUni != s.maxStreams.localUni && s.maxStreams.localUni >= s.openedStreams.peerUni &&
+		s.maxStreamsNext.localUni/2 > s.maxStreams.localUni-s.openedStreams.peerUni
+}
+
+func (s *streamMap) commitMaxStreamsBidi() {
+	s.maxStreams.localBidi = s.maxStreamsNext.localBidi
+}
+
+func (s *streamMap) commitMaxStreamsUni() {
+	s.maxStreams.localUni = s.maxStreamsNext.localUni
+}
+
+func (s *streamMap) hasUpdate() bool {
+	if s.updateMaxStreamsBidi || s.updateMaxStreamsUni {
+		return true
+	}
 	for _, st := range s.streams {
 		if st.isFlushable() {
 			return true
@@ -402,7 +611,38 @@ func (s *streamMap) hasFlushable() bool {
 	return false
 }
 
+func (s *streamMap) checkClosed(fn func(streamId uint64)) {
+	for id, st := range s.streams {
+		if st.isClosed() {
+			// Give back max streams credit if the stream is created by peer.
+			if !st.local {
+				if st.bidi {
+					s.maxStreamsNext.localBidi++
+					if s.shouldUpdateMaxStreamsBidi() {
+						s.updateMaxStreamsBidi = true
+					}
+				} else {
+					s.maxStreamsNext.localUni++
+					if s.shouldUpdateMaxStreamsUni() {
+						s.updateMaxStreamsUni = true
+					}
+				}
+			}
+			delete(s.streams, id)
+			s.closedStreams[id] = struct{}{}
+			debug("stream closed %d", id)
+			fn(id)
+		}
+	}
+}
+
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#stream-id
+// Bits | Stream           | Type
+// 0b00 | Client-Initiated | Bidirectional
+// 0b01 | Server-Initiated | Bidirectional
+// 0b10 | Client-Initiated | Unidirectional
+// 0b11 | Server-Initiated | Unidirectional
+
 // Client-initiated streams have even-numbered stream IDs (with the bit set to 0),
 // and server-initiated streams have odd-numbered stream IDs (with the bit set to 1).
 func isStreamLocal(id uint64, isClient bool) bool {

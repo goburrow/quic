@@ -19,7 +19,7 @@ func TestPacketInitial(t *testing.T) {
 			scid:    scid,
 		},
 		token:      token,
-		payloadLen: minPayloadLength,
+		payloadLen: minPacketPayloadLength,
 	}
 	n, err := p.encode(b)
 	if err != nil {

@@ -32,12 +32,17 @@ func TestLogParameters(t *testing.T) {
 
 		AckDelayExponent: 3,
 		MaxAckDelay:      100 * time.Millisecond,
+
+		ActiveConnectionIDLimit: 2,
+		DisableActiveMigration:  true,
 	}
 	e := newLogEventParametersSet(tm, p)
-	expect := "2020-01-05T00:00:00Z parameters_set owner=remote original_connection_id=0102 stateless_reset_token=060708 " +
-		"max_idle_timeout=60000 max_udp_payload_size=1500 ack_delay_exponent=3 max_ack_delay=100 " +
+	expect := "2020-01-05T00:00:00Z parameters_set owner=remote original_connection_id=0102 " +
+		"max_idle_timeout=60000 stateless_reset_token=060708 max_udp_payload_size=1500 " +
 		"initial_max_data=1000 initial_max_stream_data_bidi_local=200 initial_max_stream_data_bidi_remote=300 " +
-		"initial_max_stream_data_uni=100 initial_max_streams_bidi=10 initial_max_streams_uni=5"
+		"initial_max_stream_data_uni=100 initial_max_streams_bidi=10 initial_max_streams_uni=5 " +
+		"ack_delay_exponent=3 max_ack_delay=100 disable_active_migration=true active_connection_id_limit=2 " +
+		"initial_source_connection_id=03 retry_source_connection_id=0405"
 	assertLogEvent(t, e, expect)
 }
 
@@ -120,7 +125,7 @@ func TestLogFrameStreamsBlocked(t *testing.T) {
 
 func TestLogFrameConnectionClose(t *testing.T) {
 	f := newConnectionCloseFrame(0x122, 99, []byte("reason"), false)
-	testLogFrame(t, f, "frame_type=connection_close error_space=transport error_code=crypto_error_34 raw_error_code=290 reason=reason trigger_frame_type=99")
+	testLogFrame(t, f, "frame_type=connection_close error_space=transport error_code=crypto_error_34 raw_error_code=290 trigger_frame_type=99 reason=reason")
 }
 
 func TestLogFrameHandshakeDone(t *testing.T) {
@@ -163,6 +168,13 @@ func TestLogRecovery(t *testing.T) {
 	e := newLogEventRecovery(tm, &r)
 	expect := "2020-01-05T00:00:00Z metrics_updated loss_timer=0 min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=0 " +
 		"pto_count=0 congestion_window=0 bytes_in_flight=0"
+	assertLogEvent(t, e, expect)
+}
+
+func TestLogStreamState(t *testing.T) {
+	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
+	e := newLogEventStreamClosed(tm, 10)
+	expect := "2020-01-05T00:00:00Z stream_state_updated stream_id=10 new=closed"
 	assertLogEvent(t, e, expect)
 }
 

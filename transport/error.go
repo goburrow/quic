@@ -77,10 +77,8 @@ func newError(code uint64, msg string) *Error {
 }
 
 var (
-	errFlowControl   = newError(FlowControlError, "")
 	errFinalSize     = newError(FinalSizeError, "")
 	errInvalidPacket = newError(FrameEncodingError, "invalid packet")
-	errInvalidToken  = newError(InvalidToken, "")
 
 	errShortBuffer = errors.New("ShortBuffer")
 )

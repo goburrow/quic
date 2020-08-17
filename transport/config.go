@@ -23,11 +23,6 @@ const (
 	MaxPacketSize = 65527
 	// MinInitialPacketSize is the QUIC minimum packet size when it contains Initial packet.
 	MinInitialPacketSize = 1200
-
-	minPayloadLength = 4
-
-	// Crypto is not under flow control, but we still enforce a hard limit.
-	cryptoMaxData = 1 << 20
 )
 
 // Config is a QUIC connection configuration.
@@ -43,16 +38,20 @@ func NewConfig() *Config {
 	return &Config{
 		Version: ProtocolVersion,
 		Params: Parameters{
-			MaxIdleTimeout:   30 * time.Second,
-			AckDelayExponent: 3,
-			MaxAckDelay:      25 * time.Millisecond,
+			MaxIdleTimeout:    30 * time.Second,
+			MaxUDPPayloadSize: MaxPacketSize,
 
-			InitialMaxData:                 8192,
+			InitialMaxData:                 16384,
 			InitialMaxStreamDataBidiLocal:  8192,
 			InitialMaxStreamDataBidiRemote: 8192,
 			InitialMaxStreamDataUni:        8192,
 			InitialMaxStreamsBidi:          1,
 			InitialMaxStreamsUni:           1,
+
+			AckDelayExponent: 3,
+			MaxAckDelay:      25 * time.Millisecond,
+
+			ActiveConnectionIDLimit: 2,
 		},
 	}
 }
