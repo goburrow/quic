@@ -1,4 +1,4 @@
-# Quince
+# Quiwi 🥝
 [![GoDoc](https://godoc.org/github.com/goburrow/quic?status.svg)](https://godoc.org/github.com/goburrow/quic)
 ![](https://github.com/goburrow/quic/workflows/Go/badge.svg)
 
@@ -12,7 +12,7 @@ licensed under the 3-clause BSD license.
 
 Build command:
 ```
-cd cmd/quince
+cd cmd/quiwi
 go build
 
 # To enable tracing
@@ -24,10 +24,10 @@ go build -gcflags '-m' 2>&1 | sort -V > debug.txt
 
 ```
 # Client
-./quince client https://quic.tech:4433/
+./quiwi client https://quic.tech:4433/
 
 # Server
-./quince server
+./quiwi server
 ```
 
 Add `SSLKEYLOGFILE=key.log` to have TLS keys logged to file.
@@ -60,7 +60,7 @@ cd /path/to/quic-interop-runner
 python3 -m venv venv
 . venv/bin/activate
 pip install -r requirements.txt
-./run.py -c quince -s quince
+./run.py -s quiwi -c quiwi
 ```
 
 ## Fuzzing

@@ -17,7 +17,7 @@ func qlogCommand(args []string) error {
 
 	name := cmd.Arg(0)
 	if name == "" {
-		fmt.Fprintln(cmd.Output(), "Usage: quince qlog [options] <file>")
+		fmt.Fprintln(cmd.Output(), "Usage: quiwi qlog [options] <file>")
 		cmd.PrintDefaults()
 		return nil
 	}

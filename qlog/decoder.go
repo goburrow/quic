@@ -11,7 +11,7 @@ import (
 
 const logTimeFormat = "2006/01/02 15:04:05.000000 "
 
-// Decode decodes quince log file.
+// Decode decodes quiwi log file.
 func Decode(r io.Reader) (*LogFile, error) {
 	dec := newDecoder(r)
 	err := dec.decode()
@@ -34,7 +34,7 @@ func newDecoder(r io.Reader) *decoder {
 		scanner: bufio.NewScanner(r),
 		result: &LogFile{
 			Version: "draft-02-wip",
-			Title:   "quince",
+			Title:   "quiwi",
 		},
 	}
 }

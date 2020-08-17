@@ -16,7 +16,7 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "Usage: quince <command> [options]")
+		fmt.Fprintln(flag.CommandLine.Output(), "Usage: quiwi <command> [options]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()

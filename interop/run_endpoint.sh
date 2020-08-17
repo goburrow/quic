@@ -36,7 +36,7 @@ run_client() {
     fi
     cd "$APPDIR"
     echo "# CLIENT_PARAMS:" "$CLIENT_PARAMS"
-    ./quince client $CLIENT_PARAMS $REQUESTS 2>"$LOGDIR/client.txt"
+    ./quiwi client $CLIENT_PARAMS $REQUESTS 2>"$LOGDIR/client.txt"
 }
 
 run_server() {
@@ -46,7 +46,7 @@ run_server() {
     fi
     cd "$APPDIR"
     echo "# SERVER_PARAMS:" "$SERVER_PARAMS"
-    ./quince server $SERVER_PARAMS 2>"$LOGDIR/server.txt"
+    ./quiwi server $SERVER_PARAMS 2>"$LOGDIR/server.txt"
     # FIXME: no qlog transformation as the script is terminated
 }
 

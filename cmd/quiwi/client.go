@@ -28,7 +28,7 @@ func clientCommand(args []string) error {
 
 	addrs := cmd.Args()
 	if len(addrs) == 0 {
-		fmt.Fprintln(cmd.Output(), "Usage: quince client [options] <url>")
+		fmt.Fprintln(cmd.Output(), "Usage: quiwi client [options] <url>")
 		cmd.PrintDefaults()
 		return nil
 	} else if len(addrs) > 1 && *root == "" {
