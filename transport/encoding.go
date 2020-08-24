@@ -30,14 +30,14 @@ func (s *codec) write(b []byte) bool {
 	return true
 }
 
-func (s *codec) read(n int) []byte {
+func (s *codec) read(b *[]byte, n int) bool {
 	n += s.i
 	if n > len(s.b) {
-		return nil
+		return false
 	}
-	b := s.b[s.i:n]
+	*b = s.b[s.i:n]
 	s.i = n
-	return b
+	return true
 }
 
 func (s *codec) writeByte(b byte) bool {
@@ -68,8 +68,8 @@ func (s *codec) writeUint32(v uint32) bool {
 }
 
 func (s *codec) readUint32(v *uint32) bool {
-	b := s.read(4)
-	if b == nil {
+	var b []byte
+	if !s.read(&b, 4) {
 		return false
 	}
 	*v = binary.BigEndian.Uint32(b)
@@ -108,8 +108,8 @@ func (s *codec) writePacketNumber(v uint64, length int) bool {
 }
 
 func (s *codec) readPacketNumber(v *uint64, length int) bool {
-	b := s.read(length)
-	if b == nil {
+	var b []byte
+	if !s.read(&b, length) {
 		return false
 	}
 	*v = getPacketNumber(b, length)

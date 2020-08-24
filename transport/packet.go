@@ -33,16 +33,16 @@ const (
 	packetTypeHandshake
 	packetTypeRetry
 	packetTypeVersionNegotiation
-	packetTypeShort
+	packetTypeOneRTT
 )
 
 var packetTypeNames = [...]string{
 	packetTypeInitial:            "initial",
-	packetTypeZeroRTT:            "zerortt",
+	packetTypeZeroRTT:            "0rtt",
 	packetTypeHandshake:          "handshake",
 	packetTypeRetry:              "retry",
 	packetTypeVersionNegotiation: "version_negotiation",
-	packetTypeShort:              "short",
+	packetTypeOneRTT:             "1rtt",
 }
 
 func (s packetType) String() string {
@@ -80,7 +80,7 @@ func packetTypeFromSpace(space packetSpace) packetType {
 	case packetSpaceHandshake:
 		return packetTypeHandshake
 	case packetSpaceApplication:
-		return packetTypeShort
+		return packetTypeOneRTT
 	default:
 		panic("unsupported packet space")
 	}
@@ -95,7 +95,7 @@ func packetNumberLenHeaderFlag(n int) uint8 {
 	return uint8(n - 1)
 }
 
-// Header is the version-independent header of QUIC packets.
+// packetHeader is the version-independent header of QUIC packets.
 // https://quicwg.org/base-drafts/draft-ietf-quic-invariants.html#name-quic-packet-headers
 //
 // Long header:
@@ -180,21 +180,17 @@ func (s *packetHeader) decode(b []byte) (int, error) {
 		}
 		// DCID
 		var length uint8
-		if !dec.readByte(&length) || length > MaxCIDLength {
-			return 0, errInvalidPacket
-		}
-		if s.dcid = dec.read(int(length)); s.dcid == nil {
+		ok := dec.readByte(&length) && dec.read(&s.dcid, int(length))
+		if !ok || length > MaxCIDLength {
 			return 0, errInvalidPacket
 		}
 		// SCID
-		if !dec.readByte(&length) || length > MaxCIDLength {
-			return 0, errInvalidPacket
-		}
-		if s.scid = dec.read(int(length)); s.scid == nil {
+		ok = dec.readByte(&length) && dec.read(&s.scid, int(length))
+		if !ok || length > MaxCIDLength {
 			return 0, errInvalidPacket
 		}
 	} else {
-		if s.dcid = dec.read(int(s.dcil)); s.dcid == nil {
+		if !dec.read(&s.dcid, int(s.dcil)) {
 			return 0, errInvalidPacket
 		}
 	}
@@ -213,7 +209,7 @@ func (s *packetHeader) packetType() packetType {
 		}
 		return packetTypeFromLongHeader(s.flags)
 	}
-	return packetTypeShort
+	return packetTypeOneRTT
 }
 
 // packet is an internal structure for all QUIC packet types.
@@ -240,7 +236,7 @@ func (s *packet) encodedLen() int {
 		return s.encodedLenRetry()
 	case packetTypeVersionNegotiation:
 		return s.encodedLenVersionNegotiation()
-	case packetTypeShort:
+	case packetTypeOneRTT:
 		return s.encodedLenShort()
 	default:
 		panic("unreachable")
@@ -261,8 +257,8 @@ func (s *packet) encode(b []byte) (int, error) {
 		s.header.flags = 0xf0
 	case packetTypeVersionNegotiation:
 		s.header.flags = 0xc0
-	case packetTypeShort:
-		s.header.flags = 0x00 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
+	case packetTypeOneRTT:
+		s.header.flags = 0x40 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
 	}
 	n, err := s.header.encode(b)
 	if err != nil {
@@ -280,7 +276,7 @@ func (s *packet) encode(b []byte) (int, error) {
 		m, err = s.encodeRetry(b)
 	case packetTypeVersionNegotiation:
 		m, err = s.encodeVersionNegotiation(b)
-	case packetTypeShort:
+	case packetTypeOneRTT:
 		m, err = s.encodeShort(b)
 	default:
 		panic("unreachable")
@@ -315,7 +311,7 @@ func (s *packet) decodeBody(b []byte) (int, error) {
 		return s.decodeRetry(b)
 	case packetTypeVersionNegotiation:
 		return s.decodeVersionNegotiation(b)
-	case packetTypeShort:
+	case packetTypeOneRTT:
 		return s.decodeShort(b)
 	default:
 		panic("unreachable")
@@ -325,14 +321,15 @@ func (s *packet) decodeBody(b []byte) (int, error) {
 // packetNumberOffset returns index offset of packet number for decrypting.
 // decodeHeader must be called before so that headerLen is set.
 func (s *packet) packetNumberOffset(b []byte) (int, error) {
-	if s.typ == packetTypeShort {
+	if s.typ == packetTypeOneRTT {
 		return s.headerLen, nil
 	}
 	var length uint64
 	dec := newCodec(b[s.headerLen:])
 	if s.typ == packetTypeInitial {
 		// Skip token
-		if !dec.readVarint(&length) || !dec.skip(int(length)) {
+		ok := dec.readVarint(&length) && dec.skip(int(length))
+		if !ok {
 			return 0, errInvalidPacket
 		}
 	}
@@ -348,7 +345,7 @@ func (s *packet) String() string {
 	case packetTypeInitial, packetTypeRetry:
 		return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x token=%x packet_number=%d",
 			s.typ, s.header.version, s.header.dcid, s.header.scid, s.token, s.packetNumber)
-	case packetTypeShort:
+	case packetTypeOneRTT:
 		return fmt.Sprintf("packet_type=%s dcid=%x packet_number=%d",
 			s.typ, s.header.dcid, s.packetNumber)
 	default:
@@ -369,6 +366,7 @@ type Header struct {
 }
 
 // Decode decodes public information from a QUIC packet.
+// dcil is the length of connection id in short header packets.
 // Note: all resulted slices (CIDs) are references to data in b so they will be invalid
 // when b is modified.
 func (s *Header) Decode(b []byte, dcil int) (int, error) {
@@ -391,19 +389,16 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 	case packetTypeInitial:
 		// See decodeInitial
 		var length uint64
-		if !dec.readVarint(&length) {
-			return 0, errInvalidPacket
-		}
-		if s.Token = dec.read(int(length)); s.Token == nil {
+		ok := dec.readVarint(&length) && dec.read(&s.Token, int(length))
+		if !ok {
 			return 0, errInvalidPacket
 		}
 	case packetTypeRetry:
 		// See decodeRetry
 		length := dec.len() - retryIntegrityTagLen
-		if length < 0 {
+		if length < 0 || !dec.read(&s.Token, length) {
 			return 0, errInvalidPacket
 		}
-		s.Token = dec.read(length)
 	}
 	return n + dec.offset(), nil
 }
@@ -520,10 +515,11 @@ func (s *packet) encodedLenInitial() int {
 func (s *packet) encodeInitial(b []byte) (int, error) {
 	pnLen := packetNumberLenFromHeader(s.header.flags)
 	enc := newCodec(b)
-	if !enc.writeVarint(uint64(len(s.token))) ||
-		!enc.write(s.token) ||
-		!enc.writeVarint(uint64(pnLen+s.payloadLen)) ||
-		!enc.writePacketNumber(s.packetNumber, pnLen) {
+	ok := enc.writeVarint(uint64(len(s.token))) &&
+		enc.write(s.token) &&
+		enc.writeVarint(uint64(pnLen+s.payloadLen)) &&
+		enc.writePacketNumber(s.packetNumber, pnLen)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -533,18 +529,16 @@ func (s *packet) decodeInitial(b []byte) (int, error) {
 	dec := newCodec(b)
 	// Token
 	var length uint64
-	if !dec.readVarint(&length) {
-		return 0, errInvalidPacket
-	}
-	if s.token = dec.read(int(length)); s.token == nil {
+	ok := dec.readVarint(&length) &&
+		dec.read(&s.token, int(length))
+	if !ok {
 		return 0, errInvalidPacket
 	}
 	// Remainder length includes Packet Number and Payload
 	pnLen := packetNumberLenFromHeader(s.header.flags)
-	if !dec.readVarint(&length) || int(length) < pnLen {
-		return 0, errInvalidPacket
-	}
-	if !dec.readPacketNumber(&s.packetNumber, pnLen) {
+	ok = dec.readVarint(&length) &&
+		dec.readPacketNumber(&s.packetNumber, pnLen)
+	if !ok || int(length) < pnLen {
 		return 0, errInvalidPacket
 	}
 	s.payloadLen = int(length) - pnLen
@@ -608,8 +602,9 @@ func (s *packet) encodedLenLong() int {
 func (s *packet) encodeLong(b []byte) (int, error) {
 	pnLen := packetNumberLenFromHeader(s.header.flags)
 	enc := newCodec(b)
-	if !enc.writeVarint(uint64(pnLen+s.payloadLen)) ||
-		!enc.writePacketNumber(s.packetNumber, pnLen) {
+	ok := enc.writeVarint(uint64(pnLen+s.payloadLen)) &&
+		enc.writePacketNumber(s.packetNumber, pnLen)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -620,10 +615,9 @@ func (s *packet) decodeLong(b []byte) (int, error) {
 	var length uint64
 	// Remainder length includes Packet Number and Payload
 	pnLen := packetNumberLenFromHeader(s.header.flags)
-	if !dec.readVarint(&length) || int(length) < pnLen {
-		return 0, errInvalidPacket
-	}
-	if !dec.readPacketNumber(&s.packetNumber, pnLen) {
+	ok := dec.readVarint(&length) &&
+		dec.readPacketNumber(&s.packetNumber, pnLen)
+	if !ok || int(length) < pnLen {
 		return 0, errInvalidPacket
 	}
 	s.payloadLen = int(length) - pnLen
@@ -675,11 +669,10 @@ func (s *packet) encodeRetry(b []byte) (int, error) {
 // decodeRetry does not decode Integrity tag.
 func (s *packet) decodeRetry(b []byte) (int, error) {
 	dec := newCodec(b)
-	tokenLen := dec.len() - retryIntegrityTagLen
-	if tokenLen < 0 {
+	length := dec.len() - retryIntegrityTagLen
+	if length < 0 || !dec.read(&s.token, length) {
 		return 0, errInvalidPacket
 	}
-	s.token = dec.read(tokenLen)
 	return dec.offset(), nil
 }
 
@@ -713,7 +706,8 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 	// Use the provided buffer to write Retry Pseudo-Packet, which is computed by taking the transmitted Retry packet,
 	// removing the Retry Integrity Tag and prepending the ODCID.
 	enc := newCodec(b)
-	if !enc.writeByte(byte(len(odcid))) || !enc.write(odcid) {
+	ok := enc.writeByte(uint8(len(odcid))) && enc.write(odcid)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	offset := enc.offset()

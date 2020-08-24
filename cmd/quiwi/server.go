@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -10,20 +11,35 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/goburrow/quic"
 	"github.com/goburrow/quic/transport"
 )
 
-func serverCommand(args []string) error {
+type serverCommand struct{}
+
+func (serverCommand) Name() string {
+	return "server"
+}
+
+func (serverCommand) Desc() string {
+	return "start a QUIC server."
+}
+
+func (serverCommand) Run(args []string) error {
 	cmd := flag.NewFlagSet("server", flag.ExitOnError)
-	listenAddr := cmd.String("listen", "localhost:4433", "listen on the given IP:port")
-	certFile := cmd.String("cert", "cert.crt", "TLS certificate path")
-	keyFile := cmd.String("key", "cert.key", "TLS certificate key path")
+	listenAddr := cmd.String("listen", ":4433", "listen on the given IP:port")
+	certFile := cmd.String("cert", "cert.pem", "TLS certificate path")
+	keyFile := cmd.String("key", "key.pem", "TLS certificate key path")
 	root := cmd.String("root", "www", "root directory")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
-	logLevel := cmd.Int("v", 1, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
+	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
 	enableRetry := cmd.Bool("retry", false, "enable address validation using Retry packet")
+	cmd.Usage = func() {
+		fmt.Fprintln(cmd.Output(), "Usage: quiwi server [arguments]")
+		cmd.PrintDefaults()
+	}
 	cmd.Parse(args)
 
 	config := newConfig()
@@ -57,8 +73,8 @@ func serverCommand(args []string) error {
 		server.SetLogger(*logLevel, logFd)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGQUIT)
 	go func() {
 		<-sigCh
 		server.Close()
@@ -77,13 +93,13 @@ func (s *serverHandler) Serve(c *quic.Conn, events []transport.Event) {
 		case transport.EventStreamReadable:
 			err := s.handleStreamReadable(c, e.ID)
 			if err != nil {
-				c.Close()
+				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
 		case transport.EventStreamWritable:
 			err := s.handleStreamWritable(c, e.ID)
 			if err != nil {
-				c.Close()
+				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
 		case quic.EventConnClose:
@@ -103,16 +119,21 @@ func (s *serverHandler) handleStreamReadable(c *quic.Conn, streamID uint64) erro
 	buf := s.buf.pop()
 	defer s.buf.push(buf)
 	n, err := st.Read(buf)
-	if n <= 0 {
+	if n == 0 || err != nil {
+		if err == io.EOF {
+			return nil
+		}
 		return err
 	}
 	// Parse request
 	req := string(buf[:n])
 	if !strings.HasPrefix(req, "GET /") {
+		st.WriteString("not found")
 		return st.Close()
 	}
 	reqURL, err := url.ParseRequestURI(strings.TrimSpace(req[4:]))
 	if err != nil {
+		st.WriteString("not found")
 		return st.Close()
 	}
 	st.CloseRead(0)

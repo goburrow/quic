@@ -26,6 +26,8 @@ const (
 	paramActiveConnectionIDLimit        = 0x0e
 	paramInitialSourceCID               = 0x0f
 	paramRetrySourceCID                 = 0x10
+	// Datagram extension
+	paramMaxDatagramPayloadSize = 0x20
 )
 
 // Parameters is QUIC transport parameters.
@@ -56,6 +58,8 @@ type Parameters struct {
 	// ActiveConnectionIDLimit is the maximum number of connection IDs from the peer that
 	// an endpoint is willing to store.
 	ActiveConnectionIDLimit uint64
+	// Maximum size of payload in a DATAGRAM frame the endpoint is willing to receive.
+	MaxDatagramPayloadSize uint64
 
 	DisableActiveMigration bool
 }
@@ -122,6 +126,7 @@ func (s *Parameters) marshal() []byte {
 	}
 	if s.DisableActiveMigration {
 		b.writeVarint(paramDisableActiveMigration)
+		b.writeVarint(0)
 	}
 	if s.ActiveConnectionIDLimit > 0 {
 		b.writeVarint(paramActiveConnectionIDLimit)
@@ -134,6 +139,10 @@ func (s *Parameters) marshal() []byte {
 	if len(s.RetrySourceCID) > 0 {
 		b.writeVarint(paramRetrySourceCID)
 		b.writeBytes(s.RetrySourceCID)
+	}
+	if s.MaxDatagramPayloadSize > 0 {
+		b.writeVarint(paramMaxDatagramPayloadSize)
+		b.writeUint(s.MaxDatagramPayloadSize)
 	}
 	return b
 }
@@ -151,11 +160,10 @@ func (s *Parameters) unmarshal(data []byte) bool {
 				return false
 			}
 		case paramMaxIdleTimeout:
-			var v uint64
-			if !b.readUint(&v) {
+			if !b.readUint(&param) {
 				return false
 			}
-			s.MaxIdleTimeout = time.Duration(v) * time.Millisecond
+			s.MaxIdleTimeout = time.Duration(param) * time.Millisecond
 		case paramStatelessResetToken:
 			if !b.readBytes(&s.StatelessResetToken) {
 				return false
@@ -193,12 +201,14 @@ func (s *Parameters) unmarshal(data []byte) bool {
 				return false
 			}
 		case paramMaxAckDelay:
-			var v uint64
-			if !b.readUint(&v) {
+			if !b.readUint(&param) {
 				return false
 			}
-			s.MaxAckDelay = time.Duration(v) * time.Millisecond
+			s.MaxAckDelay = time.Duration(param) * time.Millisecond
 		case paramDisableActiveMigration:
+			if !b.readVarint(&param) || param != 0 {
+				return false
+			}
 			s.DisableActiveMigration = true
 		case paramActiveConnectionIDLimit:
 			if !b.readUint(&s.ActiveConnectionIDLimit) {
@@ -212,11 +222,14 @@ func (s *Parameters) unmarshal(data []byte) bool {
 			if !b.readBytes(&s.RetrySourceCID) {
 				return false
 			}
+		case paramMaxDatagramPayloadSize:
+			if !b.readUint(&s.MaxDatagramPayloadSize) {
+				return false
+			}
 		default:
 			// Unsupported parameter
 			debug("skip unsupported transport parameter 0x%x", param)
-			var v uint64
-			if !b.readVarint(&v) || !b.skip(int(v)) {
+			if !b.readVarint(&param) || !b.skip(int(param)) {
 				return false
 			}
 		}

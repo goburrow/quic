@@ -57,7 +57,7 @@ func (s *Client) Serve() error {
 }
 
 func (s *Client) recv(p *packet) {
-	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
+	_, err := p.header.Decode(p.data, cidLength)
 	if err != nil {
 		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error message=%v", p.addr, len(p.data), err)
 		freePacket(p)
@@ -69,12 +69,7 @@ func (s *Client) recv(p *packet) {
 		s.peersMu.RUnlock()
 		return
 	}
-	var c *Conn
-	if len(p.header.DCID) > 0 {
-		c = s.peers[string(p.header.DCID)]
-	} else {
-		c = s.peersAddr[p.addr.String()]
-	}
+	c := s.peers[string(p.header.DCID)]
 	s.peersMu.RUnlock()
 	if c == nil {
 		s.logger.log(levelDebug, "packet_dropped addr=%s trigger=unknown_connection_id %s", p.addr, &p.header)
@@ -90,13 +85,6 @@ func (s *Client) Connect(addr string) error {
 	if err != nil {
 		return err
 	}
-	s.peersMu.RLock()
-	_, ok := s.peersAddr[udpAddr.String()]
-	s.peersMu.RUnlock()
-	if ok {
-		// Already connected
-		return nil
-	}
 	c, err := s.newConn(udpAddr)
 	if err != nil {
 		return err
@@ -111,7 +99,6 @@ func (s *Client) Connect(addr string) error {
 		return fmt.Errorf("connection id conflict cid=%x", c.scid)
 	}
 	s.peers[string(c.scid[:])] = c
-	s.peersAddr[c.addr.String()] = c
 	s.peersMu.Unlock()
 	// Send initial packet
 	s.logger.log(levelInfo, "connection_started cid=%x addr=%v", c.scid, c.addr)
@@ -137,7 +124,7 @@ func (s *Client) Close() error {
 }
 
 func (s *Client) newConn(addr net.Addr) (*Conn, error) {
-	scid := make([]byte, transport.MaxCIDLength)
+	scid := make([]byte, cidLength)
 	if err := s.rand(scid); err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}

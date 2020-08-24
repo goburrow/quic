@@ -40,7 +40,7 @@ func TestTransportParams(t *testing.T) {
 	070480040000
 	080108
 	090108
-	0c
+	0c00
 	0e0102
 	0f020204
 	1003030507`)
@@ -54,5 +54,15 @@ func TestTransportParams(t *testing.T) {
 	}
 	if !reflect.DeepEqual(&tp, &tp2) {
 		t.Fatalf("unmarshal transport parameters:\nexpect=%#v\nactual=%#v", &tp, &tp2)
+	}
+}
+
+func TestTransportParamsGreased(t *testing.T) {
+	b := testdata.DecodeHex(`
+	40d50ebbb51565a7ddd499cf76072a3cd2
+	0504800800000604800800000704800800000404800c00000802406409024064010480007530030245ac0b011a0c000e01040f00`)
+	tp := Parameters{}
+	if !tp.unmarshal(b) {
+		t.Fatal("could not unmarshal")
 	}
 }

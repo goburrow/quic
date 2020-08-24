@@ -16,20 +16,33 @@ import (
 	"github.com/goburrow/quic/transport"
 )
 
-func clientCommand(args []string) error {
+type clientCommand struct{}
+
+func (clientCommand) Name() string {
+	return "client"
+}
+
+func (clientCommand) Desc() string {
+	return "download file using http/0.9 over QUIC."
+}
+
+func (clientCommand) Run(args []string) error {
 	cmd := flag.NewFlagSet("client", flag.ExitOnError)
 	listenAddr := cmd.String("listen", "0.0.0.0:0", "listen on the given IP:port")
 	insecure := cmd.Bool("insecure", false, "skip verifying server certificate")
 	root := cmd.String("root", "", "root download directory")
 	cipher := cmd.String("cipher", "", "TLS 1.3 cipher suite, e.g. TLS_CHACHA20_POLY1305_SHA256")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
-	logLevel := cmd.Int("v", 1, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
+	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
+	cmd.Usage = func() {
+		fmt.Fprintln(cmd.Output(), "Usage: quiwi client [arguments] <url>")
+		cmd.PrintDefaults()
+	}
 	cmd.Parse(args)
 
 	addrs := cmd.Args()
 	if len(addrs) == 0 {
-		fmt.Fprintln(cmd.Output(), "Usage: quiwi client [options] <url>")
-		cmd.PrintDefaults()
+		cmd.Usage()
 		return nil
 	} else if len(addrs) > 1 && *root == "" {
 		// TODO: Support different host
@@ -106,13 +119,13 @@ func (s *clientHandler) Serve(c *quic.Conn, events []transport.Event) {
 		case quic.EventConnAccept, transport.EventStreamCreatable:
 			err := s.downloadFiles(c)
 			if err != nil {
-				c.Close()
+				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
 		case transport.EventStreamReadable:
 			err := s.handleStreamReadable(c, e.ID)
 			if err != nil {
-				c.Close()
+				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
 			if len(s.files) == 0 && len(s.getRequests(c)) == 0 {

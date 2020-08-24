@@ -6,14 +6,13 @@ import (
 )
 
 func TestLogConnectionState(t *testing.T) {
-	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
-	e := newLogEventConnectionState(tm, stateHandshake, stateActive)
+	e := newTestLogEvent(logEventStateUpdated)
+	logConnectionState(&e, StateHandshake, StateActive)
 	expect := "2020-01-05T00:00:00Z connection_state_updated old=handshake new=active"
 	assertLogEvent(t, e, expect)
 }
 
 func TestLogParameters(t *testing.T) {
-	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
 	p := &Parameters{
 		OriginalDestinationCID: []byte{1, 2},
 		InitialSourceCID:       []byte{3},
@@ -36,7 +35,8 @@ func TestLogParameters(t *testing.T) {
 		ActiveConnectionIDLimit: 2,
 		DisableActiveMigration:  true,
 	}
-	e := newLogEventParametersSet(tm, p)
+	e := newTestLogEvent(logEventParametersSet)
+	logParameters(&e, p)
 	expect := "2020-01-05T00:00:00Z parameters_set owner=remote original_connection_id=0102 " +
 		"max_idle_timeout=60000 stateless_reset_token=060708 max_udp_payload_size=1500 " +
 		"initial_max_data=1000 initial_max_stream_data_bidi_local=200 initial_max_stream_data_bidi_remote=300 " +
@@ -60,8 +60,13 @@ func TestLogFrameAck(t *testing.T) {
 		largestAck:    3,
 		ackDelay:      2,
 		firstAckRange: 1,
+		ecnCounts: &ecnCounts{
+			ect0Count: 4,
+			ect1Count: 5,
+			ceCount:   6,
+		},
 	}
-	testLogFrame(t, f, "frame_type=ack ack_delay=2 acked_ranges=[[2,3]]")
+	testLogFrame(t, f, "frame_type=ack ack_delay=2 acked_ranges=[[2,3]] ect0=4 ect1=5 ce=6")
 }
 
 func TestLogFrameResetStream(t *testing.T) {
@@ -123,6 +128,37 @@ func TestLogFrameStreamsBlocked(t *testing.T) {
 	testLogFrame(t, f, "frame_type=streams_blocked stream_type=bidirectional limit=2")
 }
 
+func TestLogFrameNewConnectionID(t *testing.T) {
+	f := &newConnectionIDFrame{
+		sequenceNumber:      1,
+		retirePriorTo:       2,
+		connectionID:        []byte{1},
+		statelessResetToken: []byte{2},
+	}
+	testLogFrame(t, f, "frame_type=new_connection_id sequence_number=1 retire_prior_to=2 connection_id=01 stateless_reset_token=02")
+}
+
+func TestLogFrameRetireConnectionID(t *testing.T) {
+	f := &retireConnectionIDFrame{
+		sequenceNumber: 1,
+	}
+	testLogFrame(t, f, "frame_type=retire_connection_id sequence_number=1")
+}
+
+func TestLogFramePathChallenge(t *testing.T) {
+	f := &pathChallengeFrame{
+		data: []byte{1, 2, 3},
+	}
+	testLogFrame(t, f, "frame_type=path_challenge data=010203")
+}
+
+func TestLogFramePathResponse(t *testing.T) {
+	f := &pathResponseFrame{
+		data: []byte{4, 5},
+	}
+	testLogFrame(t, f, "frame_type=path_response data=0405")
+}
+
 func TestLogFrameConnectionClose(t *testing.T) {
 	f := newConnectionCloseFrame(0x122, 99, []byte("reason"), false)
 	testLogFrame(t, f, "frame_type=connection_close error_space=transport error_code=crypto_error_34 raw_error_code=290 trigger_frame_type=99 reason=reason")
@@ -134,9 +170,9 @@ func TestLogFrameHandshakeDone(t *testing.T) {
 }
 
 func testLogFrame(t *testing.T, f frame, expect string) {
-	tm := time.Date(2020, time.January, 5, 2, 3, 4, 5, time.UTC)
-	e := newLogEventFrame(tm, logEventFramesProcessed, f)
-	expect = "2020-01-05T02:03:04Z frames_processed " + expect
+	e := newTestLogEvent(logEventFramesProcessed)
+	logFrame(&e, f)
+	expect = "2020-01-05T00:00:00Z frames_processed " + expect
 	actual := e.String()
 	if expect != actual {
 		t.Helper()
@@ -145,7 +181,6 @@ func testLogFrame(t *testing.T, f frame, expect string) {
 }
 
 func TestLogPacket(t *testing.T) {
-	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
 	p := &packet{
 		typ: packetTypeHandshake,
 		header: packetHeader{
@@ -157,25 +192,45 @@ func TestLogPacket(t *testing.T) {
 		payloadLen:   10,
 		packetSize:   20,
 	}
-	e := newLogEventPacket(tm, "packet_sent", p)
+	e := newTestLogEvent(logEventPacketSent)
+	logPacket(&e, p)
 	expect := "2020-01-05T00:00:00Z packet_sent packet_type=handshake version=1 dcid=010203 scid=0405 packet_number=1 packet_size=20 payload_length=10"
 	assertLogEvent(t, e, expect)
 }
 
 func TestLogRecovery(t *testing.T) {
-	r := lossRecovery{}
-	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
-	e := newLogEventRecovery(tm, &r)
-	expect := "2020-01-05T00:00:00Z metrics_updated loss_timer=0 min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=0 " +
+	r := &lossRecovery{}
+	e := newTestLogEvent(logEventMetricsUpdated)
+	logRecovery(&e, r)
+	expect := "2020-01-05T00:00:00Z metrics_updated min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=0 " +
 		"pto_count=0 congestion_window=0 bytes_in_flight=0"
 	assertLogEvent(t, e, expect)
 }
 
+func TestLogLossTimer(t *testing.T) {
+	r := &lossRecovery{}
+	e := newTestLogEvent(logEventLossTimerUpdated)
+	logLossTimer(&e, r)
+	expect := "2020-01-05T00:00:00Z loss_timer_updated event_type=cancelled"
+	assertLogEvent(t, e, expect)
+
+	r.lossDetectionTimer = e.Time.Add(100 * time.Millisecond)
+	e.resetFields()
+	logLossTimer(&e, r)
+	expect = "2020-01-05T00:00:00Z loss_timer_updated event_type=set delta=100"
+	assertLogEvent(t, e, expect)
+}
+
 func TestLogStreamState(t *testing.T) {
-	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
-	e := newLogEventStreamClosed(tm, 10)
+	e := newTestLogEvent(logEventStreamStateUpdated)
+	logStreamClosed(&e, 10)
 	expect := "2020-01-05T00:00:00Z stream_state_updated stream_id=10 new=closed"
 	assertLogEvent(t, e, expect)
+}
+
+func newTestLogEvent(typ string) LogEvent {
+	tm := time.Date(2020, time.January, 5, 0, 0, 0, 0, time.UTC)
+	return newLogEvent(tm, typ)
 }
 
 func assertLogEvent(t *testing.T, e LogEvent, expect string) {

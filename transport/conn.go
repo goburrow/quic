@@ -7,25 +7,27 @@ import (
 	"time"
 )
 
-type connectionState uint8
+// ConnectionState is the state of a QUIC connection.
+type ConnectionState uint8
 
+// Supported connection states
 const (
-	stateAttempted connectionState = iota
-	stateHandshake
-	stateActive
-	stateDraining
-	stateClosed
+	StateAttempted ConnectionState = iota
+	StateHandshake
+	StateActive
+	StateDraining
+	StateClosed
 )
 
 var connectionStateNames = [...]string{
-	stateAttempted: "attempted",
-	stateHandshake: "handshake",
-	stateActive:    "active",
-	stateDraining:  "draining",
-	stateClosed:    "closed",
+	StateAttempted: "attempted",
+	StateHandshake: "handshake",
+	StateActive:    "active",
+	StateDraining:  "draining",
+	StateClosed:    "closed",
 }
 
-func (s connectionState) String() string {
+func (s ConnectionState) String() string {
 	return connectionStateNames[s]
 }
 
@@ -39,6 +41,7 @@ type Conn struct {
 
 	packetNumberSpaces [packetSpaceCount]packetNumberSpace
 	streams            streamMap
+	datagram           Datagram
 
 	localParams Parameters
 	peerParams  Parameters
@@ -50,7 +53,8 @@ type Conn struct {
 	idleTimer     time.Time // Idle timeout expiration time.
 	drainingTimer time.Time // Draining timeout expiration time.
 
-	closeFrame *connectionCloseFrame // Error to be send to peer
+	pathResponse []byte                // Data from path challenge
+	closeFrame   *connectionCloseFrame // Error to be send to peer
 
 	// Events resulting from received frames
 	events []Event
@@ -58,7 +62,7 @@ type Conn struct {
 	logEventFn func(LogEvent)
 
 	version               uint32
-	state                 connectionState
+	state                 ConnectionState
 	isClient              bool
 	gotPeerCID            bool
 	didRetry              bool
@@ -90,7 +94,7 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 		version:     config.Version,
 		isClient:    isClient,
 		localParams: config.Params,
-		state:       stateAttempted,
+		state:       StateAttempted,
 	}
 	s.handshake.init(config.TLS, &s.packetNumberSpaces, isClient)
 	for i := range s.packetNumberSpaces {
@@ -127,15 +131,17 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 		return nil, err
 	}
 	s.handshake.setTransportParams(&s.localParams)
+	s.datagram.setMaxRecv(s.localParams.MaxDatagramPayloadSize)
 	return s, nil
 }
 
 // Write consumes received data.
+// NOTE: b in be will be modified as data is decrypted directly to b.
 func (s *Conn) Write(b []byte) (int, error) {
 	now := s.time()
 	n := 0
 	for n < len(b) {
-		if !s.drainingTimer.IsZero() || s.closeFrame != nil {
+		if s.state >= StateDraining {
 			// Closing
 			break
 		}
@@ -169,20 +175,21 @@ func (s *Conn) recv(b []byte, now time.Time) (int, error) {
 	}
 	_, err := p.decodeHeader(b)
 	if err != nil {
-		return 0, err
+		s.logPacketDropped(&p, logTriggerHeaderDecryptError, now)
+		return 0, ErrPacketDropped
 	}
 	switch p.typ {
-	case packetTypeVersionNegotiation:
-		return s.recvPacketVersionNegotiation(b, &p, now)
-	case packetTypeRetry:
-		return s.recvPacketRetry(b, &p, now)
 	case packetTypeInitial:
 		return s.recvPacketInitial(b, &p, now)
 	case packetTypeZeroRTT:
 		return 0, newError(InternalError, "zerortt packet not supported")
 	case packetTypeHandshake:
 		return s.recvPacketHandshake(b, &p, now)
-	case packetTypeShort:
+	case packetTypeRetry:
+		return s.recvPacketRetry(b, &p, now)
+	case packetTypeVersionNegotiation:
+		return s.recvPacketVersionNegotiation(b, &p, now)
+	case packetTypeOneRTT:
 		return s.recvPacketShort(b, &p, now)
 	default:
 		panic(sprint("unsupported packet type ", p.typ))
@@ -192,17 +199,19 @@ func (s *Conn) recv(b []byte, now time.Time) (int, error) {
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#version-negotiation
 func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) (int, error) {
 	// VN packet can only be sent by server
-	if !s.isClient || s.didVersionNegotiation || s.state != stateAttempted ||
-		!bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
-		debug("dropped packet %v", p)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+	if !s.isClient || s.didVersionNegotiation || s.state != StateAttempted {
+		s.logPacketDropped(p, logTriggerUnexpectedPacket, now)
+		return 0, ErrPacketDropped
+	}
+	if !bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
+		s.logPacketDropped(p, logTriggerUnknownConnectionID, now)
+		return 0, ErrPacketDropped
 	}
 	n, err := p.decodeBody(b)
 	if err != nil {
-		return 0, err
+		s.logPacketDropped(p, logTriggerHeaderDecryptError, now)
+		return 0, ErrPacketDropped
 	}
-	debug("received packet %v", p)
 	var newVersion uint32
 	for _, v := range p.supportedVersions {
 		if versionSupported(v) {
@@ -229,21 +238,23 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) 
 func (s *Conn) recvPacketRetry(b []byte, p *packet, now time.Time) (int, error) {
 	// Retry packet can only be sent by server
 	// Packet's SCID must not be equal to the client's DCID.
-	if !s.isClient || s.didRetry || s.state != stateAttempted ||
-		!bytes.Equal(p.header.dcid, s.scid) || bytes.Equal(p.header.scid, s.dcid) {
-		debug("dropped packet %v", p)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+	if !s.isClient || s.didRetry || s.state != StateAttempted {
+		s.logPacketDropped(p, logTriggerUnexpectedPacket, now)
+		return 0, ErrPacketDropped
+	}
+	if !bytes.Equal(p.header.dcid, s.scid) || bytes.Equal(p.header.scid, s.dcid) {
+		s.logPacketDropped(p, logTriggerUnknownConnectionID, now)
+		return 0, ErrPacketDropped
 	}
 	_, err := p.decodeBody(b)
 	if err != nil {
-		return 0, err
+		s.logPacketDropped(p, logTriggerHeaderDecryptError, now)
+		return 0, ErrPacketDropped
 	}
 	// Verify token and integrity tag
 	if len(p.token) == 0 || !verifyRetryIntegrity(b, s.dcid) {
 		return 0, newError(InvalidToken, "")
 	}
-	debug("received packet %v", p)
 	s.didRetry = true
 	s.token = append(s.token[:0], p.token...)
 	// Update CIDs and crypto: dcid => odcid, header.scid => dcid
@@ -263,9 +274,8 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet, now time.Time) (int, error) 
 
 func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error) {
 	if s.gotPeerCID && (!bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid)) {
-		debug("dropped packet %v", p)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+		s.logPacketDropped(p, logTriggerUnknownConnectionID, now)
+		return 0, ErrPacketDropped
 	}
 	if !s.derivedInitialSecrets { // Server side
 		s.deriveInitialKeyMaterial(p.header.dcid)
@@ -292,18 +302,16 @@ func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error
 
 func (s *Conn) recvPacketHandshake(b []byte, p *packet, now time.Time) (int, error) {
 	if !bytes.Equal(p.header.dcid, s.scid) || !bytes.Equal(p.header.scid, s.dcid) {
-		debug("dropped packet %v", p)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+		s.logPacketDropped(p, logTriggerUnknownConnectionID, now)
+		return 0, ErrPacketDropped
 	}
 	return s.recvPacket(b, p, packetSpaceHandshake, now)
 }
 
 func (s *Conn) recvPacketShort(b []byte, p *packet, now time.Time) (int, error) {
 	if !bytes.Equal(p.header.dcid, s.scid) {
-		debug("dropped packet %v", p)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+		s.logPacketDropped(p, logTriggerUnknownConnectionID, now)
+		return 0, ErrPacketDropped
 	}
 	return s.recvPacket(b, p, packetSpaceApplication, now)
 }
@@ -311,20 +319,17 @@ func (s *Conn) recvPacketShort(b []byte, p *packet, now time.Time) (int, error) 
 func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time) (int, error) {
 	pnSpace := &s.packetNumberSpaces[space]
 	if !pnSpace.canDecrypt() {
-		debug("dropped undecryptable packet %v space=%v", p, space)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+		s.logPacketDropped(p, logTriggerKeyUnavailable, now)
+		return len(b), ErrKeysUnavailable
 	}
 	payload, err := pnSpace.decryptPacket(b, p)
 	if err != nil {
-		debug("dropped corrupted packet %v space=%v", p, space)
-		s.logPacketDropped(p, now)
-		return len(b), nil
+		s.logPacketDropped(p, logTriggerPayloadDecryptError, now)
+		return 0, ErrPacketDropped
 	}
-	debug("received packet %v payload=%d", p, len(payload))
 	if pnSpace.isPacketReceived(p.packetNumber) {
-		// Ignore duplicate packet
-		s.logPacketDropped(p, now)
+		// Ignore duplicate packet but still continue because packet can be coalesced.
+		s.logPacketDropped(p, logTriggerDuplicate, now)
 		return p.packetSize, nil
 	}
 	s.logPacketReceived(p, now)
@@ -340,8 +345,8 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 		if !s.isClient && pnSpace.largestRecvPacketTime.IsZero() {
 			s.dropPacketSpace(packetSpaceInitial)
 		}
-		if s.state < stateHandshake {
-			s.setState(stateHandshake, now)
+		if s.state < StateHandshake {
+			s.setState(StateHandshake, now)
 		}
 	}
 	// Mark this packet received
@@ -371,13 +376,12 @@ func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now t
 			return newError(ProtocolViolation, sprint("unexpected frame ", typ))
 		}
 		var err error
-		// TODO: Check allowed frames for current packet type
 		switch {
 		case typ == frameTypePadding:
 			n, err = s.recvFramePadding(b, now)
 		case typ == frameTypePing:
-			s.recvFramePing(now)
-		case typ == frameTypeAck:
+			s.recvFramePing(b, now)
+		case typ == frameTypeAck || typ == frameTypeAckECN:
 			n, err = s.recvFrameAck(b, space, now)
 		case typ == frameTypeResetStream:
 			n, err = s.recvFrameResetStream(b, now)
@@ -401,10 +405,20 @@ func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now t
 			n, err = s.recvFrameStreamDataBlocked(b, now)
 		case typ == frameTypeStreamsBlockedBidi || typ == frameTypeStreamsBlockedUni:
 			n, err = s.recvFrameStreamsBlocked(b, now)
+		case typ == frameTypeNewConnectionID:
+			n, err = s.recvFrameNewConnectionID(b, now)
+		case typ == frameTypeRetireConnectionID:
+			n, err = s.recvFrameRetireConnectionID(b, now)
+		case typ == frameTypePathChallenge:
+			n, err = s.recvFramePathChallenge(b, now)
+		case typ == frameTypePathResponse:
+			n, err = s.recvFramePathResponse(b, now)
 		case typ == frameTypeConnectionClose || typ == frameTypeApplicationClose:
 			n, err = s.recvFrameConnectionClose(b, space, now)
 		case typ == frameTypeHanshakeDone:
 			n, err = s.recvFrameHandshakeDone(b, now)
+		case typ == frameTypeDatagram || typ == frameTypeDatagramWithLength:
+			n, err = s.recvFrameDatagram(b, now)
 		default:
 			return newError(FrameEncodingError, sprint("unsupported frame ", typ))
 		}
@@ -430,9 +444,10 @@ func (s *Conn) recvFramePadding(b []byte, now time.Time) (int, error) {
 	return n, err
 }
 
-func (s *Conn) recvFramePing(now time.Time) {
+func (s *Conn) recvFramePing(b []byte, now time.Time) {
 	// Will ack
 	var f pingFrame
+	debug("received frame 0x%x: %v", b[0], &f)
 	s.logFrameProcessed(&f, now)
 }
 
@@ -668,6 +683,51 @@ func (s *Conn) recvFrameStreamsBlocked(b []byte, now time.Time) (int, error) {
 	return n, nil
 }
 
+// TODO
+func (s *Conn) recvFrameNewConnectionID(b []byte, now time.Time) (int, error) {
+	var f newConnectionIDFrame
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
+}
+
+// TODO
+func (s *Conn) recvFrameRetireConnectionID(b []byte, now time.Time) (int, error) {
+	var f retireConnectionIDFrame
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
+}
+
+func (s *Conn) recvFramePathChallenge(b []byte, now time.Time) (int, error) {
+	var f pathChallengeFrame
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.pathResponse = make([]byte, len(f.data))
+	copy(s.pathResponse, f.data)
+	s.logFrameProcessed(&f, now)
+	return n, nil
+}
+
+// TODO
+func (s *Conn) recvFramePathResponse(b []byte, now time.Time) (int, error) {
+	var f pathResponseFrame
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
+}
+
 func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Time) (int, error) {
 	var f connectionCloseFrame
 	n, err := f.decode(b)
@@ -675,7 +735,6 @@ func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Ti
 		return 0, err
 	}
 	debug("receiving frame 0x%x: %s (%s)", b[0], &f, errorCodeString(f.errorCode))
-	s.setState(stateDraining, now)
 	s.setDraining(now)
 	s.logFrameProcessed(&f, now)
 	return n, nil
@@ -691,7 +750,7 @@ func (s *Conn) recvFrameHandshakeDone(b []byte, now time.Time) (int, error) {
 		return 0, newError(ProtocolViolation, "unexpected handshake done frame")
 	}
 	debug("received frame 0x%x: %v", b[0], &f)
-	if s.state == stateActive && !s.handshakeConfirmed {
+	if s.state == StateActive && !s.handshakeConfirmed {
 		// Drop client's handshake state when it received done from server
 		s.dropPacketSpace(packetSpaceHandshake)
 		s.handshakeConfirmed = true
@@ -700,16 +759,32 @@ func (s *Conn) recvFrameHandshakeDone(b []byte, now time.Time) (int, error) {
 	return n, nil
 }
 
+func (s *Conn) recvFrameDatagram(b []byte, now time.Time) (int, error) {
+	var f datagramFrame
+	n, err := f.decode(b)
+	if err != nil {
+		return 0, err
+	}
+	err = s.datagram.pushRecv(f.data)
+	if err != nil {
+		return 0, err
+	}
+	if s.datagram.isReadable() {
+		s.addEvent(newEventDatagramReadable())
+	}
+	s.logFrameProcessed(&f, now)
+	return n, nil
+}
+
 // processAckedPackets is called when the connection got an ACK frame.
 func (s *Conn) processAckedPackets(space packetSpace) {
-	pnSpace := &s.packetNumberSpaces[space]
 	s.recovery.drainAcked(space, func(f frame) {
 		switch f := f.(type) {
 		case *ackFrame:
 			// Stop sending ack for packets when receiving is confirmed
-			pnSpace.recvPacketNeedAck.removeUntil(f.largestAck)
+			s.packetNumberSpaces[space].recvPacketNeedAck.removeUntil(f.largestAck)
 		case *cryptoFrame:
-			pnSpace.cryptoStream.ackSend(f.offset, uint64(len(f.data)))
+			s.packetNumberSpaces[space].cryptoStream.ackSend(f.offset, uint64(len(f.data)))
 		case *streamFrame:
 			st := s.streams.get(f.streamID)
 			if st != nil {
@@ -733,7 +808,7 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 }
 
 func (s *Conn) doHandshake(now time.Time) error {
-	if s.state >= stateActive {
+	if s.state >= StateActive {
 		return nil
 	}
 	err := s.handshake.doHandshake()
@@ -747,17 +822,24 @@ func (s *Conn) doHandshake(now time.Time) error {
 			return err
 		}
 		// Update connection state
-		s.flow.setMaxSend(params.InitialMaxData)
-		s.streams.setPeerMaxStreamsBidi(params.InitialMaxStreamsBidi)
-		s.streams.setPeerMaxStreamsUni(params.InitialMaxStreamsUni)
-		s.setState(stateActive, now)
-		// Update loss recovery state
-		s.recovery.setMaxAckDelay(params.MaxAckDelay)
-		s.peerParams = *params
+		s.setPeerParams(params, now)
+		s.setState(StateActive, now)
 		// TODO: early app frames
-		s.logParametersSet(params, now)
 	}
 	return nil
+}
+
+func (s *Conn) setPeerParams(params *Parameters, now time.Time) {
+	s.peerParams = *params
+	// Update flow and stream states
+	s.flow.setMaxSend(s.peerParams.InitialMaxData)
+	s.streams.setPeerMaxStreamsBidi(s.peerParams.InitialMaxStreamsBidi)
+	s.streams.setPeerMaxStreamsUni(s.peerParams.InitialMaxStreamsUni)
+	// Update loss recovery state
+	s.recovery.setMaxAckDelay(s.peerParams.MaxAckDelay)
+	// Datagram
+	s.datagram.setMaxSend(s.peerParams.MaxDatagramPayloadSize)
+	s.logParametersSet(params, now)
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-authenticating-connection-i
@@ -788,7 +870,7 @@ func (s *Conn) validatePeerTransportParams(p *Parameters) error {
 		return err
 	}
 	// Initial Source CID must be sent by both endpoints
-	if len(p.InitialSourceCID) == 0 || !bytes.Equal(p.InitialSourceCID, s.dcid) {
+	if !bytes.Equal(p.InitialSourceCID, s.dcid) {
 		return newError(TransportParameterError, "initial_source_connection_id")
 	}
 	if s.isClient && !bytes.Equal(p.OriginalDestinationCID, s.odcid) {
@@ -802,10 +884,10 @@ func (s *Conn) validatePeerTransportParams(p *Parameters) error {
 
 // Read produces data for sending to the client.
 func (s *Conn) Read(b []byte) (int, error) {
-	now := s.time()
-	if !s.drainingTimer.IsZero() {
+	if s.state >= StateDraining {
 		return 0, nil
 	}
+	now := s.time()
 	if err := s.doHandshake(now); err != nil {
 		return 0, err
 	}
@@ -821,11 +903,12 @@ func (s *Conn) Read(b []byte) (int, error) {
 	}
 	// Coalesce packets when possible.
 	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#packet-coalesce
-	if space < packetSpaceApplication {
+	if space < packetSpaceApplication && s.state < StateDraining {
 		avail := minInt(s.maxPacketSize(), len(b))
 		if avail-n >= 96 { // Enough for a handshake packet
 			nextSpace := s.writeSpace()
 			if nextSpace < packetSpaceCount && nextSpace > space {
+				debug("coalesce packet: space=%v space=%v", space, nextSpace)
 				m, err := s.send(b[n:avail], nextSpace, now)
 				if err != nil {
 					return 0, err
@@ -853,7 +936,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 		},
 		token:        s.token,
 		packetNumber: pnSpace.nextPacketNumber,
-		payloadLen:   avail,
+		payloadLen:   avail, // For calculating packet size
 	}
 	// Calculate what is left for payload
 	overhead := pnSpace.sealer.aead.Overhead()
@@ -922,8 +1005,8 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 		if s.isClient && p.packetNumber == 0 {
 			s.dropPacketSpace(packetSpaceInitial)
 		}
-		if s.state < stateHandshake {
-			s.setState(stateHandshake, now)
+		if s.state < StateHandshake {
+			s.setState(StateHandshake, now)
 		}
 	}
 	if p.packetNumber == 0 && !s.isClient && space == packetSpaceApplication {
@@ -948,7 +1031,7 @@ func (s *Conn) writeSpace() packetSpace {
 			continue
 		}
 		// Only use application packet number space when handshake is complete.
-		if i == packetSpaceApplication && s.state < stateActive {
+		if i == packetSpaceApplication && s.state < StateActive {
 			continue
 		}
 		// Select the space which
@@ -960,7 +1043,7 @@ func (s *Conn) writeSpace() packetSpace {
 		}
 	}
 	// If there are flushable streams, use Application.
-	if s.state == stateActive && (s.streams.hasUpdate() || s.flow.shouldUpdateMaxRecv()) {
+	if s.state == StateActive && (s.streams.hasUpdate() || s.flow.shouldUpdateMaxRecv() || s.datagram.isFlushable()) {
 		return packetSpaceApplication
 	}
 	// Nothing to send
@@ -969,11 +1052,8 @@ func (s *Conn) writeSpace() packetSpace {
 
 func (s *Conn) maxPacketSize() int {
 	var n uint64
-	if s.state >= stateActive && s.peerParams.MaxUDPPayloadSize > 0 {
+	if s.state >= StateActive && s.peerParams.MaxUDPPayloadSize > 0 {
 		n = s.peerParams.MaxUDPPayloadSize
-		if n > MaxPacketSize {
-			n = MaxPacketSize
-		}
 	} else {
 		n = MinInitialPacketSize
 	}
@@ -986,15 +1066,14 @@ func (s *Conn) maxPacketSize() int {
 
 func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 	s.logPacketsLost(s.recovery.lost[space], space, now)
-	pnSpace := &s.packetNumberSpaces[space]
 	s.recovery.drainLost(space, func(f frame) {
 		debug("lost frame space=%v %v", space, f)
 		switch f := f.(type) {
 		case *ackFrame:
-			pnSpace.ackElicited = true
+			s.packetNumberSpaces[space].ackElicited = true
 		case *cryptoFrame:
 			// Push data back to send again
-			err := pnSpace.cryptoStream.pushSend(f.data, f.offset, false)
+			err := s.packetNumberSpaces[space].cryptoStream.pushSend(f.data, f.offset, false)
 			if err != nil {
 				debug("process lost crypto frame %s: %v", f, err)
 			}
@@ -1030,6 +1109,8 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 			} else {
 				s.streams.setUpdateMaxStreamsUni(true)
 			}
+		case *pathResponseFrame:
+			s.pathResponse = f.data
 		case *handshakeDoneFrame:
 			s.handshakeConfirmed = false
 		}
@@ -1037,8 +1118,17 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 }
 
 func (s *Conn) sendFrames(op *sentPacket, space packetSpace, left int, now time.Time) int {
-	pnSpace := &s.packetNumberSpaces[space]
 	payloadLen := 0
+	// ACK
+	if f := s.sendFrameAck(space, now); f != nil {
+		n := f.encodedLen()
+		if left >= n {
+			op.addFrame(f)
+			payloadLen += n
+			left -= n
+			s.packetNumberSpaces[space].ackElicited = false
+		}
+	}
 	// CONNECTION_CLOSE
 	if s.closeFrame != nil {
 		n := s.closeFrame.encodedLen()
@@ -1047,127 +1137,136 @@ func (s *Conn) sendFrames(op *sentPacket, space packetSpace, left int, now time.
 			payloadLen += n
 			left -= n
 			s.setDraining(now)
+			return payloadLen // do not need to continue
 		}
 	}
-	if s.state < stateDraining {
-		// ACK
-		if f := s.sendFrameAck(pnSpace, now); f != nil {
+	// CRYPTO
+	if f := s.sendFrameCrypto(space, left); f != nil {
+		n := f.encodedLen()
+		op.addFrame(f)
+		payloadLen += n
+		left -= n
+	}
+	if space == packetSpaceApplication {
+		// HANDSHAKE_DONE
+		if f := s.sendFrameHandshakeDone(); f != nil {
 			n := f.encodedLen()
 			if left >= n {
 				op.addFrame(f)
 				payloadLen += n
 				left -= n
-				pnSpace.ackElicited = false
+				s.handshakeConfirmed = true
 			}
 		}
-		// CRYPTO
-		if f := s.sendFrameCrypto(pnSpace, left); f != nil {
+		// PATH_RESPONSE
+		if f := s.sendFramePathResponse(); f != nil {
+			n := f.encodedLen()
+			if left >= n {
+				op.addFrame(f)
+				payloadLen += n
+				left -= n
+				s.pathResponse = nil
+			}
+		}
+		// MAX_DATA
+		if f := s.sendFrameMaxData(); f != nil {
+			n := f.encodedLen()
+			if left >= n {
+				op.addFrame(f)
+				payloadLen += n
+				left -= n
+				s.updateMaxData = false
+				s.flow.commitMaxRecv()
+			}
+		}
+		// MAX_STREAMS (bidi)
+		if f := s.sendFrameMaxStreamsBidi(); f != nil {
+			n := f.encodedLen()
+			if left >= n {
+				op.addFrame(f)
+				payloadLen += n
+				left -= n
+				s.streams.setUpdateMaxStreamsBidi(false)
+				s.streams.commitMaxStreamsBidi()
+			}
+		}
+		// MAX_STREAMS (uni)
+		if f := s.sendFrameMaxStreamsUni(); f != nil {
+			n := f.encodedLen()
+			if left >= n {
+				op.addFrame(f)
+				payloadLen += n
+				left -= n
+				s.streams.setUpdateMaxStreamsUni(false)
+				s.streams.commitMaxStreamsUni()
+			}
+		}
+		// DATAGRAM
+		for f := s.sendFrameDatagram(left); f != nil; f = s.sendFrameDatagram(left) {
 			n := f.encodedLen()
 			op.addFrame(f)
 			payloadLen += n
 			left -= n
 		}
-		if space == packetSpaceApplication {
-			// HANDSHAKE_DONE
-			if f := s.sendFrameHandshakeDone(); f != nil {
+		for id, st := range s.streams.streams {
+			// STOP_SENDING
+			if f := s.sendFrameStopSending(id, st); f != nil {
 				n := f.encodedLen()
 				if left >= n {
 					op.addFrame(f)
 					payloadLen += n
 					left -= n
-					s.handshakeConfirmed = true
+					st.setStopSending(deliverySending)
 				}
 			}
-			// MAX_DATA
-			if f := s.sendFrameMaxData(); f != nil {
+			// RESET_STREAM
+			if f := s.sendFrameResetStream(id, st); f != nil {
 				n := f.encodedLen()
 				if left >= n {
 					op.addFrame(f)
 					payloadLen += n
 					left -= n
-					s.updateMaxData = false
-					s.flow.commitMaxRecv()
+					st.setResetStream(deliverySending)
 				}
 			}
-			// MAX_STREAMS (bidi)
-			if f := s.sendFrameMaxStreamsBidi(); f != nil {
+			// MAX_STREAM_DATA
+			if f := s.sendFrameMaxStreamData(id, st); f != nil {
 				n := f.encodedLen()
 				if left >= n {
 					op.addFrame(f)
 					payloadLen += n
 					left -= n
-					s.streams.setUpdateMaxStreamsBidi(false)
-					s.streams.commitMaxStreamsBidi()
-				}
-			}
-			// MAX_STREAMS (uni)
-			if f := s.sendFrameMaxStreamsUni(); f != nil {
-				n := f.encodedLen()
-				if left >= n {
-					op.addFrame(f)
-					payloadLen += n
-					left -= n
-					s.streams.setUpdateMaxStreamsUni(false)
-					s.streams.commitMaxStreamsUni()
-				}
-			}
-			for id, st := range s.streams.streams {
-				// STOP_SENDING
-				if f := s.sendFrameStopSending(id, st); f != nil {
-					n := f.encodedLen()
-					if left >= n {
-						op.addFrame(f)
-						payloadLen += n
-						left -= n
-						st.setStopSending(deliverySending)
-					}
-				}
-				// RESET_STREAM
-				if f := s.sendFrameResetStream(id, st); f != nil {
-					n := f.encodedLen()
-					if left >= n {
-						op.addFrame(f)
-						payloadLen += n
-						left -= n
-						st.setResetStream(deliverySending)
-					}
-				}
-				// MAX_STREAM_DATA
-				if f := s.sendFrameMaxStreamData(id, st); f != nil {
-					n := f.encodedLen()
-					if left >= n {
-						op.addFrame(f)
-						payloadLen += n
-						left -= n
-						st.setUpdateMaxData(false)
-						st.flow.commitMaxRecv()
-					}
-				}
-			}
-			// STREAM
-			// TODO: support stream priority
-			for id, st := range s.streams.streams {
-				if f := s.sendFrameStream(id, st, left); f != nil {
-					n := f.encodedLen()
-					op.addFrame(f)
-					payloadLen += n
-					left -= n
-					s.flow.addSend(len(f.data))
+					st.setUpdateMaxData(false)
+					st.flow.commitMaxRecv()
 				}
 			}
 		}
-		// PING
-		if s.recovery.lossProbes[space] > 0 {
-			if op.ackEliciting {
-				// Do not need PING if an ack-eliciting frame is sent
-				s.recovery.lossProbes[space]--
-			} else if f := s.sendFramePing(left); f != nil {
+		// STREAM
+		// TODO: support stream priority
+		for id, st := range s.streams.streams {
+			if f := s.sendFrameStream(id, st, left); f != nil {
 				n := f.encodedLen()
 				op.addFrame(f)
 				payloadLen += n
 				left -= n
-				s.recovery.lossProbes[space]--
+				s.flow.addSend(len(f.data))
+				if left <= maxStreamFrameOverhead {
+					break
+				}
 			}
+		}
+	}
+	// PING
+	if s.recovery.lossProbes[space] > 0 {
+		if op.ackEliciting {
+			// Do not need PING if an ack-eliciting frame is sent
+			s.recovery.lossProbes[space]--
+		} else if f := s.sendFramePing(left); f != nil {
+			n := f.encodedLen()
+			op.addFrame(f)
+			payloadLen += n
+			left -= n
+			s.recovery.lossProbes[space]--
 		}
 	}
 	return payloadLen
@@ -1189,14 +1288,18 @@ func (s *Conn) onPacketSent(op *sentPacket, space packetSpace) {
 // Timeout returns the amount of time until the next timeout event.
 // A negative timeout means that the timer should be disarmed.
 func (s *Conn) Timeout() time.Duration {
-	if s.state == stateClosed {
+	if s.state == StateClosed {
 		return -1
 	}
 	var deadline time.Time
 	if !s.drainingTimer.IsZero() {
 		deadline = s.drainingTimer
 	} else if !s.recovery.lossDetectionTimer.IsZero() {
+		// Minimum of loss and idle timer
 		deadline = s.recovery.lossDetectionTimer
+		if !s.idleTimer.IsZero() && deadline.After(s.idleTimer) {
+			deadline = s.idleTimer
+		}
 	} else if !s.idleTimer.IsZero() {
 		deadline = s.idleTimer
 	} else {
@@ -1212,12 +1315,12 @@ func (s *Conn) Timeout() time.Duration {
 func (s *Conn) checkTimeout(now time.Time) {
 	if !s.drainingTimer.IsZero() && !now.Before(s.drainingTimer) {
 		debug("draining timeout expired")
-		s.setState(stateClosed, now)
+		s.setState(StateClosed, now)
 		return
 	}
 	if !s.idleTimer.IsZero() && !now.Before(s.idleTimer) {
 		debug("idle timeout expired")
-		s.setState(stateClosed, now)
+		s.setState(StateClosed, now)
 		return
 	}
 	if !s.recovery.lossDetectionTimer.IsZero() && !now.Before(s.recovery.lossDetectionTimer) {
@@ -1228,26 +1331,20 @@ func (s *Conn) checkTimeout(now time.Time) {
 // Close sets the connection to closing state.
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#draining
 func (s *Conn) Close(app bool, errCode uint64, reason string) {
-	if !s.drainingTimer.IsZero() || s.closeFrame != nil || s.state >= stateDraining {
+	if s.closeFrame != nil || s.state >= StateDraining {
 		return
 	}
-	debug("set close code=%d", errCode)
+	debug("set closing: code=%d reason=%v", errCode, reason)
 	s.closeFrame = &connectionCloseFrame{
 		application:  app,
 		errorCode:    errCode,
 		reasonPhrase: []byte(reason),
 	}
-	s.setState(stateDraining, s.time())
 }
 
-// IsEstablished returns true of handshake is complete and the connection is not closing.
-func (s *Conn) IsEstablished() bool {
-	return s.state == stateActive
-}
-
-// IsClosed returns true when the connection is in Closed state and no longer send or receive packets.
-func (s *Conn) IsClosed() bool {
-	return s.state == stateClosed
+// ConnectionState returns the current connection state.
+func (s *Conn) ConnectionState() ConnectionState {
+	return s.state
 }
 
 // Events consumes received events. It appends to provided events slice
@@ -1268,8 +1365,14 @@ func (s *Conn) Stream(id uint64) (*Stream, error) {
 	return s.getOrCreateStream(id, true)
 }
 
-func (s *Conn) sendFrameAck(pnSpace *packetNumberSpace, now time.Time) *ackFrame {
-	if pnSpace.ackElicited {
+// Datagram returns a Datagram associated to this QUIC connection.
+func (s *Conn) Datagram() *Datagram {
+	return &s.datagram
+}
+
+func (s *Conn) sendFrameAck(space packetSpace, now time.Time) *ackFrame {
+	pnSpace := &s.packetNumberSpaces[space]
+	if (pnSpace.ackElicited || s.recovery.lossProbes[space] > 0) && len(pnSpace.recvPacketNeedAck) > 0 {
 		ackDelay := uint64(now.Sub(pnSpace.largestRecvPacketTime).Microseconds())
 		ackDelay /= 1 << s.peerParams.AckDelayExponent
 		return newAckFrame(ackDelay, pnSpace.recvPacketNeedAck)
@@ -1277,10 +1380,10 @@ func (s *Conn) sendFrameAck(pnSpace *packetNumberSpace, now time.Time) *ackFrame
 	return nil
 }
 
-func (s *Conn) sendFrameCrypto(pnSpace *packetNumberSpace, left int) *cryptoFrame {
+func (s *Conn) sendFrameCrypto(space packetSpace, left int) *cryptoFrame {
 	left -= maxCryptoFrameOverhead
 	if left > 0 {
-		data, offset, _ := pnSpace.cryptoStream.popSend(left)
+		data, offset, _ := s.packetNumberSpaces[space].cryptoStream.popSend(left)
 		if len(data) > 0 {
 			return newCryptoFrame(data, offset)
 		}
@@ -1356,22 +1459,39 @@ func (s *Conn) sendFrameMaxStreamsUni() *maxStreamsFrame {
 
 func (s *Conn) sendFrameHandshakeDone() *handshakeDoneFrame {
 	// HandshakeDone is sent only by server.
-	if s.isClient || s.state != stateActive || s.handshakeConfirmed {
+	if s.isClient || s.state != StateActive || s.handshakeConfirmed {
 		return nil
 	}
 	return &handshakeDoneFrame{}
 }
 
-func (s *Conn) sendFramePing(left int) *pingFrame {
-	if left < 1 {
-		return nil
+func (s *Conn) sendFramePathResponse() *pathResponseFrame {
+	if s.pathResponse != nil {
+		return newPathResponseFrame(s.pathResponse)
 	}
-	return &pingFrame{}
+	return nil
+}
+
+func (s *Conn) sendFramePing(left int) *pingFrame {
+	if left > 0 {
+		return &pingFrame{}
+	}
+	return nil
+}
+
+func (s *Conn) sendFrameDatagram(left int) *datagramFrame {
+	data := s.datagram.popSend(left - maxDatagramFrameOverhead)
+	if len(data) > 0 {
+		return newDatagramFrame(data)
+	}
+	return nil
 }
 
 func (s *Conn) setDraining(now time.Time) {
-	if s.drainingTimer.IsZero() {
+	if s.state < StateDraining {
+		// Persist for at least three times the current Probe Timeout
 		s.drainingTimer = now.Add(s.recovery.probeTimeout() * 3)
+		s.setState(StateDraining, now)
 	}
 }
 
@@ -1414,17 +1534,15 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 
 // Check closed streams for garbage collection.
 func (s *Conn) checkStreamsState(now time.Time) {
-	if s.state == stateActive {
+	if s.state == StateActive {
 		s.streams.checkClosed(func(id uint64) {
-			s.logStreamClosed(now, id)
+			s.logStreamClosed(id, now)
 		})
 	}
 }
 
-func (s *Conn) setState(state connectionState, now time.Time) {
-	if s.logEventFn != nil {
-		s.logEventFn(newLogEventConnectionState(now, s.state, state))
-	}
+func (s *Conn) setState(state ConnectionState, now time.Time) {
+	s.logConnectionState(s.state, state, now)
 	s.state = state
 	debug("set state=%v", state)
 }
@@ -1436,7 +1554,7 @@ func (s *Conn) dropPacketSpace(space packetSpace) {
 }
 
 func (s *Conn) addStreamEvents() {
-	if s.state != stateActive || s.flow.canSend() == 0 {
+	if s.state != StateActive || s.flow.canSend() == 0 {
 		return
 	}
 	for id, st := range s.streams.streams {
@@ -1447,6 +1565,12 @@ func (s *Conn) addStreamEvents() {
 }
 
 func (s *Conn) addEvent(e Event) {
+	// Ensure event is unique. Maybe use Bloom Filter?
+	for i := len(s.events) - 1; i >= 0; i-- {
+		if s.events[i] == e {
+			return
+		}
+	}
 	s.events = append(s.events, e)
 }
 
@@ -1476,64 +1600,100 @@ func minInt(a, b int) int {
 	return b
 }
 
-// OnLogEvent sets handler for received events.
-func (s *Conn) OnLogEvent(fn func(LogEvent)) {
+// SetLogger sets handler for received events.
+func (s *Conn) SetLogger(fn func(LogEvent)) {
 	s.logEventFn = fn
 }
 
-func (s *Conn) logPacketDropped(p *packet, now time.Time) {
+func (s *Conn) logPacketDropped(p *packet, trigger string, now time.Time) {
+	debug("dropped packet: %v %v", trigger, p)
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventPacket(now, logEventPacketDropped, p))
+		e := newLogEvent(now, logEventPacketDropped)
+		logPacket(&e, p)
+		logTrigger(&e, trigger)
+		s.logEventFn(e)
 	}
 }
 
 func (s *Conn) logPacketReceived(p *packet, now time.Time) {
+	debug("received packet: %v", p)
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventPacket(now, logEventPacketReceived, p))
+		e := newLogEvent(now, logEventPacketReceived)
+		logPacket(&e, p)
+		s.logEventFn(e)
 	}
 }
 
 func (s *Conn) logPacketSent(p *packet, frames []frame, now time.Time) {
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventPacket(now, logEventPacketSent, p))
+		e := newLogEvent(now, logEventPacketSent)
+		logPacket(&e, p)
+		s.logEventFn(e)
+		e.Type = logEventFramesProcessed
 		for _, f := range frames {
-			s.logEventFn(newLogEventFrame(now, logEventFramesProcessed, f))
+			e.resetFields()
+			logFrame(&e, f)
+			s.logEventFn(e)
 		}
 	}
 }
 
 func (s *Conn) logPacketsLost(packets []*sentPacket, space packetSpace, now time.Time) {
 	if s.logEventFn != nil {
+		e := newLogEvent(now, logEventPacketLost)
 		p := packet{
 			typ: packetTypeFromSpace(space),
 		}
 		for _, sp := range packets {
 			p.packetNumber = sp.packetNumber
-			s.logEventFn(newLogEventPacket(now, logEventPacketLost, &p))
+			e.resetFields()
+			logPacket(&e, &p)
+			s.logEventFn(e)
 		}
 	}
 }
 
 func (s *Conn) logFrameProcessed(f frame, now time.Time) {
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventFrame(now, logEventFramesProcessed, f))
+		e := newLogEvent(now, logEventFramesProcessed)
+		logFrame(&e, f)
+		s.logEventFn(e)
 	}
 }
 
 func (s *Conn) logParametersSet(p *Parameters, now time.Time) {
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventParametersSet(now, p))
+		e := newLogEvent(now, logEventParametersSet)
+		logParameters(&e, p)
+		s.logEventFn(e)
 	}
 }
 
 func (s *Conn) logRecovery(now time.Time) {
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventRecovery(now, &s.recovery))
+		e := newLogEvent(now, logEventMetricsUpdated)
+		logRecovery(&e, &s.recovery)
+		s.logEventFn(e)
+
+		e.resetFields()
+		e.Type = logEventLossTimerUpdated
+		logLossTimer(&e, &s.recovery)
+		s.logEventFn(e)
 	}
 }
 
-func (s *Conn) logStreamClosed(now time.Time, id uint64) {
+func (s *Conn) logStreamClosed(id uint64, now time.Time) {
 	if s.logEventFn != nil {
-		s.logEventFn(newLogEventStreamClosed(now, id))
+		e := newLogEvent(now, logEventStreamStateUpdated)
+		logStreamClosed(&e, id)
+		s.logEventFn(e)
+	}
+}
+
+func (s *Conn) logConnectionState(old, new ConnectionState, now time.Time) {
+	if s.logEventFn != nil {
+		e := newLogEvent(now, logEventStateUpdated)
+		logConnectionState(&e, old, new)
+		s.logEventFn(e)
 	}
 }

@@ -31,26 +31,26 @@ func TestAddressValidator(t *testing.T) {
 	s.timeFn = func() time.Time {
 		return now
 	}
-	token := s.Generate(addr1, odcid)
+	token := s.GenerateToken(addr1, odcid)
 	t.Logf("token: %d %x", len(token), token)
-	cid := s.Validate(addr1, token)
+	cid := s.ValidateToken(addr1, token)
 	if !bytes.Equal(odcid, cid) {
 		t.Fatalf("expect cid: %x\nactual: %x", odcid, cid)
 	}
 	// Still valid
 	now = now.Add(10 * time.Second)
-	cid = s.Validate(addr1, token)
+	cid = s.ValidateToken(addr1, token)
 	if !bytes.Equal(odcid, cid) {
 		t.Fatalf("expect cid: %x\nactual: %x", odcid, cid)
 	}
 	// Wrong address
-	cid = s.Validate(addr2, token)
+	cid = s.ValidateToken(addr2, token)
 	if cid != nil {
 		t.Fatalf("expect cid: <nil>\nactual: %x", cid)
 	}
 	// Expired
 	now = now.Add(1 * time.Second)
-	cid = s.Validate(addr2, token)
+	cid = s.ValidateToken(addr2, token)
 	if cid != nil {
 		t.Fatalf("expect cid: <nil>\nactual: %x", cid)
 	}
@@ -62,8 +62,8 @@ func BenchmarkAddressValidator(b *testing.B) {
 	s := NewAddressValidator()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		token := s.Generate(addr, odcid)
-		cid := s.Validate(addr, token)
+		token := s.GenerateToken(addr, odcid)
+		cid := s.ValidateToken(addr, token)
 		if cid == nil {
 			b.Fatal("invalid token")
 		}

@@ -13,35 +13,43 @@ import (
 	"github.com/goburrow/quic/transport"
 )
 
+type command interface {
+	Name() string
+	Desc() string
+	Run([]string) error
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	commands := []command{clientCommand{}, datagramCommand{}, qlogCommand{}, serverCommand{}}
 	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "Usage: quiwi <command> [options]")
+		output := flag.CommandLine.Output()
+		fmt.Fprintln(output, "Usage: quiwi <command> [arguments]")
+		fmt.Fprintln(output, "commands:")
+		for _, c := range commands {
+			fmt.Fprintf(output, "\t%-16s%s\n", c.Name(), c.Desc())
+		}
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	cmd := flag.Arg(0)
-	var err error
-	switch cmd {
-	case "server":
-		err = serverCommand(flag.Args()[1:])
-	case "client":
-		err = clientCommand(flag.Args()[1:])
-	case "qlog":
-		err = qlogCommand(flag.Args()[1:])
-	default:
-		flag.Usage()
-		os.Exit(2)
+	for _, c := range commands {
+		if c.Name() == cmd {
+			err := c.Run(flag.Args()[1:])
+			if err != nil {
+				log.Fatal(err)
+			}
+			return
+		}
 	}
-	if err != nil {
-		log.Fatal(err)
-	}
+	flag.Usage()
+	os.Exit(2)
 }
 
 func newConfig() *transport.Config {
 	c := transport.NewConfig()
 	c.Params.MaxUDPPayloadSize = transport.MaxIPv6PacketSize
-	c.Params.MaxIdleTimeout = 5 * time.Second
+	c.Params.MaxIdleTimeout = 10 * time.Second
 	c.Params.InitialMaxData = 1000000
 	c.Params.InitialMaxStreamDataBidiLocal = 100000
 	c.Params.InitialMaxStreamDataBidiRemote = 100000

@@ -8,7 +8,7 @@ The goal is to provide low level APIs for applications or protocols using QUIC a
 TLS 1.3 support is based on standard Go TLS package (https://github.com/golang/go/tree/master/src/crypto/tls),
 licensed under the 3-clause BSD license.
 
-## Testing
+## Development
 
 Build command:
 ```
@@ -22,46 +22,83 @@ go build -tags debug
 go build -gcflags '-m' 2>&1 | sort -V > debug.txt
 ```
 
-```
-# Client
-./quiwi client https://quic.tech:4433/
+### Client
 
-# Server
-./quiwi server
+```
+Usage: quiwi client [arguments] <url>
+  -cipher string
+    	TLS 1.3 cipher suite, e.g. TLS_CHACHA20_POLY1305_SHA256
+  -insecure
+    	skip verifying server certificate
+  -listen string
+    	listen on the given IP:port (default "0.0.0.0:0")
+  -qlog string
+    	write logs to qlog file
+  -root string
+    	root download directory
+  -v int
+    	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
+```
+
+Example
+```
+./quiwi client https://quic.tech:4433/
+```
+
+### Server
+
+```
+Usage: quiwi server [arguments]
+  -cert string
+    	TLS certificate path (default "cert.pem")
+  -key string
+    	TLS certificate key path (default "key.pem")
+  -listen string
+    	listen on the given IP:port (default ":4433")
+  -qlog string
+    	write logs to qlog file
+  -retry
+    	enable address validation using Retry packet
+  -root string
+    	root directory (default "www")
+  -v int
+    	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
+```
+
+Example:
+```
+./quiwi server -cert ../../testdata/cert.pem -key ../../testdata/key.pem
 ```
 
 Add `SSLKEYLOGFILE=key.log` to have TLS keys logged to file.
 
-Testing with Quiche:
+## Datagram
 
 ```
-cd /path/to/quiche/tools/apps
-cargo build --release
-# Client
-RUST_LOG=trace ./target/release/quiche-client --no-verify https://127.0.0.1:4433
+Usage: quiwi datagram [arguments] [url]
+  -cert string
+    	TLS certificate path (server only) (default "cert.pem")
+  -insecure
+    	skip verifying server certificate (client only)
+  -key string
+    	TLS certificate key path (server only) (default "key.pem")
+  -listen string
+    	listen on the given IP:port (default "0.0.0.0:0")
+  -v int
+    	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
+```
+
+Example:
+```
 # Server
-RUST_LOG=trace ./target/release/quiche-server
+./quiwi datagram -listen 127.0.0.1:4433
+# Client
+./quiwi datagram -insecure https://127.0.0.1:4433
 ```
 
-Test coverage:
-```
-go test -coverprofile=coverage.out
-go tool cover -html=coverage.out
-```
+## Testing
 
-Generating test certificate:
-```
-go run $GOROOT/src/crypto/tls/generate_cert.go -ecdsa-curve P256 --host localhost,127.0.0.1
-```
-
-Interop:
-```
-cd /path/to/quic-interop-runner
-python3 -m venv venv
-. venv/bin/activate
-pip install -r requirements.txt
-./run.py -s quiwi -c quiwi
-```
+See interop/README.md
 
 ## Fuzzing
 

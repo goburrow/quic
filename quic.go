@@ -13,6 +13,7 @@ import (
 
 const (
 	maxDatagramSize = transport.MaxIPv6PacketSize
+	cidLength       = transport.MaxCIDLength
 	bufferSize      = 1500
 )
 
@@ -39,7 +40,9 @@ type Conn struct {
 
 	events []transport.Event
 	recvCh chan *packet
-
+	// Initial attempt key genereted for server connection.
+	attemptKey []byte
+	// Stream IDs
 	nextStreamIDBidi uint64
 	nextStreamIDUni  uint64
 
@@ -88,6 +91,11 @@ func (s *Conn) NewStream(bidi bool) (*transport.Stream, uint64, error) {
 	return st, id, nil
 }
 
+// Datagram returns connection datagram reader and writer.
+func (s *Conn) Datagram() *transport.Datagram {
+	return s.conn.Datagram()
+}
+
 // LocalAddr returns the local network address.
 func (s *Conn) LocalAddr() net.Addr {
 	return nil // TODO: get from socket
@@ -124,9 +132,9 @@ type localConn struct {
 	config *transport.Config
 	socket net.PacketConn
 
-	peersMu   sync.RWMutex
-	peers     map[string]*Conn // by cid
-	peersAddr map[string]*Conn // by address
+	// peers include all active connections.
+	peersMu sync.RWMutex
+	peers   map[string]*Conn // by cid and attempt key
 
 	closing   bool      // locked by peersMu.
 	closeCond sync.Cond // locked by peersMu. Closing a connection will broadcast when connections is empty
@@ -139,7 +147,6 @@ type localConn struct {
 func (s *localConn) init(config *transport.Config) {
 	s.config = config
 	s.peers = make(map[string]*Conn)
-	s.peersAddr = make(map[string]*Conn)
 	s.closeCh = make(chan struct{})
 	s.closeCond.L = &s.peersMu
 	s.handler = noopHandler{}
@@ -165,12 +172,20 @@ func (s *localConn) SetListener(conn net.PacketConn) {
 func (s *localConn) handleConn(c *Conn) {
 	defer s.connClosed(c)
 	established := false
-	for !c.conn.IsClosed() {
+	for c.conn.ConnectionState() != transport.StateClosed {
 		p := s.pollConn(c)
 		if established {
 			s.serveConn(c)
 		} else {
-			if c.conn.IsEstablished() {
+			// First time state switched to active
+			if c.conn.ConnectionState() == transport.StateActive {
+				// Handshake done, remove the attempt key
+				if c.attemptKey != nil {
+					s.peersMu.Lock()
+					delete(s.peers, string(c.attemptKey))
+					c.attemptKey = nil
+					s.peersMu.Unlock()
+				}
 				// Maybe also attach packet header in the event?
 				c.events = append(c.events, transport.Event{Type: EventConnAccept})
 				established = true
@@ -215,7 +230,8 @@ func (s *localConn) pollConn(c *Conn) *packet {
 }
 
 func (s *localConn) pollConnDelayed(c *Conn) {
-	if !c.conn.IsEstablished() {
+	if c.conn.ConnectionState() != transport.StateActive {
+		// Only for application space
 		return
 	}
 	// TODO: check whether we only need to send back ACK, then we can delay it.
@@ -237,11 +253,19 @@ func (s *localConn) pollConnDelayed(c *Conn) {
 func (s *localConn) recvConn(c *Conn, data []byte) error {
 	n, err := c.conn.Write(data)
 	if err != nil {
-		s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
-		// Close connection when receive failed
+		if err == transport.ErrPacketDropped {
+			// Just ignore dropped packets
+			return nil
+		}
+		if err == transport.ErrKeysUnavailable {
+			// TODO: queue packet for later processing.
+			return nil
+		}
 		if err, ok := err.(*transport.Error); ok {
+			// Close connection when receive failed
 			c.conn.Close(false, err.Code, err.Message)
 		} else {
+			s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
 			c.conn.Close(false, transport.InternalError, "")
 		}
 		return err
@@ -288,7 +312,10 @@ func (s *localConn) connClosed(c *Conn) {
 	s.serveConn(c)
 	s.peersMu.Lock()
 	delete(s.peers, string(c.scid[:]))
-	delete(s.peersAddr, c.addr.String())
+	if c.attemptKey != nil {
+		delete(s.peers, string(c.attemptKey))
+		c.attemptKey = nil
+	}
 	// If server is closing and this is the last one, tell others
 	if s.closing && len(s.peers) == 0 {
 		s.closeCond.Broadcast()
@@ -296,7 +323,7 @@ func (s *localConn) connClosed(c *Conn) {
 	s.peersMu.Unlock()
 }
 
-// close closes receiving packet channel of all connections to signal terminating handleConn gorotines.
+// close closes receiving packet channel of all connections to signal terminating handleConn goroutines.
 func (s *localConn) close(timeout time.Duration) {
 	s.peersMu.Lock()
 	if s.closing {

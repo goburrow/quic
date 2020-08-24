@@ -14,7 +14,8 @@ const (
 	// Maximum reordering in time before time threshold loss detection considers a packet lost.
 	// Specified as an RTT multiplier.
 	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#time-threshold
-	timeThreshold = 9.0 / 8.0
+	// NOTE: The value is spec is 9/8, but used as "x + x/8" here to avoid casting to float.
+	timeThreshold = 8
 
 	// Timer granularity.
 	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#time-threshold
@@ -34,7 +35,8 @@ const (
 	minimumWindow        = 2 * maxDatagramSize
 
 	// Reduction in congestion window when a new loss event is detected.
-	lossReductionFactor = 0.5
+	// NOTE: The value in spec is 0.5, but used as "x/2" here to avoid casting to float.
+	lossReductionFactor = 2
 
 	// The period of time for persistent congestion to be established,
 	// specified as a PTO multiplier. The recommended value is 3, which is approximately
@@ -117,6 +119,8 @@ type lossRecovery struct {
 	timeOfLastAckElicitingPacket [packetSpaceCount]time.Time
 	// The largest packet number acknowledged in the packet number space so far.
 	largestAckedPacket [packetSpaceCount]uint64
+	// The largest packet number the connection has sent.
+	largestSentPacket [packetSpaceCount]uint64
 	// lossTime is the time at which the next packet in that packet number space
 	// will be considered lost based on exceeding the reordering window in time.
 	lossTime   [packetSpaceCount]time.Time
@@ -150,6 +154,9 @@ func (s *lossRecovery) init() {
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-sending-a-packet
 func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 	s.sent[space] = append(s.sent[space], p)
+	if p.packetNumber > s.largestSentPacket[space] {
+		s.largestSentPacket[space] = p.packetNumber
+	}
 	if p.inFlight {
 		if p.ackEliciting {
 			s.timeOfLastAckElicitingPacket[space] = p.timeSent
@@ -163,6 +170,10 @@ func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-receiving-an-acknowledgm
 func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, space packetSpace, now time.Time) {
 	largestAcked := ranges.largest()
+	if largestAcked > s.largestSentPacket[space] {
+		debug("invalid largest acknowledged packet number: %v %v", s.largestSentPacket, ranges)
+		return
+	}
 	if s.largestAckedPacket[space] == maxUint64 || s.largestAckedPacket[space] < largestAcked {
 		s.largestAckedPacket[space] = largestAcked
 	}
@@ -181,19 +192,21 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 			return true
 		})
 	}
-	// Nothing to do if there are no newly acked packets.
 	if len(ackedPackets) == 0 {
+		// Nothing to do if there are no newly acked packets.
 		return
 	}
-	largestPacket := ackedPackets[len(ackedPackets)-1]
-	// If the largest acknowledged is newly acked and
-	// at least one ack-eliciting was newly acked, update the RTT.
-	if largestPacket.packetNumber == largestAcked && hasAckEliciting {
-		latestRTT := now.Sub(largestPacket.timeSent)
-		if space != packetSpaceApplication {
-			ackDelay = 0
+	if hasAckEliciting {
+		largestPacket := ackedPackets[len(ackedPackets)-1]
+		// If the largest acknowledged is newly acked and
+		// at least one ack-eliciting was newly acked, update the RTT.
+		if largestPacket.packetNumber == largestAcked {
+			latestRTT := now.Sub(largestPacket.timeSent)
+			if space != packetSpaceApplication {
+				ackDelay = 0
+			}
+			s.updateRTT(latestRTT, ackDelay)
 		}
-		s.updateRTT(latestRTT, ackDelay)
 	}
 
 	// TODO: Process ECN information if present.
@@ -307,14 +320,16 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 	sent := s.sent[space]
 	if len(sent) > 0 {
 		// Retransmit the frames from the oldest sent packets on PTO.
-		n := len(sent) - probes
-		if n < 0 {
-			n = 0
+		// Calculate starting point first to keep lost packets in order.
+		i := len(sent) - probes
+		if i < 0 {
+			i = 0
 		}
-		for i := n; i < len(sent); i++ {
+		for ; i < len(sent); i++ {
 			p := sent[i]
 			if p.ackEliciting {
 				s.lost[space] = append(s.lost[space], p)
+				p.ackEliciting = false // So it will not be marked as lost again.
 			}
 			// The packet may not really lost, so do not change congestion control.
 			// It is kept in the sent list so we can actually declare it lost or acked later.
@@ -331,7 +346,7 @@ func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 	if lossDelay < s.latestRTT {
 		lossDelay = s.latestRTT
 	}
-	lossDelay = time.Duration(float64(lossDelay) * timeThreshold)
+	lossDelay += lossDelay / timeThreshold
 	if lossDelay < granularity {
 		lossDelay = granularity
 	}
@@ -427,7 +442,7 @@ func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 	return lossTime, space
 }
 
-// earliestTimeout returns ealieast PTO timeout.
+// earliestTimeout returns the earliest PTO timeout.
 func (s *lossRecovery) earliestProbeTime() (time.Time, packetSpace) {
 	duration := s.probeTimeout() * (1 << s.ptoCount)
 	space := packetSpaceInitial
@@ -607,7 +622,7 @@ func (s *congestionControl) onNewCongestionEvent(sentTime, now time.Time) {
 	// start of the previous congestion recovery period.
 	if !s.inRecovery(sentTime) {
 		s.recoveryStartTime = now
-		s.congestionWindow = uint64(float64(s.congestionWindow) * lossReductionFactor)
+		s.congestionWindow = s.congestionWindow / lossReductionFactor
 		if s.congestionWindow < minimumWindow {
 			s.congestionWindow = minimumWindow
 		}

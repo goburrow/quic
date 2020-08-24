@@ -65,12 +65,7 @@ func TestServerAndClient(t *testing.T) {
 			t.Errorf("server close: %v", err)
 		}
 	}()
-	go func() {
-		err := s.Serve()
-		if err != nil {
-			t.Logf("server serve: %v", err)
-		}
-	}()
+	go s.Serve()
 	recvData := make(chan []byte, 1)
 	c := newClient()
 	c.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {

@@ -10,17 +10,29 @@ import (
 // Supported log events
 // https://quiclog.github.io/internet-drafts/draft-marx-qlog-event-definitions-quic-h3.html
 const (
-	logEventConnectionStateUpdated = "connection_state_updated"
-	logEventMetricsUpdated         = "metrics_updated"
-
+	// Packet
 	logEventPacketReceived  = "packet_received"
 	logEventPacketSent      = "packet_sent"
 	logEventPacketDropped   = "packet_dropped"
 	logEventPacketLost      = "packet_lost"
 	logEventFramesProcessed = "frames_processed"
-	logEventParametersSet   = "parameters_set"
-
+	// Stream
 	logEventStreamStateUpdated = "stream_state_updated"
+
+	// Recovery
+	logEventParametersSet    = "parameters_set"
+	logEventMetricsUpdated   = "metrics_updated"
+	logEventStateUpdated     = "connection_state_updated"
+	logEventLossTimerUpdated = "loss_timer_updated"
+)
+
+const (
+	logTriggerKeyUnavailable      = "key_unavailable"
+	logTriggerUnknownConnectionID = "unknown_connection_id"
+	logTriggerHeaderDecryptError  = "header_decrypt_error"
+	logTriggerPayloadDecryptError = "payload_decrypt_error"
+	logTriggerUnexpectedPacket    = "unexpected_packet"
+	logTriggerDuplicate           = "duplicate"
 )
 
 // LogEvent is event sent by connection
@@ -43,6 +55,10 @@ func newLogEvent(tm time.Time, tp string) LogEvent {
 // Only limited types of v are supported.
 func (s *LogEvent) addField(k string, v interface{}) {
 	s.Fields = append(s.Fields, newLogField(k, v))
+}
+
+func (s *LogEvent) resetFields() {
+	s.Fields = s.Fields[:0]
 }
 
 func (s LogEvent) String() string {
@@ -138,20 +154,12 @@ func (s LogField) String() string {
 
 // Log connection state
 
-func newLogEventConnectionState(tm time.Time, old, new connectionState) LogEvent {
-	e := newLogEvent(tm, logEventConnectionStateUpdated)
+func logConnectionState(e *LogEvent, old, new ConnectionState) {
 	e.addField("old", old.String())
 	e.addField("new", new.String())
-	return e
 }
 
 // Log packets
-
-func newLogEventPacket(tm time.Time, tp string, p *packet) LogEvent {
-	e := newLogEvent(tm, tp)
-	logPacket(&e, p)
-	return e
-}
 
 func logPacket(e *LogEvent, s *packet) {
 	e.addField("packet_type", s.typ.String())
@@ -181,14 +189,12 @@ func logPacket(e *LogEvent, s *packet) {
 	}
 }
 
-func newLogEventParametersSet(tm time.Time, p *Parameters) LogEvent {
-	e := newLogEvent(tm, logEventParametersSet)
-	e.addField("owner", "remote") // Log peer's parameters only
-	logParameters(&e, p)
-	return e
+func logTrigger(e *LogEvent, trigger string) {
+	e.addField("trigger", trigger)
 }
 
 func logParameters(e *LogEvent, p *Parameters) {
+	e.addField("owner", "remote") // Log peer's parameters only
 	if len(p.OriginalDestinationCID) > 0 {
 		e.addField("original_connection_id", p.OriginalDestinationCID)
 	}
@@ -241,43 +247,51 @@ func logParameters(e *LogEvent, p *Parameters) {
 
 // Log frames
 
-func newLogEventFrame(tm time.Time, tp string, f frame) LogEvent {
-	e := newLogEvent(tm, tp)
+func logFrame(e *LogEvent, f frame) {
 	switch f := f.(type) {
 	case *paddingFrame:
-		logFramePadding(&e, f)
+		logFramePadding(e, f)
 	case *pingFrame:
-		logFramePing(&e, f)
+		logFramePing(e, f)
 	case *ackFrame:
-		logFrameAck(&e, f)
+		logFrameAck(e, f)
 	case *resetStreamFrame:
-		logFrameResetStream(&e, f)
+		logFrameResetStream(e, f)
 	case *stopSendingFrame:
-		logFrameStopSending(&e, f)
+		logFrameStopSending(e, f)
 	case *cryptoFrame:
-		logFrameCrypto(&e, f)
+		logFrameCrypto(e, f)
 	case *newTokenFrame:
-		logFrameNewToken(&e, f)
+		logFrameNewToken(e, f)
 	case *streamFrame:
-		logFrameStream(&e, f)
+		logFrameStream(e, f)
 	case *maxDataFrame:
-		logFrameMaxData(&e, f)
+		logFrameMaxData(e, f)
 	case *maxStreamDataFrame:
-		logFrameMaxStreamData(&e, f)
+		logFrameMaxStreamData(e, f)
 	case *maxStreamsFrame:
-		logFrameMaxStreams(&e, f)
+		logFrameMaxStreams(e, f)
 	case *dataBlockedFrame:
-		logFrameDataBlocked(&e, f)
+		logFrameDataBlocked(e, f)
 	case *streamDataBlockedFrame:
-		logFrameStreamDataBlocked(&e, f)
+		logFrameStreamDataBlocked(e, f)
 	case *streamsBlockedFrame:
-		logFrameStreamsBlocked(&e, f)
+		logFrameStreamsBlocked(e, f)
+	case *newConnectionIDFrame:
+		logFrameNewConnectionID(e, f)
+	case *retireConnectionIDFrame:
+		logFrameRetireConnectionID(e, f)
+	case *pathChallengeFrame:
+		logFramePathChallenge(e, f)
+	case *pathResponseFrame:
+		logFramePathResponse(e, f)
 	case *connectionCloseFrame:
-		logFrameConnectionClose(&e, f)
+		logFrameConnectionClose(e, f)
 	case *handshakeDoneFrame:
-		logFrameHandshakeDone(&e, f)
+		logFrameHandshakeDone(e, f)
+	case *datagramFrame:
+		logFrameDatagram(e, f)
 	}
-	return e
 }
 
 func logFramePadding(e *LogEvent, s *paddingFrame) {
@@ -292,6 +306,11 @@ func logFrameAck(e *LogEvent, s *ackFrame) {
 	e.addField("frame_type", "ack")
 	e.addField("ack_delay", s.ackDelay)
 	e.addField("acked_ranges", s.toRangeSet())
+	if s.ecnCounts != nil {
+		e.addField("ect0", s.ecnCounts.ect0Count)
+		e.addField("ect1", s.ecnCounts.ect1Count)
+		e.addField("ce", s.ecnCounts.ceCount)
+	}
 }
 
 func logFrameResetStream(e *LogEvent, s *resetStreamFrame) {
@@ -368,6 +387,29 @@ func logFrameStreamsBlocked(e *LogEvent, s *streamsBlockedFrame) {
 	e.addField("limit", s.streamLimit)
 }
 
+func logFrameNewConnectionID(e *LogEvent, s *newConnectionIDFrame) {
+	e.addField("frame_type", "new_connection_id")
+	e.addField("sequence_number", s.sequenceNumber)
+	e.addField("retire_prior_to", s.retirePriorTo)
+	e.addField("connection_id", s.connectionID)
+	e.addField("stateless_reset_token", s.statelessResetToken)
+}
+
+func logFrameRetireConnectionID(e *LogEvent, s *retireConnectionIDFrame) {
+	e.addField("frame_type", "retire_connection_id")
+	e.addField("sequence_number", s.sequenceNumber)
+}
+
+func logFramePathChallenge(e *LogEvent, s *pathChallengeFrame) {
+	e.addField("frame_type", "path_challenge")
+	e.addField("data", s.data)
+}
+
+func logFramePathResponse(e *LogEvent, s *pathResponseFrame) {
+	e.addField("frame_type", "path_response")
+	e.addField("data", s.data)
+}
+
 func logFrameConnectionClose(e *LogEvent, s *connectionCloseFrame) {
 	e.addField("frame_type", "connection_close")
 	if s.application {
@@ -387,19 +429,12 @@ func logFrameHandshakeDone(e *LogEvent, s *handshakeDoneFrame) {
 	e.addField("frame_type", "handshake_done")
 }
 
-// Recovery
-
-func newLogEventRecovery(tm time.Time, recovery *lossRecovery) LogEvent {
-	e := newLogEvent(tm, logEventMetricsUpdated)
-	// XXX: Move this to logRecovery?
-	if recovery.lossDetectionTimer.IsZero() || recovery.lossDetectionTimer.Before(tm) {
-		e.addField("loss_timer", "0")
-	} else {
-		e.addField("loss_timer", recovery.lossDetectionTimer.Sub(tm))
-	}
-	logRecovery(&e, recovery)
-	return e
+func logFrameDatagram(e *LogEvent, s *datagramFrame) {
+	e.addField("frame_type", "datagram")
+	e.addField("length", len(s.data))
 }
+
+// Recovery
 
 func logRecovery(e *LogEvent, s *lossRecovery) {
 	// Loss detection
@@ -413,9 +448,19 @@ func logRecovery(e *LogEvent, s *lossRecovery) {
 	e.addField("bytes_in_flight", s.congestion.bytesInFlight)
 }
 
-func newLogEventStreamClosed(tm time.Time, id uint64) LogEvent {
-	e := newLogEvent(tm, logEventStreamStateUpdated)
+func logLossTimer(e *LogEvent, s *lossRecovery) {
+	if s.lossDetectionTimer.IsZero() {
+		e.addField("event_type", "cancelled")
+	} else if s.lossDetectionTimer.Before(e.Time) {
+		e.addField("event_type", "set")
+		e.addField("delta", "0")
+	} else {
+		e.addField("event_type", "set")
+		e.addField("delta", s.lossDetectionTimer.Sub(e.Time))
+	}
+}
+
+func logStreamClosed(e *LogEvent, id uint64) {
 	e.addField("stream_id", id)
 	e.addField("new", "closed")
-	return e
 }

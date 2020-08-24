@@ -7,6 +7,8 @@ import (
 
 const (
 	maxStreams = 1 << 60
+	// Minimum remaining data in sending buffer that application is notified writable stream.
+	minStreamBufferWritable = 8192
 )
 
 type deliveryState uint8
@@ -129,7 +131,7 @@ func (s *Stream) resetRecv(finalSize uint64) error {
 func (s *Stream) isWritable() bool {
 	// XXX: To avoid over buffer, we only tell application to fill the send buffer
 	// when there is only some data left (8KB) to send.
-	return !s.send.stopReceived && !s.send.fin && s.flow.canSend() > 0 && s.send.buf.size() < 8192
+	return !s.send.stopReceived && !s.send.fin && s.flow.canSend() > 0 && s.send.buf.size() < minStreamBufferWritable
 }
 
 // isFlushable returns true if the stream has data and is allowed to send.
@@ -221,10 +223,6 @@ func (s *Stream) Close() error {
 		s.send.fin = true
 	}
 	return nil
-}
-
-func (s *Stream) String() string {
-	return fmt.Sprintf("recv{%s} send{%s}", &s.recv, &s.send)
 }
 
 // recvStream is buffer for receiving data.

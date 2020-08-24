@@ -108,6 +108,30 @@ func TestFrameAckContinuous(t *testing.T) {
 	}
 }
 
+func TestFrameAckECN(t *testing.T) {
+	f := &ackFrame{
+		largestAck:    0x1234,
+		ackDelay:      0x3456,
+		firstAckRange: 0x78,
+		ackRanges: []ackRange{
+			{
+				gap:      1,
+				ackRange: 2,
+			},
+			{
+				gap:      3,
+				ackRange: 4,
+			},
+		},
+		ecnCounts: &ecnCounts{
+			ect0Count: 1,
+			ect1Count: 2,
+			ceCount:   3,
+		},
+	}
+	testFrame(t, f, "035234745602407801020304010203")
+}
+
 func TestFrameConnectionClose(t *testing.T) {
 	f := &connectionCloseFrame{
 		errorCode:    0x5678,
@@ -222,9 +246,80 @@ func TestFrameStreamsBlocked(t *testing.T) {
 	testFrame(t, f, "165234")
 }
 
+func TestFrameNewConnectionID(t *testing.T) {
+	f := &newConnectionIDFrame{
+		sequenceNumber:      0x1234,
+		retirePriorTo:       0,
+		connectionID:        []byte{1, 2},
+		statelessResetToken: []byte("1234567890123456"),
+	}
+	testFrame(t, f, "1852340002010231323334353637383930313233343536")
+
+	b := make([]byte, 100)
+	f.connectionID = b[:MaxCIDLength+1]
+	n, err := f.encode(b)
+	if err == nil || err.Error() != "frame_encoding_error new_connection_id" {
+		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
+	}
+	f.connectionID = b[:1]
+	f.statelessResetToken = b[:15]
+	n, err = f.encode(b)
+	if err == nil || err.Error() != "frame_encoding_error new_connection_id" {
+		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
+	}
+}
+
+func TestFrameRetireConnectionID(t *testing.T) {
+	f := &retireConnectionIDFrame{
+		sequenceNumber: 0x1234,
+	}
+	testFrame(t, f, "195234")
+}
+
+func TestFramePathChallenge(t *testing.T) {
+	f := &pathChallengeFrame{
+		data: []byte("12345678"),
+	}
+	testFrame(t, f, "1a3132333435363738")
+	b := make([]byte, 100)
+	f.data = b[:7]
+	n, err := f.encode(b)
+	if err == nil || err.Error() != "frame_encoding_error path_challenge" {
+		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
+	}
+}
+
+func TestFramePathResponse(t *testing.T) {
+	f := &pathResponseFrame{
+		data: []byte("12345678"),
+	}
+	testFrame(t, f, "1b3132333435363738")
+	b := make([]byte, 100)
+	f.data = b[:9]
+	n, err := f.encode(b)
+	if err == nil || err.Error() != "frame_encoding_error path_response" {
+		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
+	}
+}
+
 func TestFrameHandshakeDone(t *testing.T) {
 	f := &handshakeDoneFrame{}
 	testFrame(t, f, "1e")
+}
+
+func TestFrameDatagram(t *testing.T) {
+	f := &datagramFrame{
+		data: []byte("12345"),
+	}
+	testFrame(t, f, "31053132333435")
+	// Decode without length
+	n, err := f.decode([]byte{0x30, 0x31, 0x32, 0x33})
+	if err != nil || n != 4 {
+		t.Fatalf("decode %v %v", n, err)
+	}
+	if string(f.data) != "123" {
+		t.Fatalf("expect data %s, actual %s", "123", f.data)
+	}
 }
 
 func TestFuzzFrame(t *testing.T) {
@@ -251,6 +346,10 @@ func TestFuzzFrame(t *testing.T) {
 		&dataBlockedFrame{},
 		&streamDataBlockedFrame{},
 		&streamsBlockedFrame{},
+		&newConnectionIDFrame{},
+		&retireConnectionIDFrame{},
+		&pathChallengeFrame{},
+		&pathResponseFrame{},
 		&connectionCloseFrame{},
 		&handshakeDoneFrame{},
 	}
@@ -268,7 +367,7 @@ func TestFuzzFrame(t *testing.T) {
 						// Stream frame always include length, so encoded length may be greater than decoded length.
 						continue
 					}
-					t.Fatalf("could not encode decoded frame: %v: %v\n%x", f, err, b)
+					t.Fatalf("could not encode decoded frame: %#v: %v\n%x", f, err, b)
 				}
 			}
 		}

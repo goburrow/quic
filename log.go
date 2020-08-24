@@ -62,11 +62,11 @@ func (s *logger) attachLogger(c *Conn) {
 		writer: s, // Write protected
 		prefix: fmt.Sprintf("cid=%x", c.scid),
 	}
-	c.conn.OnLogEvent(tl.logEvent)
+	c.conn.SetLogger(tl.logEvent)
 }
 
 func (s *logger) detachLogger(c *Conn) {
-	c.conn.OnLogEvent(nil)
+	c.conn.SetLogger(nil)
 }
 
 type transactionLogger struct {

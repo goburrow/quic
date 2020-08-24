@@ -136,6 +136,28 @@ func TestStreamSend(t *testing.T) {
 	}
 }
 
+func TestStreamRecvEOF(t *testing.T) {
+	s := Stream{}
+	s.init(true, true)
+	s.flow.init(10, 10)
+
+	s.pushRecv(nil, 10, true)
+	b := make([]byte, 100)
+	n, err := s.Read(b)
+	if err != nil || n != 0 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
+	}
+	s.pushRecv(b[:10], 0, false)
+	n, err = s.Read(b)
+	if err != nil || n != 10 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
+	}
+	n, err = s.Read(b)
+	if err != io.EOF || n != 0 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
+	}
+}
+
 func TestStreamCloseWriteBidi(t *testing.T) {
 	s := Stream{}
 	s.init(true, true)

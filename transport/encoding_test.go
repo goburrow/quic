@@ -34,14 +34,13 @@ func TestCodecDecode(t *testing.T) {
 	x.assertOffset(13)
 	x.assertLen(len(b) - 13)
 
-	v = x.c.read(3)
-	if !bytes.Equal(v, b[13:16]) {
+	if !x.c.read(&v, 3) || !bytes.Equal(v, b[13:16]) {
 		t.Fatalf("read: %x, actual: %x", v, b[13:16])
 	}
 	x.assertOffset(16)
 	x.assertLen(len(b) - 16)
 
-	if x.c.read(2) != nil || x.c.readByte(&v8) || x.c.readUint32(&v32) || x.c.readVarint(&v64) {
+	if x.c.read(&v, 2) || x.c.readByte(&v8) || x.c.readUint32(&v32) || x.c.readVarint(&v64) {
 		t.Fatal("read should fail")
 	}
 }

@@ -10,14 +10,24 @@ import (
 	"github.com/goburrow/quic/qlog"
 )
 
-func qlogCommand(args []string) error {
+type qlogCommand struct{}
+
+func (qlogCommand) Name() string {
+	return "qlog"
+}
+
+func (qlogCommand) Desc() string {
+	return "transform quiwi logs to qlog format."
+}
+
+func (qlogCommand) Run(args []string) error {
 	cmd := flag.NewFlagSet("qlog", flag.ExitOnError)
 	pretty := cmd.Bool("pretty", false, "pretty print json")
 	cmd.Parse(args)
 
 	name := cmd.Arg(0)
 	if name == "" {
-		fmt.Fprintln(cmd.Output(), "Usage: quiwi qlog [options] <file>")
+		fmt.Fprintln(cmd.Output(), "Usage: quiwi qlog [arguments] <file>")
 		cmd.PrintDefaults()
 		return nil
 	}

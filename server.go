@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -82,7 +83,7 @@ func (s *Server) Serve() error {
 }
 
 func (s *Server) recv(p *packet) {
-	_, err := p.header.Decode(p.data, transport.MaxCIDLength)
+	_, err := p.header.Decode(p.data, cidLength)
 	if err != nil {
 		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error message=%v", p.addr, len(p.data), err)
 		freePacket(p)
@@ -95,11 +96,9 @@ func (s *Server) recv(p *packet) {
 		freePacket(p)
 		return
 	}
-	var c *Conn
-	if len(p.header.DCID) > 0 {
-		c = s.peers[string(p.header.DCID)]
-	} else {
-		c = s.peersAddr[p.addr.String()]
+	c := s.peers[string(p.header.DCID)]
+	if c == nil {
+		c = s.peers[string(s.attemptKey(p.addr, p.header.DCID))]
 	}
 	s.peersMu.RUnlock()
 	if c == nil {
@@ -142,12 +141,12 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	p := newPacket()
 	defer freePacket(p)
 	// newCID is a new DCID client should send in next Initial packet
-	var newCID [transport.MaxCIDLength]byte
+	var newCID [cidLength]byte
 	if err := s.rand(newCID[:]); err != nil {
 		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
 		return
 	}
-	token := s.addrValid.Generate(addr, h.DCID)
+	token := s.addrValid.GenerateToken(addr, h.DCID)
 	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
 	if err != nil {
 		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
@@ -163,7 +162,7 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 }
 
 func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
-	return s.addrValid.Validate(addr, token)
+	return s.addrValid.ValidateToken(addr, token)
 }
 
 // handleNewConn creates a new connection and handles packets sent to this connection.
@@ -181,17 +180,21 @@ func (s *Server) handleNewConn(p *packet) {
 		}
 		odcid = s.verifyToken(p.addr, p.header.Token)
 		if len(odcid) == 0 {
-			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=invalid_token", p.addr, &p.header)
+			s.logger.log(levelInfo, "packet_dropped addr=%s %s trigger=invalid_token", p.addr, &p.header)
 			freePacket(p)
 			return
 		}
 	}
-	c, err := s.newConn(p.addr, p.header.DCID, odcid)
+	c, err := s.newConn(p.addr, odcid)
 	if err != nil {
-		s.logger.log(levelError, "internal_error addr=%s %s description=create_connection_failed: %v", p.addr, &p.header, err)
+		s.logger.log(levelError, "packet_dropped addr=%s %s trigger=create_connection_failed message=%v", p.addr, &p.header, err)
 		freePacket(p)
 		return
 	}
+	if len(odcid) == 0 {
+		odcid = p.header.DCID
+	}
+	c.attemptKey = s.attemptKey(p.addr, odcid)
 	s.peersMu.Lock()
 	if s.closing {
 		// Do not create a new handler when server is closing
@@ -199,31 +202,35 @@ func (s *Server) handleNewConn(p *packet) {
 		freePacket(p)
 		return
 	}
-	if _, ok := s.peers[string(c.scid[:])]; ok {
-		// Is that server too slow that client resent the packet? Log it as Error for now.
+	if ec := s.peers[string(c.scid[:])]; ec != nil {
+		// scid is randomly generated, but possible clash. Drop packet for now.
 		s.peersMu.Unlock()
-		s.logger.log(levelError, "internal_error addr=%s cid=%x description=create_connection_failed: cid conflict", p.addr, c.scid)
+		s.logger.log(levelError, "packet_dropped addr=%s %s trigger=create_connection_failed message=generated cid conflict", p.addr, &p.header)
 		freePacket(p)
 		return
 	}
+	if ec := s.peers[string(c.attemptKey)]; ec != nil {
+		// Client may send multiple initial packets, discard the new connection and reuse the one already created.
+		s.peersMu.Unlock()
+		s.logger.log(levelInfo, "info addr=%s cid=%x odcid=%x message=found connection from initial attempt key, discard new connection",
+			p.addr, c.scid, odcid)
+		ec.recvCh <- p
+		return
+	}
 	s.peers[string(c.scid[:])] = c
-	s.peersAddr[c.addr.String()] = c
+	s.peers[string(c.attemptKey)] = c
 	s.peersMu.Unlock()
 	s.logger.log(levelInfo, "connection_started addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
 	c.recvCh <- p // Buffered channel
 	s.handleConn(c)
 }
 
-func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
-	scid := make([]byte, transport.MaxCIDLength)
-	if len(scid) == len(oscid) {
-		copy(scid, oscid)
-	} else {
-		// Generate id for new connection since short packets don't include CID length so
-		// we use MaxCIDLength for all connections
-		if err := s.rand(scid); err != nil {
-			return nil, err
-		}
+func (s *Server) newConn(addr net.Addr, odcid []byte) (*Conn, error) {
+	// Generate id for new connection since short packets don't include CID length so
+	// we use MaxCIDLength for all connections
+	scid := make([]byte, cidLength)
+	if err := s.rand(scid); err != nil {
+		return nil, err
 	}
 	conn, err := transport.Accept(scid, odcid, s.config)
 	if err != nil {
@@ -235,6 +242,15 @@ func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
 	c.nextStreamIDUni++
 	s.logger.attachLogger(c)
 	return c, nil
+}
+
+// attemptKey generates an initial attempt key from a request.
+// This is to find right connection for multiple initial packets.
+func (s *Server) attemptKey(addr net.Addr, cid []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(addr.String()))
+	h.Write(cid)
+	return h.Sum(nil)
 }
 
 // Close sends Close frame to all connected clients and closes the socket given in Serve.
@@ -252,11 +268,11 @@ func (s *Server) Close() error {
 // AddressValidator generates and validates server retry token.
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#token-integrity
 type AddressValidator interface {
-	// Generate creates a new token from given addr and odcid.
-	Generate(addr net.Addr, odcid []byte) []byte
-	// Validate returns odcid when the address and token pair is valid,
+	// GenerateToken creates a new token from given addr and odcid.
+	GenerateToken(addr net.Addr, odcid []byte) []byte
+	// ValidateToken returns odcid when the address and token pair is valid,
 	// empty slice otherwise.
-	Validate(addr net.Addr, token []byte) []byte
+	ValidateToken(addr net.Addr, token []byte) []byte
 }
 
 // NewAddressValidator returns a simple implementation of AddressValidator.
@@ -306,7 +322,7 @@ func newAddressValidator() (*addressValidator, error) {
 }
 
 // Generate encrypts odcid using current time as nonce and addr as additional data.
-func (s *addressValidator) Generate(addr net.Addr, odcid []byte) []byte {
+func (s *addressValidator) GenerateToken(addr net.Addr, odcid []byte) []byte {
 	now := s.timeFn().Unix()
 	nonce := make([]byte, len(s.nonce))
 	binary.BigEndian.PutUint32(nonce, uint32(now))
@@ -319,7 +335,7 @@ func (s *addressValidator) Generate(addr net.Addr, odcid []byte) []byte {
 }
 
 // Validate decrypts token and returns odcid.
-func (s *addressValidator) Validate(addr net.Addr, token []byte) []byte {
+func (s *addressValidator) ValidateToken(addr net.Addr, token []byte) []byte {
 	if len(token) < 4 {
 		return nil
 	}

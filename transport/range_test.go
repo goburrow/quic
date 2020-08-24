@@ -251,10 +251,12 @@ func TestRangeBufferPop(t *testing.T) {
 func BenchmarkRangeBuffer(b *testing.B) {
 	b.ReportAllocs()
 	ls := rangeBufferList{}
-	data := make([]byte, 100)
+	data := make([]byte, 1000)
 	for i := 0; i < b.N; i++ {
 		ls.write(data, 0)
+		ls.write(data, uint64(len(data)))
 		ls.read(data, 0)
+		ls.read(data, uint64(len(data)))
 	}
 }
 

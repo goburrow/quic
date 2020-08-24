@@ -77,10 +77,17 @@ func newError(code uint64, msg string) *Error {
 }
 
 var (
+	// ErrPacketDropped is an error returned when received packet is dropped
+	// due to invalid or corrupted.
+	ErrPacketDropped = errors.New("packet dropped")
+	// ErrKeysUnavailable is an error returned when received packet can not
+	// be processed currently because encryption keys are unavailable.
+	ErrKeysUnavailable = errors.New("keys unavailable")
+
 	errFinalSize     = newError(FinalSizeError, "")
 	errInvalidPacket = newError(FrameEncodingError, "invalid packet")
 
-	errShortBuffer = errors.New("ShortBuffer")
+	errShortBuffer = errors.New("short buffer")
 )
 
 // sprint is simpler version fmt.Sprint but does not cause values escaping to heaps.

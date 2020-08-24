@@ -30,23 +30,38 @@ case "$TESTCASE" in
 esac
 
 run_client() {
-    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -qlog "$QLOGDIR/client.qlog" -v 3"
-    if [ "$TESTCASE" == chacha20 ]; then
+    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3"
+    case "$TESTCASE" in
+    multiconnect)
+        # Create multiple connections
+        for REQ in $REQUESTS; do
+            NAME="$(basename $REQ)"
+            PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client-$NAME.qlog"
+            echo "# CLIENT_PARAMS: $PARAMS"
+            "$APPDIR/quiwi" client $PARAMS "$REQ" 2>>"$LOGDIR/client.txt" &
+            sleep 2
+        done
+        wait
+        return
+        ;;
+    chacha20)
         CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256"
-    fi
-    cd "$APPDIR"
-    echo "# CLIENT_PARAMS:" "$CLIENT_PARAMS"
-    ./quiwi client $CLIENT_PARAMS $REQUESTS 2>"$LOGDIR/client.txt"
+        ;;
+    esac
+    CLIENT_PARAMS="$CLIENT_PARAMS $QLOGDIR/client.qlog"
+    echo "# CLIENT_PARAMS: $CLIENT_PARAMS"
+    "$APPDIR/quiwi" client $CLIENT_PARAMS $REQUESTS 2>"$LOGDIR/client.txt"
 }
 
 run_server() {
-    SERVER_PARAMS="$SERVER_PARAMS -listen 0.0.0.0:443 -cert cert.pem -key key.pem -root $WWWDIR -qlog "$QLOGDIR/server.qlog" -v 3"
-    if [ "$TESTCASE" == retry ]; then
+    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert $APPDIR/cert.pem -key $APPDIR/key.pem -root $WWWDIR -qlog $QLOGDIR/server.qlog -v 3"
+    case "$TESTCASE" in
+    retry)
         SERVER_PARAMS="$SERVER_PARAMS -retry"
-    fi
-    cd "$APPDIR"
-    echo "# SERVER_PARAMS:" "$SERVER_PARAMS"
-    ./quiwi server $SERVER_PARAMS 2>"$LOGDIR/server.txt"
+        ;;
+    esac
+    echo "# SERVER_PARAMS: $SERVER_PARAMS"
+    "$APPDIR/quiwi" server $SERVER_PARAMS 2>"$LOGDIR/server.txt"
     # FIXME: no qlog transformation as the script is terminated
 }
 

@@ -344,6 +344,27 @@ func TestConnRecvStopSending(t *testing.T) {
 	}
 }
 
+func TestConnRecvPathChallenge(t *testing.T) {
+	conn, err := Accept([]byte("server"), nil, NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := pathChallengeFrame{
+		data: []byte("12345678"),
+	}
+	_, err = conn.recvFramePathChallenge(encodeFrame(&f), testTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rf := conn.sendFramePathResponse()
+	if rf == nil {
+		t.Fatalf("expect path response frame, actual %v", rf)
+	}
+	if string(rf.data) != "12345678" {
+		t.Fatalf("expect response with same challenge, actual %v", rf)
+	}
+}
+
 func newTestConn() (*testEndpoint, error) {
 	clientCID := []byte("client-cid")
 	clientConfig := newTestConfig()
@@ -444,7 +465,7 @@ func (t *testEndpoint) retry() error {
 
 func (t *testEndpoint) handshake() error {
 	start := time.Now()
-	for !t.client.IsEstablished() || !t.server.IsEstablished() {
+	for t.client.ConnectionState() != StateActive || t.server.ConnectionState() != StateActive {
 		n, err := t.client.Read(t.buf[:])
 		if err != nil {
 			return err

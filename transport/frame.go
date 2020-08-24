@@ -6,6 +6,7 @@ const (
 	frameTypePadding     = 0x00
 	frameTypePing        = 0x01
 	frameTypeAck         = 0x02
+	frameTypeAckECN      = 0x03
 	frameTypeResetStream = 0x04
 	frameTypeStopSending = 0x05
 	frameTypeCrypto      = 0x06
@@ -22,15 +23,24 @@ const (
 	frameTypeStreamsBlockedBidi = 0x16
 	frameTypeStreamsBlockedUni  = 0x17
 
+	frameTypeNewConnectionID    = 0x18
+	frameTypeRetireConnectionID = 0x19
+	frameTypePathChallenge      = 0x1a
+	frameTypePathResponse       = 0x1b
+
 	frameTypeConnectionClose  = 0x1c
 	frameTypeApplicationClose = 0x1d
 	frameTypeHanshakeDone     = 0x1e
+
+	frameTypeDatagram           = 0x30
+	frameTypeDatagramWithLength = 0x31
 )
 
 const (
-	maxCryptoFrameOverhead = 8
-	maxStreamFrameOverhead = 12
-	maxAckRanges           = 1024
+	maxCryptoFrameOverhead   = 9  // type + offset + length
+	maxStreamFrameOverhead   = 13 // type + id + offset + length
+	maxDatagramFrameOverhead = 5  // type + length
+	maxAckRanges             = 1024
 )
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#frames
@@ -99,6 +109,13 @@ func (s *pingFrame) String() string {
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#frame-crypto
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                          Offset (i)                         ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                          Length (i)                         ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                        Crypto Data (*)                      ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 type cryptoFrame struct {
 	offset uint64
 	data   []byte
@@ -120,10 +137,11 @@ func (s *cryptoFrame) encodedLen() int {
 
 func (s *cryptoFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeCrypto) ||
-		!enc.writeVarint(s.offset) ||
-		!enc.writeVarint(uint64(len(s.data))) ||
-		!enc.write(s.data) {
+	ok := enc.writeByte(frameTypeCrypto) &&
+		enc.writeVarint(s.offset) &&
+		enc.writeVarint(uint64(len(s.data))) &&
+		enc.write(s.data)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -132,12 +150,11 @@ func (s *cryptoFrame) encode(b []byte) (int, error) {
 func (s *cryptoFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	var length uint64
-	if !dec.skip(1) || // skip frame type
-		!dec.readVarint(&s.offset) ||
-		!dec.readVarint(&length) {
-		return 0, newError(FrameEncodingError, "crypto")
-	}
-	if s.data = dec.read(int(length)); s.data == nil {
+	ok := dec.skip(1) && // skip frame type
+		dec.readVarint(&s.offset) &&
+		dec.readVarint(&length) &&
+		dec.read(&s.data, int(length))
+	if !ok {
 		return 0, newError(FrameEncodingError, "crypto")
 	}
 	return dec.offset(), nil
@@ -173,7 +190,13 @@ type ackFrame struct {
 	ackDelay      uint64 // Time in microseconds since when the largest acknowledged packet
 	firstAckRange uint64 // Number of contiguous packets preceding the largest acknowledged
 	ackRanges     []ackRange
-	// TODO: ECN
+	ecnCounts     *ecnCounts
+}
+
+type ecnCounts struct {
+	ect0Count uint64
+	ect1Count uint64
+	ceCount   uint64
 }
 
 func newAckFrame(ackDelay uint64, r rangeSet) *ackFrame {
@@ -193,20 +216,39 @@ func (s *ackFrame) encodedLen() int {
 	for _, r := range s.ackRanges {
 		n += varintLen(r.gap) + varintLen(r.ackRange)
 	}
+	if s.ecnCounts != nil {
+		n += varintLen(s.ecnCounts.ect0Count) + varintLen(s.ecnCounts.ect1Count) + varintLen(s.ecnCounts.ceCount)
+	}
 	return n
 }
 
 func (s *ackFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeAck) ||
-		!enc.writeVarint(s.largestAck) ||
-		!enc.writeVarint(s.ackDelay) ||
-		!enc.writeVarint(uint64(len(s.ackRanges))) ||
-		!enc.writeVarint(s.firstAckRange) {
+	var typ uint8
+	if s.ecnCounts == nil {
+		typ = frameTypeAck
+	} else {
+		typ = frameTypeAckECN
+	}
+	ok := enc.writeByte(typ) &&
+		enc.writeVarint(s.largestAck) &&
+		enc.writeVarint(s.ackDelay) &&
+		enc.writeVarint(uint64(len(s.ackRanges))) &&
+		enc.writeVarint(s.firstAckRange)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	for _, r := range s.ackRanges {
-		if !enc.writeVarint(r.gap) || !enc.writeVarint(r.ackRange) {
+		ok = enc.writeVarint(r.gap) && enc.writeVarint(r.ackRange)
+		if !ok {
+			return 0, errShortBuffer
+		}
+	}
+	if s.ecnCounts != nil {
+		ok = enc.writeVarint(s.ecnCounts.ect0Count) &&
+			enc.writeVarint(s.ecnCounts.ect1Count) &&
+			enc.writeVarint(s.ecnCounts.ceCount)
+		if !ok {
 			return 0, errShortBuffer
 		}
 	}
@@ -215,25 +257,39 @@ func (s *ackFrame) encode(b []byte) (int, error) {
 
 func (s *ackFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
+	var typ uint8
 	var rangeCount uint64
-	if !dec.skip(1) || // skip frame type
-		!dec.readVarint(&s.largestAck) ||
-		!dec.readVarint(&s.ackDelay) ||
-		!dec.readVarint(&rangeCount) ||
-		!dec.readVarint(&s.firstAckRange) ||
-		rangeCount > maxAckRanges {
+	ok := dec.readByte(&typ) &&
+		dec.readVarint(&s.largestAck) &&
+		dec.readVarint(&s.ackDelay) &&
+		dec.readVarint(&rangeCount) &&
+		dec.readVarint(&s.firstAckRange)
+	if !ok || rangeCount > maxAckRanges {
 		return 0, newError(FrameEncodingError, "ack")
 	}
 	if rangeCount > 0 {
 		s.ackRanges = make([]ackRange, int(rangeCount))
 		for i := range s.ackRanges {
 			r := &s.ackRanges[i]
-			if !dec.readVarint(&r.gap) || !dec.readVarint(&r.ackRange) {
+			ok = dec.readVarint(&r.gap) && dec.readVarint(&r.ackRange)
+			if !ok {
 				return 0, newError(FrameEncodingError, "ack")
 			}
 		}
 	} else {
 		s.ackRanges = nil
+	}
+	if typ == frameTypeAckECN {
+		counts := ecnCounts{}
+		ok := dec.readVarint(&counts.ect0Count) &&
+			dec.readVarint(&counts.ect1Count) &&
+			dec.readVarint(&counts.ceCount)
+		if !ok {
+			return 0, newError(FrameEncodingError, "ack")
+		}
+		s.ecnCounts = &counts
+	} else {
+		s.ecnCounts = nil
 	}
 	return dec.offset(), nil
 }
@@ -333,10 +389,11 @@ func (s *resetStreamFrame) encodedLen() int {
 
 func (s *resetStreamFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeResetStream) ||
-		!enc.writeVarint(s.streamID) ||
-		!enc.writeVarint(s.errorCode) ||
-		!enc.writeVarint(s.finalSize) {
+	ok := enc.writeByte(frameTypeResetStream) &&
+		enc.writeVarint(s.streamID) &&
+		enc.writeVarint(s.errorCode) &&
+		enc.writeVarint(s.finalSize)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -344,10 +401,11 @@ func (s *resetStreamFrame) encode(b []byte) (int, error) {
 
 func (s *resetStreamFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&s.streamID) ||
-		!dec.readVarint(&s.errorCode) ||
-		!dec.readVarint(&s.finalSize) {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.streamID) &&
+		dec.readVarint(&s.errorCode) &&
+		dec.readVarint(&s.finalSize)
+	if !ok {
 		return 0, newError(FrameEncodingError, "reset_stream")
 	}
 	return dec.offset(), nil
@@ -375,9 +433,10 @@ func (s *stopSendingFrame) encodedLen() int {
 
 func (s *stopSendingFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeStopSending) ||
-		!enc.writeVarint(s.streamID) ||
-		!enc.writeVarint(s.errorCode) {
+	ok := enc.writeByte(frameTypeStopSending) &&
+		enc.writeVarint(s.streamID) &&
+		enc.writeVarint(s.errorCode)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -385,9 +444,10 @@ func (s *stopSendingFrame) encode(b []byte) (int, error) {
 
 func (s *stopSendingFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&s.streamID) ||
-		!dec.readVarint(&s.errorCode) {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.streamID) &&
+		dec.readVarint(&s.errorCode)
+	if !ok {
 		return 0, newError(FrameEncodingError, "stop_sending")
 	}
 	return dec.offset(), nil
@@ -444,13 +504,16 @@ func (s *streamFrame) encode(b []byte) (int, error) {
 		typ |= 0x04
 	}
 	enc := newCodec(b)
-	if !enc.writeByte(typ) || !enc.writeVarint(s.streamID) {
+	ok := enc.writeByte(typ) &&
+		enc.writeVarint(s.streamID)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	if s.offset > 0 && !enc.writeVarint(s.offset) {
 		return 0, errShortBuffer
 	}
-	if !enc.writeVarint(uint64(len(s.data))) || !enc.write(s.data) {
+	ok = enc.writeVarint(uint64(len(s.data))) && enc.write(s.data)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -459,7 +522,8 @@ func (s *streamFrame) encode(b []byte) (int, error) {
 func (s *streamFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	var typ uint8
-	if !dec.readByte(&typ) || !dec.readVarint(&s.streamID) {
+	ok := dec.readByte(&typ) && dec.readVarint(&s.streamID)
+	if !ok {
 		return 0, newError(FrameEncodingError, "stream")
 	}
 	s.fin = typ&0x01 != 0
@@ -474,10 +538,8 @@ func (s *streamFrame) decode(b []byte) (int, error) {
 	}
 	if hasLength {
 		var length uint64
-		if !dec.readVarint(&length) {
-			return 0, newError(FrameEncodingError, "stream")
-		}
-		if s.data = dec.read(int(length)); s.data == nil {
+		ok = dec.readVarint(&length) && dec.read(&s.data, int(length))
+		if !ok {
 			return 0, newError(FrameEncodingError, "stream")
 		}
 		return dec.offset(), nil
@@ -510,8 +572,9 @@ func (s *maxDataFrame) encodedLen() int {
 
 func (s *maxDataFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeMaxData) ||
-		!enc.writeVarint(s.maximumData) {
+	ok := enc.writeByte(frameTypeMaxData) &&
+		enc.writeVarint(s.maximumData)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -519,8 +582,9 @@ func (s *maxDataFrame) encode(b []byte) (int, error) {
 
 func (s *maxDataFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&s.maximumData) {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.maximumData)
+	if !ok {
 		return 0, newError(FrameEncodingError, "max_data")
 	}
 	return dec.offset(), nil
@@ -554,9 +618,10 @@ func (s *maxStreamDataFrame) encodedLen() int {
 
 func (s *maxStreamDataFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeMaxStreamData) ||
-		!enc.writeVarint(s.streamID) ||
-		!enc.writeVarint(s.maximumData) {
+	ok := enc.writeByte(frameTypeMaxStreamData) &&
+		enc.writeVarint(s.streamID) &&
+		enc.writeVarint(s.maximumData)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -564,9 +629,10 @@ func (s *maxStreamDataFrame) encode(b []byte) (int, error) {
 
 func (s *maxStreamDataFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&s.streamID) ||
-		!dec.readVarint(&s.maximumData) {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.streamID) &&
+		dec.readVarint(&s.maximumData)
+	if !ok {
 		return 0, newError(FrameEncodingError, "max_stream_data")
 	}
 	return dec.offset(), nil
@@ -604,8 +670,9 @@ func (s *maxStreamsFrame) encode(b []byte) (int, error) {
 	} else {
 		typ = frameTypeMaxStreamsUni
 	}
-	if !enc.writeByte(typ) ||
-		!enc.writeVarint(s.maximumStreams) {
+	ok := enc.writeByte(typ) &&
+		enc.writeVarint(s.maximumStreams)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -614,8 +681,9 @@ func (s *maxStreamsFrame) encode(b []byte) (int, error) {
 func (s *maxStreamsFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	var typ uint8
-	if !dec.readByte(&typ) || // Skip type
-		!dec.readVarint(&s.maximumStreams) {
+	ok := dec.readByte(&typ) && // Skip type
+		dec.readVarint(&s.maximumStreams)
+	if !ok {
 		return 0, newError(FrameEncodingError, "max_streams")
 	}
 	s.bidi = typ == frameTypeMaxStreamsBidi
@@ -646,8 +714,9 @@ func (s *dataBlockedFrame) encodedLen() int {
 
 func (s *dataBlockedFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeDataBlocked) ||
-		!enc.writeVarint(s.dataLimit) {
+	ok := enc.writeByte(frameTypeDataBlocked) &&
+		enc.writeVarint(s.dataLimit)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -655,8 +724,9 @@ func (s *dataBlockedFrame) encode(b []byte) (int, error) {
 
 func (s *dataBlockedFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&s.dataLimit) {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.dataLimit)
+	if !ok {
 		return 0, newError(FrameEncodingError, "data_blocked")
 	}
 	return dec.offset(), nil
@@ -690,9 +760,10 @@ func (s *streamDataBlockedFrame) encodedLen() int {
 
 func (s *streamDataBlockedFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeStreamDataBlocked) ||
-		!enc.writeVarint(s.streamID) ||
-		!enc.writeVarint(s.dataLimit) {
+	ok := enc.writeByte(frameTypeStreamDataBlocked) &&
+		enc.writeVarint(s.streamID) &&
+		enc.writeVarint(s.dataLimit)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -700,9 +771,10 @@ func (s *streamDataBlockedFrame) encode(b []byte) (int, error) {
 
 func (s *streamDataBlockedFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&s.streamID) ||
-		!dec.readVarint(&s.dataLimit) {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.streamID) &&
+		dec.readVarint(&s.dataLimit)
+	if !ok {
 		return 0, newError(FrameEncodingError, "stream_data_blocked")
 	}
 	return dec.offset(), nil
@@ -712,6 +784,10 @@ func (s *streamDataBlockedFrame) String() string {
 	return fmt.Sprintf("streamDataBlocked{id=%d limit=%d}", s.streamID, s.dataLimit)
 }
 
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-streams_blocked-frames
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                        Stream Limit (i)                     ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 type streamsBlockedFrame struct {
 	streamLimit uint64
 	bidi        bool
@@ -736,8 +812,9 @@ func (s *streamsBlockedFrame) encode(b []byte) (int, error) {
 	} else {
 		typ = frameTypeStreamsBlockedUni
 	}
-	if !enc.writeByte(typ) ||
-		!enc.writeVarint(s.streamLimit) {
+	ok := enc.writeByte(typ) &&
+		enc.writeVarint(s.streamLimit)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -746,8 +823,9 @@ func (s *streamsBlockedFrame) encode(b []byte) (int, error) {
 func (s *streamsBlockedFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	var typ uint8
-	if !dec.readByte(&typ) || // Skip type
-		!dec.readVarint(&s.streamLimit) {
+	ok := dec.readByte(&typ) &&
+		dec.readVarint(&s.streamLimit)
+	if !ok {
 		return 0, newError(FrameEncodingError, "streams_blocked")
 	}
 	s.bidi = typ == frameTypeStreamsBlockedBidi
@@ -756,6 +834,192 @@ func (s *streamsBlockedFrame) decode(b []byte) (int, error) {
 
 func (s *streamsBlockedFrame) String() string {
 	return fmt.Sprintf("streamsBlocked{limit=%d}", s.streamLimit)
+}
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-new_connection_id-frames
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                      Sequence Number (i)                    ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                      Retire Prior To (i)                    ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |   Length (8)  |                                               |
+// +-+-+-+-+-+-+-+-+       Connection ID (8..160)                  +
+// |                                                             ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                                                               |
+// +                                                               +
+// |                                                               |
+// +                   Stateless Reset Token (128)                 +
+// |                                                               |
+// +                                                               +
+// |                                                               |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+type newConnectionIDFrame struct {
+	sequenceNumber      uint64
+	retirePriorTo       uint64
+	connectionID        []byte
+	statelessResetToken []byte
+}
+
+func (s *newConnectionIDFrame) encodedLen() int {
+	return 1 + varintLen(s.sequenceNumber) + varintLen(s.retirePriorTo) + 1 + len(s.connectionID) + len(s.statelessResetToken)
+}
+
+func (s *newConnectionIDFrame) encode(b []byte) (int, error) {
+	if len(s.connectionID) < 1 || len(s.connectionID) > MaxCIDLength || len(s.statelessResetToken) != 16 {
+		return 0, newError(FrameEncodingError, "new_connection_id")
+	}
+	enc := newCodec(b)
+	ok := enc.writeByte(frameTypeNewConnectionID) &&
+		enc.writeVarint(s.sequenceNumber) &&
+		enc.writeVarint(s.retirePriorTo) &&
+		enc.writeByte(uint8(len(s.connectionID))) &&
+		enc.write(s.connectionID) &&
+		enc.write(s.statelessResetToken)
+	if !ok {
+		return 0, errShortBuffer
+	}
+	return enc.offset(), nil
+}
+
+func (s *newConnectionIDFrame) decode(b []byte) (int, error) {
+	dec := newCodec(b)
+	var cil uint8
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.sequenceNumber) &&
+		dec.readVarint(&s.retirePriorTo) &&
+		dec.readByte(&cil) &&
+		dec.read(&s.connectionID, int(cil)) &&
+		dec.read(&s.statelessResetToken, 16)
+	if !ok || cil < 1 || cil > MaxCIDLength {
+		return 0, newError(FrameEncodingError, "new_connection_id")
+	}
+	return dec.offset(), nil
+}
+
+func (s *newConnectionIDFrame) String() string {
+	return fmt.Sprintf("newConnectionID{sequenceNumber=%d,retirePriorTo=%d,connectionID=%x,statelessResetToken=%s}",
+		s.sequenceNumber, s.retirePriorTo, s.connectionID, s.statelessResetToken)
+}
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-retire_connection_id-frames
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                      Sequence Number (i)                    ...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+type retireConnectionIDFrame struct {
+	sequenceNumber uint64
+}
+
+func (s *retireConnectionIDFrame) encodedLen() int {
+	return 1 + varintLen(s.sequenceNumber)
+}
+
+func (s *retireConnectionIDFrame) encode(b []byte) (int, error) {
+	enc := newCodec(b)
+	ok := enc.writeByte(frameTypeRetireConnectionID) &&
+		enc.writeVarint(s.sequenceNumber)
+	if !ok {
+		return 0, errShortBuffer
+	}
+	return enc.offset(), nil
+}
+
+func (s *retireConnectionIDFrame) decode(b []byte) (int, error) {
+	dec := newCodec(b)
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&s.sequenceNumber)
+	if !ok {
+		return 0, newError(FrameEncodingError, "retire_connection_id")
+	}
+	return dec.offset(), nil
+}
+
+func (s *retireConnectionIDFrame) String() string {
+	return fmt.Sprintf("retireConnectionID{sequence=%d}", s.sequenceNumber)
+}
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-path_challenge-frames
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// +                           Data (64)                           +
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+type pathChallengeFrame struct {
+	data []byte
+}
+
+func (s *pathChallengeFrame) encodedLen() int {
+	return 1 + len(s.data)
+}
+
+func (s *pathChallengeFrame) encode(b []byte) (int, error) {
+	if len(s.data) != 8 {
+		return 0, newError(FrameEncodingError, "path_challenge")
+	}
+	enc := newCodec(b)
+	ok := enc.writeByte(frameTypePathChallenge) &&
+		enc.write(s.data)
+	if !ok {
+		return 0, errShortBuffer
+	}
+	return enc.offset(), nil
+}
+
+func (s *pathChallengeFrame) decode(b []byte) (int, error) {
+	dec := newCodec(b)
+	ok := dec.skip(1) &&
+		dec.read(&s.data, 8)
+	if !ok {
+		return 0, newError(FrameEncodingError, "path_challenge")
+	}
+	return dec.offset(), nil
+}
+
+func (s *pathChallengeFrame) String() string {
+	return fmt.Sprintf("pathChallenge{data=%x}", s.data)
+}
+
+// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-path_response-frames
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// +                           Data (64)                           +
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+type pathResponseFrame struct {
+	data []byte
+}
+
+func newPathResponseFrame(data []byte) *pathResponseFrame {
+	return &pathResponseFrame{
+		data: data,
+	}
+}
+
+func (s *pathResponseFrame) encodedLen() int {
+	return 1 + len(s.data)
+}
+
+func (s *pathResponseFrame) encode(b []byte) (int, error) {
+	if len(s.data) != 8 {
+		return 0, newError(FrameEncodingError, "path_response")
+	}
+	enc := newCodec(b)
+	ok := enc.writeByte(frameTypePathResponse) &&
+		enc.write(s.data)
+	if !ok {
+		return 0, errShortBuffer
+	}
+	return enc.offset(), nil
+}
+
+func (s *pathResponseFrame) decode(b []byte) (int, error) {
+	dec := newCodec(b)
+	ok := dec.skip(1) &&
+		dec.read(&s.data, 8)
+	if !ok {
+		return 0, newError(FrameEncodingError, "path_response")
+	}
+	return dec.offset(), nil
+}
+
+func (s *pathResponseFrame) String() string {
+	return fmt.Sprintf("pathResponse{data=%x}", s.data)
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#frame-connection-close
@@ -819,21 +1083,22 @@ func (s *connectionCloseFrame) encode(b []byte) (int, error) {
 func (s *connectionCloseFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	// Check if it is a Application Close frame type
-	var length uint64
-	if !dec.readVarint(&length) || !dec.readVarint(&s.errorCode) {
+	var typ uint8
+	ok := dec.readByte(&typ) && dec.readVarint(&s.errorCode)
+	if !ok {
 		return 0, newError(FrameEncodingError, "connection_close")
 	}
-	if length == frameTypeConnectionClose {
+	if typ == frameTypeConnectionClose {
 		if !dec.readVarint(&s.frameType) {
 			return 0, newError(FrameEncodingError, "connection_close")
 		}
 	} else {
 		s.application = true
 	}
-	if !dec.readVarint(&length) {
-		return 0, newError(FrameEncodingError, "connection_close")
-	}
-	if s.reasonPhrase = dec.read(int(length)); s.reasonPhrase == nil {
+	var length uint64
+	ok = dec.readVarint(&length) &&
+		dec.read(&s.reasonPhrase, int(length))
+	if !ok {
 		return 0, newError(FrameEncodingError, "connection_close")
 	}
 	return dec.offset(), nil
@@ -865,9 +1130,10 @@ func (s *newTokenFrame) encodedLen() int {
 
 func (s *newTokenFrame) encode(b []byte) (int, error) {
 	enc := newCodec(b)
-	if !enc.writeByte(frameTypeNewToken) ||
-		!enc.writeVarint(uint64(len(s.token))) ||
-		!enc.write(s.token) {
+	ok := enc.writeByte(frameTypeNewToken) &&
+		enc.writeVarint(uint64(len(s.token))) &&
+		enc.write(s.token)
+	if !ok {
 		return 0, errShortBuffer
 	}
 	return enc.offset(), nil
@@ -876,12 +1142,10 @@ func (s *newTokenFrame) encode(b []byte) (int, error) {
 func (s *newTokenFrame) decode(b []byte) (int, error) {
 	dec := newCodec(b)
 	var length uint64
-	if !dec.skip(1) || // Skip type
-		!dec.readVarint(&length) ||
-		length == 0 {
-		return 0, newError(FrameEncodingError, "new_token")
-	}
-	if s.token = dec.read(int(length)); s.token == nil {
+	ok := dec.skip(1) && // Skip type
+		dec.readVarint(&length) &&
+		dec.read(&s.token, int(length))
+	if !ok || length == 0 {
 		return 0, newError(FrameEncodingError, "new_token")
 	}
 	return dec.offset(), nil
@@ -915,6 +1179,57 @@ func (s *handshakeDoneFrame) String() string {
 	return "handshakeDone{}"
 }
 
+// DATAGRAM frames are used to transmit application data in an unreliable manner.
+// https://quicwg.org/datagram/draft-ietf-quic-datagram.html
+type datagramFrame struct {
+	data []byte
+}
+
+func newDatagramFrame(data []byte) *datagramFrame {
+	return &datagramFrame{
+		data: data,
+	}
+}
+
+func (s *datagramFrame) encodedLen() int {
+	return 1 + varintLen(uint64(len(s.data))) + len(s.data)
+}
+
+func (s *datagramFrame) encode(b []byte) (int, error) {
+	// Always include length
+	enc := newCodec(b)
+	ok := enc.writeByte(frameTypeDatagramWithLength) &&
+		enc.writeVarint(uint64(len(s.data))) &&
+		enc.write(s.data)
+	if !ok {
+		return 0, errShortBuffer
+	}
+	return enc.offset(), nil
+}
+
+func (s *datagramFrame) decode(b []byte) (int, error) {
+	dec := newCodec(b)
+	var typ uint8
+	if !dec.readByte(&typ) {
+		return 0, newError(FrameEncodingError, "datagram")
+	}
+	if typ == frameTypeDatagramWithLength {
+		var length uint64
+		ok := dec.readVarint(&length) &&
+			dec.read(&s.data, int(length))
+		if !ok {
+			return 0, newError(FrameEncodingError, "datagram")
+		}
+		return dec.offset(), nil
+	}
+	s.data = b[dec.offset():]
+	return len(b), nil
+}
+
+func (s *datagramFrame) String() string {
+	return fmt.Sprintf("datagram{data=%x}", s.data)
+}
+
 func encodeFrames(b []byte, frames []frame) (int, error) {
 	n := 0
 	for _, f := range frames {
@@ -942,7 +1257,7 @@ func isFrameAllowedInPacket(typ uint64, pktType packetType) bool {
 	case packetTypeInitial, packetTypeHandshake:
 		return typ == frameTypePadding || typ == frameTypePing || typ == frameTypeAck ||
 			typ == frameTypeCrypto || typ == frameTypeConnectionClose
-	case packetTypeShort:
+	case packetTypeOneRTT:
 		return true
 	default:
 		return false

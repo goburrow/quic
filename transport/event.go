@@ -11,6 +11,8 @@ const (
 	EventStreamStop     = "stream_stop"     // Received stream stop sending
 	EventStreamReset    = "stream_reset"    // Received stream reset
 	EventStreamComplete = "stream_complete" // All sending data has been acked.
+
+	EventDatagramReadable = "datagram_readable" // Received datagram.
 )
 
 // Event is a union structure of all events.
@@ -74,5 +76,12 @@ func newEventStreamComplete(id uint64) Event {
 	return Event{
 		Type: EventStreamComplete,
 		ID:   id,
+	}
+}
+
+// newEventDatagramReadable creates an event where a DATAGRAM frame was received.
+func newEventDatagramReadable() Event {
+	return Event{
+		Type: EventDatagramReadable,
 	}
 }
