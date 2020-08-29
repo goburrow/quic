@@ -70,6 +70,29 @@ func TestServerConnInitialState(t *testing.T) {
 func TestHandshake(t *testing.T) {
 	// Not use stub random and time
 	clientConfig := NewConfig()
+	clientConfig.TLS = &tls.Config{
+		InsecureSkipVerify: true,
+	}
+	client, err := Connect([]byte("client"), clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig := NewConfig()
+	serverConfig.TLS = &tls.Config{
+		Certificates: testCerts,
+	}
+	server, err := Accept([]byte("server"), nil, serverConfig)
+	p := &testEndpoint{client: client, server: server}
+	err = p.handshake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("server handshaked scid=%x dcid=%x odcid=%x", server.scid, server.dcid, server.odcid)
+}
+
+func TestHandshakeWithRetry(t *testing.T) {
+	// Not use stub random and time
+	clientConfig := NewConfig()
 	clientConfig.Version = 0xffffffff
 	clientConfig.TLS = &tls.Config{
 		InsecureSkipVerify: true,
@@ -365,6 +388,26 @@ func TestConnRecvPathChallenge(t *testing.T) {
 	}
 }
 
+func TestConnClose(t *testing.T) {
+	conn, err := Accept([]byte("server"), nil, NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.deriveInitialKeyMaterial([]byte("client"))
+	conn.Close(false, 1, "failure")
+	if conn.ConnectionState() != StateAttempted {
+		t.Fatalf("expect connection state not changed, got %v", conn.ConnectionState())
+	}
+	b := make([]byte, 100)
+	n, err := conn.Read(b)
+	if err != nil || n == 0 {
+		t.Fatalf("expect read has data, got %v %v", n, err)
+	}
+	if conn.ConnectionState() != StateClosed {
+		t.Fatalf("expect connection state %v, got %v", StateClosed, conn.ConnectionState())
+	}
+}
+
 func newTestConn() (*testEndpoint, error) {
 	clientCID := []byte("client-cid")
 	clientConfig := newTestConfig()
@@ -430,10 +473,13 @@ func (t *testEndpoint) negotiateVersion() error {
 	if err != nil {
 		return err
 	}
+	if n == 0 {
+		return fmt.Errorf("client first packet is empty")
+	}
 	h := Header{}
 	_, err = h.Decode(t.buf[:n], 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("header decode: %v %v", n, err)
 	}
 	b := make([]byte, 256)
 	n, err = NegotiateVersion(b, h.SCID, h.DCID)

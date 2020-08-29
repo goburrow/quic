@@ -20,7 +20,46 @@ go build -tags debug
 
 # Check heap allocations
 go build -gcflags '-m' 2>&1 | sort -V > debug.txt
+
+# Raspberry Pi Zero
+GOOS=linux GOARCH=arm GOARM=6 CGO_ENABLED=0 go build
 ```
+
+### Server
+
+```
+Usage: quiwi server [arguments]
+  -cache string
+    	certificate cache directory when using ACME (default ".")
+  -cert string
+    	TLS certificate path
+  -domains string
+    	allowed host names for ACME (separated by a comma)
+  -key string
+    	TLS certificate key path
+  -listen string
+    	listen on the given IP:port (default ":4433")
+  -qlog string
+    	write logs to qlog file
+  -retry
+    	enable address validation using Retry packet
+  -root string
+    	root directory (default "www")
+  -v int
+    	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
+```
+
+Examples:
+```
+# Listen on port 4433:
+./quiwi server -cert ../../testdata/cert.pem -key ../../testdata/key.pem
+
+# Automatically get certificate from Let's Encrypt:
+# (This will also listen on TCP port 443 to handle "tls-alpn-01" challenge)
+./quiwi server -domains example.com
+```
+
+Add `SSLKEYLOGFILE=key.log` to have TLS keys logged to file.
 
 ### Client
 
@@ -40,37 +79,10 @@ Usage: quiwi client [arguments] <url>
     	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
 ```
 
-Example
+Examples
 ```
 ./quiwi client https://quic.tech:4433/
 ```
-
-### Server
-
-```
-Usage: quiwi server [arguments]
-  -cert string
-    	TLS certificate path (default "cert.pem")
-  -key string
-    	TLS certificate key path (default "key.pem")
-  -listen string
-    	listen on the given IP:port (default ":4433")
-  -qlog string
-    	write logs to qlog file
-  -retry
-    	enable address validation using Retry packet
-  -root string
-    	root directory (default "www")
-  -v int
-    	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
-```
-
-Example:
-```
-./quiwi server -cert ../../testdata/cert.pem -key ../../testdata/key.pem
-```
-
-Add `SSLKEYLOGFILE=key.log` to have TLS keys logged to file.
 
 ## Datagram
 
@@ -88,10 +100,11 @@ Usage: quiwi datagram [arguments] [url]
     	log verbose: 0=off 1=error 2=info 3=debug 4=trace (default 2)
 ```
 
-Example:
+Examples:
 ```
 # Server
 ./quiwi datagram -listen 127.0.0.1:4433
+
 # Client
 ./quiwi datagram -insecure https://127.0.0.1:4433
 ```

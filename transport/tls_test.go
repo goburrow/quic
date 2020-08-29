@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"crypto/tls"
 	"reflect"
 	"testing"
 	"time"
@@ -64,5 +65,26 @@ func TestTransportParamsGreased(t *testing.T) {
 	tp := Parameters{}
 	if !tp.unmarshal(b) {
 		t.Fatal("could not unmarshal")
+	}
+}
+
+func TestTLSHandshakeInitial(t *testing.T) {
+	var pnSpaces [packetSpaceCount]packetNumberSpace
+	for i := range pnSpaces {
+		pnSpaces[i].init()
+	}
+	tlsConfig := &tls.Config{
+		ServerName: "localhost",
+	}
+	handshake := tlsHandshake{}
+	handshake.init(tlsConfig, &pnSpaces, true)
+
+	err := handshake.doHandshake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &pnSpaces[packetSpaceInitial].cryptoStream
+	if !stream.isFlushable() {
+		t.Fatalf("expect crypto stream data, got %v", &stream.send)
 	}
 }

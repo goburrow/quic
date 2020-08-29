@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -12,9 +14,12 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/goburrow/quic"
 	"github.com/goburrow/quic/transport"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 type serverCommand struct{}
@@ -30,8 +35,10 @@ func (serverCommand) Desc() string {
 func (serverCommand) Run(args []string) error {
 	cmd := flag.NewFlagSet("server", flag.ExitOnError)
 	listenAddr := cmd.String("listen", ":4433", "listen on the given IP:port")
-	certFile := cmd.String("cert", "cert.pem", "TLS certificate path")
-	keyFile := cmd.String("key", "key.pem", "TLS certificate key path")
+	certFile := cmd.String("cert", "", "TLS certificate path")
+	keyFile := cmd.String("key", "", "TLS certificate key path")
+	domains := cmd.String("domains", "", "allowed host names for ACME (separated by a comma)")
+	cacheDir := cmd.String("cache", ".", "certificate cache directory when using ACME")
 	root := cmd.String("root", "www", "root directory")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
@@ -44,11 +51,28 @@ func (serverCommand) Run(args []string) error {
 
 	config := newConfig()
 	if *certFile != "" {
+		// Configure TLS
 		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
 		if err != nil {
 			return err
 		}
 		config.TLS.Certificates = []tls.Certificate{cert}
+	}
+	if *domains != "" {
+		// Configure ACME
+		acme := acmeHandler{
+			domains:  *domains,
+			cacheDir: *cacheDir,
+		}
+		err := acme.listen(config.TLS)
+		if err != nil {
+			return err
+		}
+		defer acme.Close()
+		go acme.serve()
+	}
+	if len(config.TLS.Certificates) == 0 && config.TLS.GetCertificate == nil && config.TLS.GetConfigForClient == nil {
+		return fmt.Errorf("TLS certificate must be set")
 	}
 	server := quic.NewServer(config)
 	server.SetHandler(&serverHandler{
@@ -56,8 +80,10 @@ func (serverCommand) Run(args []string) error {
 		buf:  newBuffers(2048, 10),
 	})
 	if *enableRetry {
+		// Stateless retry
 		server.SetAddressValidator(quic.NewAddressValidator())
 	}
+	// Logging
 	if *qlogFile == "" {
 		server.SetLogger(*logLevel, os.Stderr)
 	} else {
@@ -227,4 +253,49 @@ func (s *serverHandler) getResponses(c *quic.Conn) map[uint64]*os.File {
 		return responses
 	}
 	return c.UserData().(map[uint64]*os.File)
+}
+
+// acmeHandler listens on the standard TLS port (443) and handles "tls-alpn-01" challenge
+// from Let's Encrypt.
+type acmeHandler struct {
+	domains  string
+	cacheDir string
+	ln       net.Listener
+}
+
+func (s *acmeHandler) listen(config *tls.Config) error {
+	certManager := autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(strings.Split(s.domains, ",")...),
+		Cache:      autocert.DirCache(s.cacheDir),
+	}
+	config.GetCertificate = certManager.GetCertificate
+	config.NextProtos = append(config.NextProtos, acme.ALPNProto)
+	listener, err := tls.Listen("tcp", ":443", config)
+	if err != nil {
+		return fmt.Errorf("acme listen: %v", err)
+	}
+	s.ln = listener
+	return nil
+}
+
+func (s *acmeHandler) serve() {
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			log.Printf("acme accept: %v", err)
+			return
+		}
+		// Maybe handshake in separated goroutines?
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		err = conn.(*tls.Conn).Handshake()
+		if err != nil {
+			log.Printf("acme handshake: %v", err)
+		}
+		conn.Close()
+	}
+}
+
+func (s *acmeHandler) Close() error {
+	return s.ln.Close()
 }

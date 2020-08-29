@@ -261,8 +261,8 @@ func (s *localConn) recvConn(c *Conn, data []byte) error {
 			// TODO: queue packet for later processing.
 			return nil
 		}
+		// Close connection when receive failed
 		if err, ok := err.(*transport.Error); ok {
-			// Close connection when receive failed
 			c.conn.Close(false, err.Code, err.Message)
 		} else {
 			s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
@@ -278,7 +278,13 @@ func (s *localConn) sendConn(c *Conn, buf []byte) error {
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
-			s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
+			// Close connection when send failed
+			if err, ok := err.(*transport.Error); ok {
+				c.conn.Close(false, err.Code, err.Message)
+			} else {
+				s.logger.log(levelError, "internal_error cid=%x addr=%s description=send_failed: %v", c.scid, c.addr, err)
+				c.conn.Close(false, transport.InternalError, "")
+			}
 			return err
 		}
 		if n == 0 {
@@ -288,6 +294,7 @@ func (s *localConn) sendConn(c *Conn, buf []byte) error {
 		n, err = s.socket.WriteTo(buf[:n], c.addr)
 		if err != nil {
 			s.logger.log(levelError, "internal_error cid=%x addr=%s description=send_failed: %v", c.scid, c.addr, err)
+			c.conn.Close(false, transport.InternalError, "")
 			return err
 		}
 		s.logger.log(levelTrace, "datagrams_sent cid=%x addr=%s byte_length=%d raw=%x", c.scid, c.addr, n, buf[:n])

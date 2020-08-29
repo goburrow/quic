@@ -735,7 +735,12 @@ func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Ti
 		return 0, err
 	}
 	debug("receiving frame 0x%x: %s (%s)", b[0], &f, errorCodeString(f.errorCode))
-	s.setDraining(now)
+	// After receiving a CONNECTION_CLOSE frame, endpoints enter the draining state;
+	if s.state < StateDraining {
+		// Persist for at least three times the current Probe Timeout
+		s.drainingTimer = now.Add(s.recovery.probeTimeout() * 3)
+		s.setState(StateDraining, now)
+	}
 	s.logFrameProcessed(&f, now)
 	return n, nil
 }
@@ -888,11 +893,16 @@ func (s *Conn) Read(b []byte) (int, error) {
 		return 0, nil
 	}
 	now := s.time()
-	if err := s.doHandshake(now); err != nil {
-		return 0, err
+	if s.closeFrame == nil {
+		// Only check handshake when not in closing state, so it can send connection close
+		// frame when handshake failed.
+		err := s.doHandshake(now)
+		if err != nil {
+			return 0, err
+		}
+		// Checking streams state before finding write space to check stream updates.
+		s.checkStreamsState(now)
 	}
-	// Checking streams state before finding write space to check stream updates.
-	s.checkStreamsState(now)
 	space := s.writeSpace()
 	if space == packetSpaceCount {
 		return 0, nil
@@ -1019,12 +1029,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 func (s *Conn) writeSpace() packetSpace {
 	// On error, send packet in the latest space available.
 	if s.closeFrame != nil {
-		space := s.handshake.writeSpace()
-		if space == packetSpaceApplication && !s.handshake.HandshakeComplete() {
-			// Downgrade to handshake packet space as the handshake is not complete yet
-			return packetSpaceHandshake
-		}
-		return space
+		return s.handshake.writeSpace()
 	}
 	for i := packetSpaceInitial; i < packetSpaceCount; i++ {
 		if !s.packetNumberSpaces[i].canEncrypt() {
@@ -1136,7 +1141,10 @@ func (s *Conn) sendFrames(op *sentPacket, space packetSpace, left int, now time.
 			op.addFrame(s.closeFrame)
 			payloadLen += n
 			left -= n
-			s.setDraining(now)
+			// After sending a CONNECTION_CLOSE frame, an endpoint immediately enters the closing state
+			if s.state < StateClosed {
+				s.setState(StateClosed, now)
+			}
 			return payloadLen // do not need to continue
 		}
 	}
@@ -1332,6 +1340,7 @@ func (s *Conn) checkTimeout(now time.Time) {
 // https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#draining
 func (s *Conn) Close(app bool, errCode uint64, reason string) {
 	if s.closeFrame != nil || s.state >= StateDraining {
+		// Closing or draining or already closed
 		return
 	}
 	debug("set closing: code=%d reason=%v", errCode, reason)
@@ -1485,14 +1494,6 @@ func (s *Conn) sendFrameDatagram(left int) *datagramFrame {
 		return newDatagramFrame(data)
 	}
 	return nil
-}
-
-func (s *Conn) setDraining(now time.Time) {
-	if s.state < StateDraining {
-		// Persist for at least three times the current Probe Timeout
-		s.drainingTimer = now.Add(s.recovery.probeTimeout() * 3)
-		s.setState(StateDraining, now)
-	}
 }
 
 func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {

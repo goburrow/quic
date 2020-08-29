@@ -132,6 +132,53 @@ func TestServerAndClient(t *testing.T) {
 	}
 }
 
+func TestClientCloseHandshake(t *testing.T) {
+	closeCh := make(chan struct{}, 2)
+	socket, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer()
+	s.SetListener(socket)
+	s.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
+		if len(events) != 1 || events[0].Type != EventConnClose {
+			t.Errorf("expect only close event, got %v", events)
+		}
+		closeCh <- struct{}{}
+	}))
+	defer s.Close()
+	go s.Serve()
+
+	clientConfig := transport.NewConfig()
+	clientConfig.TLS = &tls.Config{
+		ServerName: "quic",
+	}
+	c := NewClient(clientConfig)
+	c.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
+		if len(events) != 1 || events[0].Type != EventConnClose {
+			t.Errorf("expect only close event, got %v", events)
+		}
+		closeCh <- struct{}{}
+	}))
+	err = c.ListenAndServe("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	err = c.Connect(socket.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(5 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-closeCh:
+		case <-timeout:
+			t.Errorf("receive timed out")
+		}
+	}
+}
+
 func newServer() *Server {
 	cert, err := tls.LoadX509KeyPair("testdata/cert.pem", "testdata/key.pem")
 	if err != nil {

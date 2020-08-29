@@ -392,6 +392,10 @@ func (s *tlsHandshake) writeSpace() packetSpace {
 	case tls13.EncryptionLevelHandshake:
 		return packetSpaceHandshake
 	case tls13.EncryptionLevelApplication:
+		if !s.HandshakeComplete() {
+			// Downgrade to handshake packet space as the handshake is not complete yet
+			return packetSpaceHandshake
+		}
 		return packetSpaceApplication
 	default:
 		panic(sprint("unsupported tls encryption level ", level))

@@ -39,7 +39,7 @@ https://github.com/QUIC-Tracker/quic-tracker
 ```
 docker run -it --rm -v "$PWD:/traces" -w /traces -p 5000:5000 mpiraux/quictracker /bin/sh
 # Start server
-./quiwi server -root . -v 3 -qlog server.qlog 2>server.txt &
+./quiwi server -cert cert.pem -key key.pem -root . -v 3 -qlog server.qlog 2>server.txt &
 # Run single test case
 /scenario_runner -debug -host 127.0.0.1:4433 -output 20200101.json -scenario multi_packet_client_hello
 # Run all test cases
