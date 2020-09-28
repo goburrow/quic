@@ -92,7 +92,7 @@ func (s *Client) Connect(addr string) error {
 	s.peersMu.Lock()
 	if s.closing {
 		s.peersMu.Unlock()
-		return fmt.Errorf("client is closed")
+		return fmt.Errorf("client is already closed")
 	}
 	if _, ok := s.peers[string(c.scid[:])]; ok {
 		s.peersMu.Unlock()

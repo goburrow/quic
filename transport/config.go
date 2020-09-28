@@ -56,6 +56,7 @@ func NewConfig() *Config {
 	}
 }
 
-func versionSupported(ver uint32) bool {
-	return ver == ProtocolVersion
+// VersionSupported returns true when the provided QUIC transport version is supported.
+func VersionSupported(version uint32) bool {
+	return version == ProtocolVersion
 }

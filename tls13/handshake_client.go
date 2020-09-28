@@ -36,7 +36,11 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		return nil, nil, errors.New("tls: NextProtos values too large")
 	}
 
-	clientHelloVersion := supportedVersions[0]
+	if len(supportedVersions) == 0 {
+		return nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
+	}
+
+	clientHelloVersion := maxSupportedVersion()
 	// The version at the beginning of the ClientHello was capped at TLS 1.2
 	// for compatibility reasons. The supported_versions extension is used
 	// to negotiate versions now. See RFC 8446, Section 4.2.1.
@@ -67,7 +71,18 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		}
 	*/
 
-	hello.cipherSuites = configCipherSuites(c.config)
+	possibleCipherSuites := configCipherSuites(c.config)
+	hello.cipherSuites = make([]uint16, 0, len(possibleCipherSuites))
+
+	for _, suiteId := range possibleCipherSuites {
+		for _, suite := range cipherSuitesTLS13 {
+			if suite.id != suiteId {
+				continue
+			}
+			hello.cipherSuites = append(hello.cipherSuites, suiteId)
+			break
+		}
+	}
 
 	_, err := io.ReadFull(configRand(c.config), hello.random)
 	if err != nil {
@@ -87,7 +102,7 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 
 	var params ecdheParameters
 	if hello.supportedVersions[0] == tls.VersionTLS13 {
-		hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13...)
+		hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13()...)
 
 		curveID := configCurvePreferences(c.config)[0]
 		if _, ok := curveForCurveID(curveID); curveID != tls.X25519 && !ok {
@@ -104,43 +119,49 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 }
 
 func (c *Conn) clientHandshake() (err error) {
-	if c.clientHs == nil {
-		// This may be a renegotiation handshake, in which case some fields
-		// need to be reset.
-		c.didResume = false
+	if c.config == nil {
+		c.config = defaultConfig()
+	}
+	if c.clientHs != nil {
+		return c.clientHs.handshake()
+	}
 
-		hello, ecdheParams, err := c.makeClientHello()
-		if err != nil {
-			return err
-		}
+	// This may be a renegotiation handshake, in which case some fields
+	// need to be reset.
+	c.didResume = false
 
-		cacheKey, session, earlySecret, binderKey := c.loadSession(hello)
-		if cacheKey != "" && session != nil {
-			defer func() {
-				// If we got a handshake failure when resuming a session, throw away
-				// the session ticket. See RFC 5077, Section 3.2.
-				//
-				// RFC 8446 makes no mention of dropping tickets on failure, but it
-				// does require servers to abort on invalid binders, so we need to
-				// delete tickets to recover from a corrupted PSK.
-				if err != nil {
-					c.config.ClientSessionCache.Put(cacheKey, nil)
-				}
-			}()
-		}
+	hello, ecdheParams, err := c.makeClientHello()
+	if err != nil {
+		return err
+	}
+	c.serverName = hello.serverName
 
-		if _, err := c.writeRecord(recordTypeHandshake, hello.marshal()); err != nil {
-			return err
-		}
+	cacheKey, session, earlySecret, binderKey := c.loadSession(hello)
+	if cacheKey != "" && session != nil {
+		defer func() {
+			// If we got a handshake failure when resuming a session, throw away
+			// the session ticket. See RFC 5077, Section 3.2.
+			//
+			// RFC 8446 makes no mention of dropping tickets on failure, but it
+			// does require servers to abort on invalid binders, so we need to
+			// delete tickets to recover from a corrupted PSK.
+			if err != nil && err != ErrWantRead {
+				c.config.ClientSessionCache.(ClientSessionCache).PutClientSession(cacheKey, nil)
+			}
+		}()
+	}
 
-		c.clientHs = &clientHandshakeStateTLS13{
-			c:           c,
-			hello:       hello,
-			ecdheParams: ecdheParams,
-			session:     session,
-			earlySecret: earlySecret,
-			binderKey:   binderKey,
-		}
+	if _, err := c.writeRecord(recordTypeHandshake, hello.marshal()); err != nil {
+		return err
+	}
+
+	c.clientHs = &clientHandshakeStateTLS13{
+		c:           c,
+		hello:       hello,
+		ecdheParams: ecdheParams,
+		session:     session,
+		earlySecret: earlySecret,
+		binderKey:   binderKey,
 	}
 
 	// In TLS 1.3, session tickets are delivered after the handshake.
@@ -148,8 +169,12 @@ func (c *Conn) clientHandshake() (err error) {
 }
 
 func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
-	session *clientSessionState, earlySecret, binderKey []byte) {
+	session *ClientSessionState, earlySecret, binderKey []byte) {
 	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {
+		return "", nil, nil, nil
+	}
+	sessionCache, ok := c.config.ClientSessionCache.(ClientSessionCache)
+	if !ok {
 		return "", nil, nil, nil
 	}
 
@@ -170,8 +195,8 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
 
 	// Try to resume a previously negotiated TLS session, if available.
 	cacheKey = clientSessionCacheKey(c.config)
-	tlsSession, ok := c.config.ClientSessionCache.Get(cacheKey)
-	if !ok || tlsSession == nil {
+	session, ok = sessionCache.GetClientSession(cacheKey)
+	if !ok || session == nil {
 		return cacheKey, nil, nil, nil
 	}
 
@@ -198,7 +223,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
 		serverCert := session.serverCertificates[0]
 		if configTime(c.config).After(serverCert.NotAfter) {
 			// Expired certificate, delete the entry.
-			c.config.ClientSessionCache.Put(cacheKey, nil)
+			sessionCache.PutClientSession(cacheKey, nil)
 			return cacheKey, nil, nil, nil
 		}
 		if err := serverCert.VerifyHostname(c.config.ServerName); err != nil {
@@ -206,9 +231,13 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
 		}
 	}
 
+	if session.vers != tls.VersionTLS13 {
+		return cacheKey, nil, nil, nil
+	}
+
 	// Check that the session ticket is not expired.
 	if configTime(c.config).After(session.useBy) {
-		c.config.ClientSessionCache.Put(cacheKey, nil)
+		sessionCache.PutClientSession(cacheKey, nil)
 		return cacheKey, nil, nil, nil
 	}
 
@@ -265,6 +294,7 @@ func (c *Conn) pickTLSVersion(serverHello *serverHelloMsg) error {
 	}
 
 	c.vers = vers
+	c.haveVers = true
 
 	return nil
 }
@@ -300,13 +330,6 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 		}
 	}
 
-	if c.config.VerifyPeerCertificate != nil {
-		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
-			c.sendAlert(alertBadCertificate)
-			return err
-		}
-	}
-
 	switch certs[0].PublicKey.(type) {
 	case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
 		break
@@ -316,6 +339,20 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	}
 
 	c.peerCertificates = certs
+
+	if c.config.VerifyPeerCertificate != nil {
+		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
+	}
 
 	return nil
 }

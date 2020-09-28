@@ -14,7 +14,7 @@ const (
 	// Maximum reordering in time before time threshold loss detection considers a packet lost.
 	// Specified as an RTT multiplier.
 	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#time-threshold
-	// NOTE: The value is spec is 9/8, but used as "x + x/8" here to avoid casting to float.
+	// NOTE: The value in spec is 9/8, but used as "x + x/8" here to avoid casting to float.
 	timeThreshold = 8
 
 	// Timer granularity.
@@ -135,7 +135,7 @@ type lossRecovery struct {
 	lostCount uint64
 
 	// Control PTO calculation.
-	handshakeComplete bool
+	handshakeConfirmed bool
 
 	congestion congestionControl
 }
@@ -230,12 +230,13 @@ func (s *lossRecovery) updateRTT(latestRTT time.Duration, ackDelay time.Duration
 		s.rttVariance = latestRTT / 2
 		return
 	}
-	// Subsequent RTT samples
-	if latestRTT < s.minRTT {
-		// min_rtt ignores ack delay.
+	// min_rtt ignores acknowledgment delay.
+	if s.minRTT > latestRTT {
 		s.minRTT = latestRTT
 	}
-	if ackDelay > s.maxAckDelay {
+	// Limit ack_delay by max_ack_delay after handshake confirmation.
+	// Note that ack_delay is 0 for acknowledgements of Initial and Handshake packets.
+	if s.handshakeConfirmed && ackDelay > s.maxAckDelay {
 		// Limit ack_delay by max_ack_delay
 		ackDelay = s.maxAckDelay
 	}
@@ -347,6 +348,7 @@ func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 		lossDelay = s.latestRTT
 	}
 	lossDelay += lossDelay / timeThreshold
+	// Minimum time of kGranularity before packets are deemed lost.
 	if lossDelay < granularity {
 		lossDelay = granularity
 	}
@@ -428,7 +430,8 @@ func (s *lossRecovery) probeTimeout() time.Duration {
 	return pto
 }
 
-// earliestLossTime returns min(s.lossTime).
+// earliestLossTime returns the earliest loss time.
+// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
 func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 	space := packetSpaceInitial
 	lossTime := s.lossTime[space]
@@ -442,8 +445,10 @@ func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 	return lossTime, space
 }
 
-// earliestTimeout returns the earliest PTO timeout.
+// earliestProbeTime returns the earliest PTO timeout.
+// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
 func (s *lossRecovery) earliestProbeTime() (time.Time, packetSpace) {
+	// duration = (smoothed_rtt + max(4 * rttvar, kGranularity)) * (2 ^ pto_count)
 	duration := s.probeTimeout() * (1 << s.ptoCount)
 	space := packetSpaceInitial
 	timeout := s.timeOfLastAckElicitingPacket[space]
@@ -451,7 +456,7 @@ func (s *lossRecovery) earliestProbeTime() (time.Time, packetSpace) {
 		timeout = timeout.Add(duration)
 	}
 	for i := space + 1; i < packetSpaceCount; i++ {
-		if space == packetSpaceApplication && !s.handshakeComplete {
+		if space == packetSpaceApplication && !s.handshakeConfirmed {
 			// Skip Application Data until handshake complete.
 			continue
 		}
@@ -545,8 +550,8 @@ func (s *lossRecovery) setMaxAckDelay(maxAckDelay time.Duration) {
 	}
 }
 
-func (s *lossRecovery) setHandshakeComplete() {
-	s.handshakeComplete = true
+func (s *lossRecovery) setHandshakeConfirmed() {
+	s.handshakeConfirmed = true
 }
 
 func (s *lossRecovery) canSend() uint64 {

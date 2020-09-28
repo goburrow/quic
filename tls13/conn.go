@@ -1,3 +1,9 @@
+// Copyright 2010 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// TLS low level connection and record layer
+
 package tls13
 
 import (
@@ -7,29 +13,13 @@ import (
 	"fmt"
 )
 
-// EncryptionLevel is QUIC encryption space.
-type EncryptionLevel int
-
-const (
-	EncryptionLevelInitial EncryptionLevel = iota
-	EncryptionLevelHandshake
-	EncryptionLevelApplication
-)
-
-var ErrWantRead = errors.New("tls: want read")
-
-type RecordLayer interface {
-	ReadRecord(EncryptionLevel, []byte) (int, error)
-	WriteRecord(EncryptionLevel, []byte) (int, error)
-	SetReadSecret(level EncryptionLevel, readSecret []byte) error
-	SetWriteSecret(level EncryptionLevel, writeSecret []byte) error
-}
-
 // A Conn represents a secured connection.
 // It implements the net.Conn interface.
 type Conn struct {
 	// constant
-	isClient bool
+	conn        Transport
+	isClient    bool
+	handshakeFn func() error // (*Conn).clientHandshake or serverHandshake
 
 	// handshakeStatus is 1 if the connection is currently transferring
 	// application data (i.e. is not currently processing a handshake).
@@ -38,6 +28,7 @@ type Conn struct {
 	// constant after handshake; protected by handshakeMutex
 	handshakeErr error       // error resulting from handshake
 	vers         uint16      // TLS version
+	haveVers     bool        // version has been negotiated
 	config       *tls.Config // configuration passed to constructor
 	// handshakes counts the number of handshakes performed on the
 	// connection so far. If renegotiation is disabled then this is either
@@ -63,12 +54,21 @@ type Conn struct {
 	// NewSessionTicket messages. nil if config.SessionTicketsDisabled.
 	resumptionSecret []byte
 
+	// ticketKeys is the set of active session ticket keys for this
+	// connection. The first one is used to encrypt new tickets and
+	// all are tried to decrypt tickets.
+	ticketKeys []ticketKey
+
 	clientProtocol string
 
 	// input/output
-	in, out     halfConn
-	rawInput    []byte // raw input, starting with a record header
-	recordLayer RecordLayer
+	in, out  halfConn
+	rawInput []byte // raw input, starting with a record header
+
+	// retryCount counts the number of consecutive non-advancing records
+	// received by Conn.readRecord. That is, records that neither advance the
+	// handshake, nor deliver application data. Protected by in.Mutex.
+	retryCount int
 
 	clientHs *clientHandshakeStateTLS13
 	serverHs *serverHandshakeStateTLS13
@@ -77,18 +77,6 @@ type Conn struct {
 	peerTransportParams []byte
 
 	alert alert
-}
-
-func NewConn(recordLayer RecordLayer, config *tls.Config, isClient bool) *Conn {
-	if config == nil {
-		config = defaultConfig()
-	}
-	return &Conn{
-		isClient:    isClient,
-		config:      config,
-		vers:        tls.VersionTLS13,
-		recordLayer: recordLayer,
-	}
 }
 
 // A halfConn represents one direction of the record layer
@@ -102,7 +90,7 @@ type halfConn struct {
 func (c *Conn) readRecord(level EncryptionLevel, n int) error {
 	c.growReadBufCapacity(n)
 	for len(c.rawInput) < n {
-		i, err := c.recordLayer.ReadRecord(level, c.rawInput[len(c.rawInput):n])
+		i, err := c.conn.ReadRecord(level, c.rawInput[len(c.rawInput):n])
 		if err != nil {
 			return err
 		}
@@ -127,7 +115,7 @@ func (c *Conn) growReadBufCapacity(n int) {
 }
 
 func (c *Conn) writeRecord(typ recordType, data []byte) (int, error) {
-	return c.recordLayer.WriteRecord(c.out.encryptionLevel, data)
+	return c.conn.WriteRecord(c.out.encryptionLevel, data)
 }
 
 // sendAlert sends a TLS alert message.
@@ -203,8 +191,65 @@ func (c *Conn) readHandshake() (interface{}, error) {
 	return m, nil
 }
 
+// handlePostHandshakeMessage processes a handshake message arrived after the
+// handshake is complete. Up to TLS 1.2, it indicates the start of a renegotiation.
+func (c *Conn) handlePostHandshakeMessage() error {
+	if c.vers != tls.VersionTLS13 {
+		return fmt.Errorf("tls: unsupported version %v", c.vers)
+	}
+
+	msg, err := c.readHandshake()
+	if err != nil {
+		if err == ErrWantRead {
+			return nil
+		}
+		return err
+	}
+
+	c.retryCount++
+	if c.retryCount > maxUselessRecords {
+		c.sendAlert(alertUnexpectedMessage)
+		return errors.New("tls: too many non-advancing records")
+	}
+
+	switch msg := msg.(type) {
+	case *newSessionTicketMsgTLS13:
+		return c.handleNewSessionTicket(msg)
+	case *keyUpdateMsg:
+		return c.handleKeyUpdate(msg)
+	default:
+		c.sendAlert(alertUnexpectedMessage)
+		return fmt.Errorf("tls: received unexpected handshake message of type %T", msg)
+	}
+}
+
+func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
+	cipherSuite := cipherSuiteTLS13ByID(c.cipherSuite)
+	if cipherSuite == nil {
+		c.sendAlert(alertInternalError)
+		return errors.New("tls: unsupported cipher suite")
+	}
+
+	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
+	c.setInSecret(c.in.encryptionLevel, newSecret)
+
+	if keyUpdate.updateRequested {
+		msg := &keyUpdateMsg{}
+		_, err := c.writeRecord(recordTypeHandshake, msg.marshal())
+		if err != nil {
+			// Surface the error at the next write.
+			return err
+		}
+
+		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
+		c.setOutSecret(c.out.encryptionLevel, newSecret)
+	}
+
+	return nil
+}
+
 func (c *Conn) setInSecret(level EncryptionLevel, inSecret []byte) error {
-	if err := c.recordLayer.SetReadSecret(level, inSecret); err != nil {
+	if err := c.conn.SetReadSecret(level, inSecret); err != nil {
 		return err
 	}
 	c.in.trafficSecret = inSecret
@@ -213,7 +258,7 @@ func (c *Conn) setInSecret(level EncryptionLevel, inSecret []byte) error {
 }
 
 func (c *Conn) setOutSecret(level EncryptionLevel, outSecret []byte) error {
-	if err := c.recordLayer.SetWriteSecret(level, outSecret); err != nil {
+	if err := c.conn.SetWriteSecret(level, outSecret); err != nil {
 		return err
 	}
 	c.out.trafficSecret = outSecret
@@ -223,50 +268,51 @@ func (c *Conn) setOutSecret(level EncryptionLevel, outSecret []byte) error {
 
 // Handshake runs the client or server handshake
 // protocol if it has not yet been run.
-// Most uses of this package need not call Handshake
-// explicitly: the first Read or Write will call it automatically.
 func (c *Conn) Handshake() error {
-	var err error
-	if err = c.handshakeErr; err != nil {
+	if err := c.handshakeErr; err != nil {
 		return err
 	}
 	if c.handshakeComplete() {
-		return nil
+		return c.handlePostHandshakeMessage()
 	}
-	if c.isClient {
-		err = c.clientHandshake()
+
+	err := c.handshakeFn()
+	if err == nil {
+		c.handshakes++
 	} else {
-		err = c.serverHandshake()
-	}
-	if err != nil {
 		if err != ErrWantRead {
 			// Can only continue when it needs new data
 			c.handshakeErr = err
 		}
 		return err
 	}
-	c.handshakes++
-	c.handshakeStatus = 1
-	// TODO: Delete handshake state
-	return nil
+
+	if c.handshakeComplete() {
+		c.handshakeErr = c.handlePostHandshakeMessage()
+	} else {
+		c.handshakeErr = errors.New("tls: internal error: handshake should have had a result")
+	}
+
+	return c.handshakeErr
 }
 
 // ConnectionState returns basic TLS details about the connection.
 func (c *Conn) ConnectionState() tls.ConnectionState {
+	return c.connectionStateLocked()
+}
+
+func (c *Conn) connectionStateLocked() tls.ConnectionState {
 	var state tls.ConnectionState
 	state.HandshakeComplete = c.handshakeComplete()
+	state.Version = c.vers
+	state.NegotiatedProtocol = c.clientProtocol
+	state.DidResume = c.didResume
 	state.ServerName = c.serverName
 	state.CipherSuite = c.cipherSuite
-
-	if state.HandshakeComplete {
-		state.Version = c.vers
-		state.NegotiatedProtocol = c.clientProtocol
-		state.DidResume = c.didResume
-		state.PeerCertificates = c.peerCertificates
-		state.VerifiedChains = c.verifiedChains
-		state.SignedCertificateTimestamps = c.scts
-		state.OCSPResponse = c.ocspResponse
-	}
+	state.PeerCertificates = c.peerCertificates
+	state.VerifiedChains = c.verifiedChains
+	state.SignedCertificateTimestamps = c.scts
+	state.OCSPResponse = c.ocspResponse
 	return state
 }
 

@@ -5,6 +5,7 @@
 package tls13
 
 import (
+	"container/list"
 	"crypto"
 	"crypto/rand"
 	"crypto/sha512"
@@ -169,6 +170,14 @@ var helloRetryRequestRandom = []byte{ // See RFC 8446, Section 4.1.3.
 	0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 }
 
+const (
+	// downgradeCanaryTLS12 or downgradeCanaryTLS11 is embedded in the server
+	// random as a downgrade protection if the server would be capable of
+	// negotiating a higher version. See RFC 8446, Section 4.1.3.
+	downgradeCanaryTLS12 = "DOWNGRD\x01"
+	downgradeCanaryTLS11 = "DOWNGRD\x00"
+)
+
 // requiresClientCert reports whether the ClientAuthType requires a client
 // certificate to be provided.
 func requiresClientCert(c tls.ClientAuthType) bool {
@@ -180,9 +189,9 @@ func requiresClientCert(c tls.ClientAuthType) bool {
 	}
 }
 
-// clientSessionState contains the state needed by clients to resume TLS
+// ClientSessionState contains the state needed by clients to resume TLS
 // sessions.
-type clientSessionState struct {
+type ClientSessionState struct {
 	sessionTicket      []uint8               // Encrypted ticket used for session resumption with server
 	vers               uint16                // TLS version negotiated for the session
 	cipherSuite        uint16                // Ciphersuite negotiated for the session
@@ -190,6 +199,8 @@ type clientSessionState struct {
 	serverCertificates []*x509.Certificate   // Certificate chain presented by the server
 	verifiedChains     [][]*x509.Certificate // Certificate chains we built for verification
 	receivedAt         time.Time             // When the session ticket was received from the server
+	ocspResponse       []byte                // Stapled OCSP response presented by the server
+	scts               [][]byte              // SCTs presented by the server
 
 	// TLS 1.3 fields.
 	nonce  []byte    // Ticket nonce sent by the server, to derive PSK
@@ -197,9 +208,37 @@ type clientSessionState struct {
 	ageAdd uint32    // Random obfuscation factor for sending the ticket age
 }
 
-// ticketKeyNameLen is the number of bytes of identifier that is prepended to
-// an encrypted session ticket in order to identify the key used to encrypt it.
-const ticketKeyNameLen = 16
+// ClientSessionCache is a cache of ClientSessionState objects that can be used
+// by a client to resume a TLS session with a given server. ClientSessionCache
+// implementations should expect to be called concurrently from different
+// goroutines. Up to TLS 1.2, only ticket-based resumption is supported, not
+// SessionID-based resumption. In TLS 1.3 they were merged into PSK modes, which
+// are supported via this interface.
+type ClientSessionCache interface {
+	// GetClientSession searches for a ClientSessionState associated with the given key.
+	// On return, ok is true if one was found.
+	GetClientSession(sessionKey string) (session *ClientSessionState, ok bool)
+
+	// PutClientSession adds the ClientSessionState to the cache with the given key. It might
+	// get called multiple times in a connection if a TLS 1.3 server provides
+	// more than one session ticket. If called with a nil *ClientSessionState,
+	// it should remove the cache entry.
+	PutClientSession(sessionKey string, cs *ClientSessionState)
+}
+
+const (
+	// ticketKeyNameLen is the number of bytes of identifier that is prepended to
+	// an encrypted session ticket in order to identify the key used to encrypt it.
+	ticketKeyNameLen = 16
+
+	// ticketKeyLifetime is how long a ticket key remains valid and can be used to
+	// resume a client connection.
+	ticketKeyLifetime = 7 * 24 * time.Hour // 7 days
+
+	// ticketKeyRotation is how often the server should rotate the session ticket key
+	// that is used for new tickets.
+	ticketKeyRotation = 24 * time.Hour
+)
 
 // ticketKey is the internal representation of a session ticket key.
 type ticketKey struct {
@@ -208,16 +247,19 @@ type ticketKey struct {
 	keyName [ticketKeyNameLen]byte
 	aesKey  [16]byte
 	hmacKey [16]byte
+	// created is the time at which this ticket key was created. See Config.ticketKeys.
+	created time.Time
 }
 
 // ticketKeyFromBytes converts from the external representation of a session
 // ticket key to a ticketKey. Externally, session ticket keys are 32 random
 // bytes and this function expands that into sufficient name and key material.
-func ticketKeyFromBytes(b [32]byte) (key ticketKey) {
+func configTicketKeyFromBytes(c *tls.Config, b [32]byte) (key ticketKey) {
 	hashed := sha512.Sum512(b[:])
 	copy(key.keyName[:], hashed[:ticketKeyNameLen])
 	copy(key.aesKey[:], hashed[ticketKeyNameLen:ticketKeyNameLen+16])
 	copy(key.hmacKey[:], hashed[ticketKeyNameLen+16:ticketKeyNameLen+32])
+	key.created = configTime(c)
 	return key
 }
 
@@ -225,36 +267,58 @@ func ticketKeyFromBytes(b [32]byte) (key ticketKey) {
 // ticket, and the lifetime we set for tickets we send.
 const maxSessionTicketLifetime = 7 * 24 * time.Hour
 
-// configTicketKeys is a replacement for tls.Config.ticketKeys.
-func configTicketKeys(c *tls.Config) []ticketKey {
-	// FIXME: Get ticketKeys from tls.Config
-	v, ok := globalTicketKeys.Load(c)
-	if ok {
-		return v.([]ticketKey)
-	}
-	alreadySet := false
-	for _, b := range c.SessionTicketKey {
-		if b != 0 {
-			alreadySet = true
-			break
+// ticketKeys returns the ticketKeys for this connection.
+// If configForClient has explicitly set keys, those will
+// be returned. Otherwise, the keys on c will be used and
+// may be rotated if auto-managed.
+// During rotation, any expired session ticket keys are deleted from
+// c.sessionTicketKeys. If the session ticket key that is currently
+// encrypting tickets (ie. the first ticketKey in c.sessionTicketKeys)
+// is not fresh, then a new session ticket key will be
+// created and prepended to c.sessionTicketKeys.
+func configTicketKeys(c *tls.Config, configForClient *tls.Config) []ticketKey {
+	// If the ConfigForClient callback returned a Config with explicitly set
+	// keys, use those, otherwise just use the original Config.
+	if configForClient != nil {
+		if configForClient.SessionTicketsDisabled {
+			return nil
 		}
 	}
-	var key ticketKey
-	if alreadySet {
-		key = ticketKeyFromBytes(c.SessionTicketKey)
-	} else {
-		var sessionTicketKey [32]byte
-		if _, err := io.ReadFull(configRand(c), sessionTicketKey[:]); err != nil {
-			panic(err)
+	if c.SessionTicketsDisabled {
+		return nil
+	}
+
+	s := getServerSession(c)
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	// Fast path for the common case where the key is fresh enough.
+	if len(s.autoSessionTicketKeys) > 0 && configTime(c).Sub(s.autoSessionTicketKeys[0].created) < ticketKeyRotation {
+		return s.autoSessionTicketKeys
+	}
+
+	// autoSessionTicketKeys are managed by auto-rotation.
+	s.mutex.RUnlock()
+	defer s.mutex.RLock()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	// Re-check the condition in case it changed since obtaining the new lock.
+	if len(s.autoSessionTicketKeys) == 0 || configTime(c).Sub(s.autoSessionTicketKeys[0].created) >= ticketKeyRotation {
+		var newKey [32]byte
+		if _, err := io.ReadFull(configRand(c), newKey[:]); err != nil {
+			panic(fmt.Sprintf("unable to generate random session ticket key: %v", err))
 		}
-		key = ticketKeyFromBytes(sessionTicketKey)
+		valid := make([]ticketKey, 0, len(s.autoSessionTicketKeys)+1)
+		valid = append(valid, configTicketKeyFromBytes(c, newKey))
+		for _, k := range s.autoSessionTicketKeys {
+			// While rotating the current key, also remove any expired ones.
+			if configTime(c).Sub(k.created) < ticketKeyLifetime {
+				valid = append(valid, k)
+			}
+		}
+		s.autoSessionTicketKeys = valid
 	}
-	sessionTicketKeys := []ticketKey{key}
-	v, ok = globalTicketKeys.LoadOrStore(c, sessionTicketKeys)
-	if ok {
-		return v.([]ticketKey)
-	}
-	return sessionTicketKeys
+	return s.autoSessionTicketKeys
 }
 
 // configRand is a replacement for tls.Config.rand.
@@ -279,13 +343,17 @@ func configTime(c *tls.Config) time.Time {
 func configCipherSuites(c *tls.Config) []uint16 {
 	s := c.CipherSuites
 	if s == nil {
-		s = defaultCipherSuitesTLS13
+		s = defaultCipherSuitesTLS13()
 	}
 	return s
 }
 
 var supportedVersions = []uint16{
 	tls.VersionTLS13,
+}
+
+func maxSupportedVersion() uint16 {
+	return supportedVersions[0]
 }
 
 // supportedVersionsFromMax returns a list of supported versions derived from a
@@ -404,6 +472,103 @@ type handshakeMessage interface {
 	unmarshal([]byte) bool
 }
 
+// lruSessionCache is a ClientSessionCache implementation that uses an LRU
+// caching strategy.
+type lruSessionCache struct {
+	sync.Mutex
+
+	m        map[string]*list.Element
+	q        *list.List
+	capacity int
+	// stdTLS is the cache provided by standard tls package.
+	stdTLS tls.ClientSessionCache
+}
+
+type lruSessionCacheEntry struct {
+	sessionKey string
+	state      *ClientSessionState
+}
+
+// NewLRUClientSessionCache returns a ClientSessionCache with the given
+// capacity that uses an LRU strategy. If capacity is < 1, a default capacity
+// is used instead.
+func NewLRUClientSessionCache(capacity int) tls.ClientSessionCache {
+	const defaultSessionCacheCapacity = 64
+
+	if capacity < 1 {
+		capacity = defaultSessionCacheCapacity
+	}
+	return &lruSessionCache{
+		m:        make(map[string]*list.Element),
+		q:        list.New(),
+		capacity: capacity,
+		stdTLS:   tls.NewLRUClientSessionCache(capacity),
+	}
+}
+
+// Put adds the provided (sessionKey, cs) pair to the cache. If cs is nil, the entry
+// corresponding to sessionKey is removed from the cache instead.
+func (c *lruSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
+	if c.stdTLS != nil {
+		c.stdTLS.Put(sessionKey, cs)
+	}
+}
+
+// PutClientSession adds the provided (sessionKey, cs) pair to the cache. If cs is nil, the entry
+// corresponding to sessionKey is removed from the cache instead.
+func (c *lruSessionCache) PutClientSession(sessionKey string, cs *ClientSessionState) {
+	c.Lock()
+	defer c.Unlock()
+
+	if elem, ok := c.m[sessionKey]; ok {
+		if cs == nil {
+			c.q.Remove(elem)
+			delete(c.m, sessionKey)
+		} else {
+			entry := elem.Value.(*lruSessionCacheEntry)
+			entry.state = cs
+			c.q.MoveToFront(elem)
+		}
+		return
+	}
+
+	if c.q.Len() < c.capacity {
+		entry := &lruSessionCacheEntry{sessionKey, cs}
+		c.m[sessionKey] = c.q.PushFront(entry)
+		return
+	}
+
+	elem := c.q.Back()
+	entry := elem.Value.(*lruSessionCacheEntry)
+	delete(c.m, entry.sessionKey)
+	entry.sessionKey = sessionKey
+	entry.state = cs
+	c.q.MoveToFront(elem)
+	c.m[sessionKey] = elem
+}
+
+// Get returns the ClientSessionState value associated with a given key. It
+// returns (nil, false) if no value is found.
+func (c *lruSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
+	if c.stdTLS != nil {
+		return c.stdTLS.Get(sessionKey)
+	}
+	return nil, false
+}
+
+// GetClientSession returns the ClientSessionState value associated with a given key. It
+// returns (nil, false) if no value is found.
+func (c *lruSessionCache) GetClientSession(sessionKey string) (*ClientSessionState, bool) {
+	c.Lock()
+	defer c.Unlock()
+
+	if elem, ok := c.m[sessionKey]; ok {
+		c.q.MoveToFront(elem)
+		return elem.Value.(*lruSessionCacheEntry).state, true
+	}
+	return nil, false
+}
+
 // TODO(jsing): Make these available to both crypto/x509 and crypto/tls.
 type dsaSignature struct {
 	R, S *big.Int
@@ -417,10 +582,16 @@ func defaultConfig() *tls.Config {
 	return &emptyConfig
 }
 
-var defaultCipherSuitesTLS13 = []uint16{
-	tls.TLS_AES_128_GCM_SHA256,
-	tls.TLS_CHACHA20_POLY1305_SHA256,
-	tls.TLS_AES_256_GCM_SHA384,
+var (
+	varDefaultCipherSuitesTLS13 = []uint16{
+		tls.TLS_AES_128_GCM_SHA256,
+		tls.TLS_CHACHA20_POLY1305_SHA256,
+		tls.TLS_AES_256_GCM_SHA384,
+	}
+)
+
+func defaultCipherSuitesTLS13() []uint16 {
+	return varDefaultCipherSuitesTLS13
 }
 
 func unexpectedMessageError(wanted, got interface{}) error {
@@ -434,4 +605,30 @@ func isSupportedSignatureAlgorithm(sigAlg tls.SignatureScheme, supportedSignatur
 		}
 	}
 	return false
+}
+
+// serverSession is the replacement for tls.Config.autoSessionTicketKeys.
+type serverSession struct {
+	// mutex protects sessionTicketKeys and autoSessionTicketKeys.
+	mutex sync.RWMutex
+	// autoSessionTicketKeys is like sessionTicketKeys but is owned by the
+	// auto-rotation logic. See Config.ticketKeys.
+	autoSessionTicketKeys []ticketKey
+}
+
+// globalServerSessions has all server sessions. It is a map[*tls.Config]*serverSession.
+// FIXME: Limit number of sessions to avoid memory leak.
+var globalServerSessions sync.Map
+
+func getServerSession(c *tls.Config) *serverSession {
+	s, ok := globalServerSessions.Load(c)
+	if ok {
+		return s.(*serverSession)
+	}
+	sess := &serverSession{}
+	s, ok = globalServerSessions.LoadOrStore(c, sess)
+	if ok {
+		return s.(*serverSession)
+	}
+	return sess
 }

@@ -31,6 +31,7 @@ func (clientCommand) Run(args []string) error {
 	listenAddr := cmd.String("listen", "0.0.0.0:0", "listen on the given IP:port")
 	insecure := cmd.Bool("insecure", false, "skip verifying server certificate")
 	root := cmd.String("root", "", "root download directory")
+	multi := cmd.Bool("multi", false, "download files using multiple streams")
 	cipher := cmd.String("cipher", "", "TLS 1.3 cipher suite, e.g. TLS_CHACHA20_POLY1305_SHA256")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
@@ -55,8 +56,7 @@ func (clientCommand) Run(args []string) error {
 		if err != nil {
 			return err
 		}
-		// In reverse
-		urls[len(urls)-1-i] = addrURL
+		urls[i] = addrURL
 	}
 	config := newConfig()
 	config.TLS.ServerName = urls[len(urls)-1].Hostname()
@@ -74,9 +74,8 @@ func (clientCommand) Run(args []string) error {
 		return fmt.Errorf("unsupported cipher: %v", *cipher)
 	}
 	handler := clientHandler{
-		buf:   newBuffers(2048, 10),
-		root:  *root,
-		files: urls,
+		buf:  newBuffers(2048, 10),
+		root: *root,
 	}
 	client := quic.NewClient(config)
 	client.SetHandler(&handler)
@@ -94,15 +93,28 @@ func (clientCommand) Run(args []string) error {
 		}()
 		client.SetLogger(*logLevel, logFd)
 	}
-
 	if err := client.ListenAndServe(*listenAddr); err != nil {
 		return err
 	}
-	handler.wg.Add(1)
-	if err := client.Connect(canonicalAddr(urls[len(urls)-1])); err != nil {
-		return err
+	if *multi || len(handler.files) == 1 {
+		// Download all files using multiple streams.
+		handler.files = urls
+		handler.wg.Add(1)
+		if err := client.Connect(canonicalAddr(handler.files[0])); err != nil {
+			return err
+		}
+		handler.wg.Wait()
+	} else {
+		// Create a new connection for each download.
+		for i := range urls {
+			handler.files = urls[i : i+1]
+			handler.wg.Add(1)
+			if err := client.Connect(canonicalAddr(handler.files[0])); err != nil {
+				return err
+			}
+			handler.wg.Wait()
+		}
 	}
-	handler.wg.Wait()
 	return client.Close()
 }
 
@@ -145,7 +157,7 @@ func (s *clientHandler) Serve(c *quic.Conn, events []transport.Event) {
 
 func (s *clientHandler) downloadFiles(c *quic.Conn) error {
 	for len(s.files) > 0 {
-		fileURL := s.files[len(s.files)-1]
+		fileURL := s.files[0]
 		st, id, err := c.NewStream(true)
 		if err != nil {
 			if err, ok := err.(*transport.Error); ok && err.Code == transport.StreamLimitError {
@@ -169,7 +181,7 @@ func (s *clientHandler) downloadFiles(c *quic.Conn) error {
 			return err
 		}
 		st.Close()
-		s.files = s.files[:len(s.files)-1]
+		s.files = s.files[1:]
 		s.getRequests(c)[id] = output
 		s.wg.Add(1)
 	}
@@ -237,7 +249,7 @@ func parseURL(addr string) (*url.URL, error) {
 		return nil, err
 	}
 	if addrURL.Scheme != "https" {
-		return nil, fmt.Errorf("unsupported scheme: %v", addrURL.Scheme)
+		return nil, fmt.Errorf("unsupported url scheme: %v", addrURL)
 	}
 	if addrURL.Path == "" {
 		addrURL.Path = "/"

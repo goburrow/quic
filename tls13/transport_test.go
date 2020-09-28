@@ -3,18 +3,18 @@ package tls13
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"io"
+	"strings"
 	"testing"
-
-	"github.com/goburrow/quic/testdata"
 )
 
-type testRecordLayer struct {
+type testTransport struct {
 	read  [EncryptionLevelApplication + 1]bytes.Buffer
 	write [EncryptionLevelApplication + 1]bytes.Buffer
 }
 
-func (t *testRecordLayer) ReadRecord(level EncryptionLevel, b []byte) (int, error) {
+func (t *testTransport) ReadRecord(level EncryptionLevel, b []byte) (int, error) {
 	n, err := t.read[level].Read(b)
 	if err == io.EOF {
 		return n, nil
@@ -22,7 +22,7 @@ func (t *testRecordLayer) ReadRecord(level EncryptionLevel, b []byte) (int, erro
 	return n, err
 }
 
-func (t *testRecordLayer) WriteRecord(level EncryptionLevel, b []byte) (int, error) {
+func (t *testTransport) WriteRecord(level EncryptionLevel, b []byte) (int, error) {
 	n, err := t.write[level].Write(b)
 	if err == io.EOF {
 		return n, nil
@@ -30,16 +30,16 @@ func (t *testRecordLayer) WriteRecord(level EncryptionLevel, b []byte) (int, err
 	return n, err
 }
 
-func (t *testRecordLayer) SetReadSecret(level EncryptionLevel, readSecret []byte) error {
+func (t *testTransport) SetReadSecret(level EncryptionLevel, readSecret []byte) error {
 	return nil
 }
 
-func (t *testRecordLayer) SetWriteSecret(level EncryptionLevel, writeSecret []byte) error {
+func (t *testTransport) SetWriteSecret(level EncryptionLevel, writeSecret []byte) error {
 	return nil
 }
 
 func TestReadClientHello(t *testing.T) {
-	cert, err := tls.LoadX509KeyPair("../testdata/cert.pem", "../testdata/key.pem")
+	cert, err := tls.LoadX509KeyPair("testdata/example-cert.pem", "testdata/example-key.pem")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,11 +56,11 @@ func TestReadClientHello(t *testing.T) {
 	0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 	0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 	00000000000000000000000000000000`
-	data := testdata.DecodeHex(clientHello)
-	records := testRecordLayer{}
+	data := decodeHex(clientHello)
+	records := testTransport{}
 	records.read[EncryptionLevelInitial].Write(data)
 
-	conn := NewConn(&records, &tlsConfig, false)
+	conn := Server(&records, &tlsConfig)
 	err = conn.Handshake()
 	if err != ErrWantRead {
 		t.Fatalf("unexpected error: %v", err)
@@ -70,4 +70,15 @@ func TestReadClientHello(t *testing.T) {
 	}
 
 	t.Logf("\nhandshake output buffer: %d\n", records.write[EncryptionLevelHandshake].Len())
+}
+
+func decodeHex(str string) []byte {
+	str = strings.ReplaceAll(str, "\n", "")
+	str = strings.ReplaceAll(str, "\t", "")
+	str = strings.ReplaceAll(str, " ", "")
+	b, err := hex.DecodeString(str)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

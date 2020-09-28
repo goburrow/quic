@@ -255,6 +255,12 @@ func (m *clientHelloMsg) marshal() []byte {
 					})
 				})
 			}
+			if len(m.quicTransportParams) > 0 {
+				b.AddUint16(extensionQUICTransportParams)
+				b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+					b.AddBytes(m.quicTransportParams)
+				})
+			}
 			if m.earlyData {
 				// RFC 8446, Section 4.2.10
 				b.AddUint16(extensionEarlyData)
@@ -288,12 +294,6 @@ func (m *clientHelloMsg) marshal() []byte {
 							})
 						}
 					})
-				})
-			}
-			if len(m.quicTransportParams) > 0 {
-				b.AddUint16(extensionQUICTransportParams)
-				b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
-					b.AddBytes(m.quicTransportParams)
 				})
 			}
 			extensionsPresent = len(b.BytesOrPanic()) > 2

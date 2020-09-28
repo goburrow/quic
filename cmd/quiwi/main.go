@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goburrow/quic/tls13"
 	"github.com/goburrow/quic/transport"
 )
 
@@ -58,10 +59,11 @@ func newConfig() *transport.Config {
 	c.Params.InitialMaxStreamsUni = 8
 	c.TLS = &tls.Config{
 		NextProtos: []string{
-			fmt.Sprintf("hq-%d", transport.ProtocolVersion&0xff),
+			fmt.Sprintf("hq-%d", c.Version&0xff),
 			"http/0.9",
 		},
-		KeyLogWriter: newKeyLogWriter(),
+		ClientSessionCache: tls13.NewLRUClientSessionCache(10),
+		KeyLogWriter:       newKeyLogWriter(),
 	}
 	return c
 }

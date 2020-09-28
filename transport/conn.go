@@ -214,7 +214,7 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) 
 	}
 	var newVersion uint32
 	for _, v := range p.supportedVersions {
-		if versionSupported(v) {
+		if VersionSupported(v) {
 			newVersion = v
 			break
 		}
@@ -813,14 +813,11 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 }
 
 func (s *Conn) doHandshake(now time.Time) error {
-	if s.state >= StateActive {
-		return nil
-	}
 	err := s.handshake.doHandshake()
 	if err != nil {
 		return err
 	}
-	if s.handshake.HandshakeComplete() {
+	if s.state < StateActive && s.handshake.HandshakeComplete() {
 		params := s.handshake.peerTransportParams()
 		debug("peer transport params: %+v", params)
 		if err := s.validatePeerTransportParams(params); err != nil {
@@ -841,6 +838,7 @@ func (s *Conn) setPeerParams(params *Parameters, now time.Time) {
 	s.streams.setPeerMaxStreamsBidi(s.peerParams.InitialMaxStreamsBidi)
 	s.streams.setPeerMaxStreamsUni(s.peerParams.InitialMaxStreamsUni)
 	// Update loss recovery state
+	s.recovery.setHandshakeConfirmed()
 	s.recovery.setMaxAckDelay(s.peerParams.MaxAckDelay)
 	// Datagram
 	s.datagram.setMaxSend(s.peerParams.MaxDatagramPayloadSize)
@@ -896,9 +894,10 @@ func (s *Conn) Read(b []byte) (int, error) {
 	if s.closeFrame == nil {
 		// Only check handshake when not in closing state, so it can send connection close
 		// frame when handshake failed.
-		err := s.doHandshake(now)
-		if err != nil {
-			return 0, err
+		if s.state < StateActive {
+			if err := s.doHandshake(now); err != nil {
+				return 0, err
+			}
 		}
 		// Checking streams state before finding write space to check stream updates.
 		s.checkStreamsState(now)

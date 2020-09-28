@@ -358,6 +358,7 @@ func (s tlsExtension) empty() bool {
 	return len(s) == 0
 }
 
+// tlsHandshake implements tls13.Transport
 type tlsHandshake struct {
 	tlsConfig *tls.Config
 	tlsConn   *tls13.Conn
@@ -367,7 +368,11 @@ type tlsHandshake struct {
 
 func (s *tlsHandshake) init(config *tls.Config, packetNumberSpaces *[packetSpaceCount]packetNumberSpace, isClient bool) {
 	s.tlsConfig = config
-	s.tlsConn = tls13.NewConn(s, s.tlsConfig, isClient)
+	if isClient {
+		s.tlsConn = tls13.Client(s, s.tlsConfig)
+	} else {
+		s.tlsConn = tls13.Server(s, s.tlsConfig)
+	}
 	s.packetNumberSpaces = packetNumberSpaces
 }
 
@@ -404,7 +409,11 @@ func (s *tlsHandshake) writeSpace() packetSpace {
 
 // XXX: Store isClient in tlsHandshake?
 func (s *tlsHandshake) reset(isClient bool) {
-	s.tlsConn = tls13.NewConn(s, s.tlsConfig, isClient)
+	if isClient {
+		s.tlsConn = tls13.Client(s, s.tlsConfig)
+	} else {
+		s.tlsConn = tls13.Server(s, s.tlsConfig)
+	}
 }
 
 func (s *tlsHandshake) ReadRecord(level tls13.EncryptionLevel, b []byte) (int, error) {

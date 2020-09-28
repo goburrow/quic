@@ -53,6 +53,8 @@ type serverHandshakeStateTLS13 struct {
 }
 
 func (hs *serverHandshakeStateTLS13) handshake() error {
+	c := hs.c
+
 	// For an overview of the TLS 1.3 handshake, see RFC 8446, Section 2.
 	if hs.state == serverStateReadClientHello {
 		if err := hs.readClientHello(); err != nil {
@@ -92,9 +94,12 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if hs.state != serverStateFinished {
 		return fmt.Errorf("tls: unexpected handshake state: %v", hs.state)
 	}
+
+	c.handshakeStatus = 1
 	return nil
 }
 
+// readClientHello reads a ClientHello message and selects the protocol version.
 func (hs *serverHandshakeStateTLS13) readClientHello() error {
 	c := hs.c
 
@@ -108,19 +113,19 @@ func (hs *serverHandshakeStateTLS13) readClientHello() error {
 		return unexpectedMessageError(clientHello, msg)
 	}
 
-	// TODO: Support tls.Config.GetConfigForClient
-	/*
-		if c.config.GetConfigForClient != nil {
-			chi := clientHelloInfo(c, clientHello)
-			if newConfig, err := c.config.GetConfigForClient(chi); err != nil {
-				c.sendAlert(alertInternalError)
-				return nil, err
-			} else if newConfig != nil {
-				newConfig.serverInitOnce.Do(func() { newConfig.serverInit(c.config) })
-				c.config = newConfig
-			}
+	var configForClient *tls.Config
+	originalConfig := c.config
+	if c.config.GetConfigForClient != nil {
+		chi := clientHelloInfo(c, clientHello)
+		if configForClient, err = c.config.GetConfigForClient(chi); err != nil {
+			c.sendAlert(alertInternalError)
+			return err
+		} else if configForClient != nil {
+			// TODO: Support changing tls.Config
+			// c.config = configForClient
 		}
-	*/
+	}
+	c.ticketKeys = configTicketKeys(originalConfig, configForClient)
 
 	clientVersions := clientHello.supportedVersions
 	if len(clientHello.supportedVersions) == 0 {
@@ -131,6 +136,7 @@ func (hs *serverHandshakeStateTLS13) readClientHello() error {
 		c.sendAlert(alertProtocolVersion)
 		return fmt.Errorf("tls: client offered only unsupported versions: %x", clientVersions)
 	}
+	c.haveVers = true
 
 	if hs.clientHello == nil {
 		hs.clientHello = clientHello
@@ -167,7 +173,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		if id == tls.TLS_FALLBACK_SCSV {
 			// Use c.vers instead of max(supported_versions) because an attacker
 			// could defeat this by adding an arbitrary high version otherwise.
-			if c.vers < tls.VersionTLS13 {
+			if c.vers < maxSupportedVersion() {
 				c.sendAlert(alertInappropriateFallback)
 				return errors.New("tls: client using inappropriate protocol fallback")
 			}
@@ -208,11 +214,11 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 
 	var preferenceList, supportedList []uint16
 	if c.config.PreferServerCipherSuites {
-		preferenceList = defaultCipherSuitesTLS13
+		preferenceList = defaultCipherSuitesTLS13()
 		supportedList = hs.clientHello.cipherSuites
 	} else {
 		preferenceList = hs.clientHello.cipherSuites
-		supportedList = defaultCipherSuitesTLS13
+		supportedList = defaultCipherSuitesTLS13()
 	}
 	for _, suiteID := range preferenceList {
 		hs.suite = mutualCipherSuiteTLS13(supportedList, suiteID)
@@ -373,6 +379,7 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 			return errors.New("tls: invalid PSK binder")
 		}
 
+		c.didResume = true
 		if err := c.processCertsFromClient(sessionState.certificate); err != nil {
 			return err
 		}
@@ -380,7 +387,6 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 		hs.hello.selectedIdentityPresent = true
 		hs.hello.selectedIdentity = uint16(i)
 		hs.usingPSK = true
-		c.didResume = true
 		return nil
 	}
 
@@ -813,6 +819,18 @@ func (hs *serverHandshakeStateTLS13) sendSessionTickets() error {
 func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 	c := hs.c
 
+	if !hs.requestClientCert() {
+		// Make sure the connection is still being verified whether or not
+		// the server requested a client certificate.
+		if c.config.VerifyConnection != nil {
+			if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+				c.sendAlert(alertBadCertificate)
+				return err
+			}
+		}
+		return nil
+	}
+
 	// If we requested a client certificate, then the client must send a
 	// certificate message. If it's empty, no CertificateVerify is sent.
 
@@ -830,6 +848,13 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 
 	if err := c.processCertsFromClient(certMsg.certificate); err != nil {
 		return err
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
 	}
 
 	if len(certMsg.certificate.Certificate) != 0 {

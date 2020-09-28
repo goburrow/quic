@@ -33,7 +33,7 @@ type clientHandshakeStateTLS13 struct {
 	hello       *clientHelloMsg
 	ecdheParams ecdheParameters
 
-	session     *clientSessionState
+	session     *ClientSessionState
 	earlySecret []byte
 	binderKey   []byte
 
@@ -120,10 +120,11 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 			return err
 		}
 	}
-
 	if hs.state != clientStateFinished {
 		return fmt.Errorf("tls: unexpected handshake state: %v", hs.state)
 	}
+
+	c.handshakeStatus = 1
 	return nil
 }
 
@@ -143,6 +144,18 @@ func (hs *clientHandshakeStateTLS13) readServerHello() error {
 	if hs.serverHello == nil {
 		if err := c.pickTLSVersion(serverHello); err != nil {
 			return err
+		}
+
+		// If we are negotiating a protocol version that's lower than what we
+		// support, check for the server downgrade canaries.
+		// See RFC 8446, Section 4.1.3.
+		maxVers := maxSupportedVersion()
+		tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
+		tls11Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS11
+		if maxVers == tls.VersionTLS13 && c.vers <= tls.VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
+			maxVers == tls.VersionTLS12 && c.vers <= tls.VersionTLS11 && tls11Downgrade {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
 		}
 
 		if c.vers != tls.VersionTLS13 {
@@ -215,51 +228,62 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 	c := hs.c
 
 	// The first ClientHello gets double-hashed into the transcript upon a
-	// HelloRetryRequest. See RFC 8446, Section 4.4.1.
+	// HelloRetryRequest. (The idea is that the server might offload transcript
+	// storage to the client in the cookie.) See RFC 8446, Section 4.4.1.
 	chHash := hs.transcript.Sum(nil)
 	hs.transcript.Reset()
 	hs.transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})
 	hs.transcript.Write(chHash)
 	hs.transcript.Write(hs.serverHello.marshal())
 
+	// The only HelloRetryRequest extensions we support are key_share and
+	// cookie, and clients must abort the handshake if the HRR would not result
+	// in any change in the ClientHello.
+	if hs.serverHello.selectedGroup == 0 && hs.serverHello.cookie == nil {
+		c.sendAlert(alertIllegalParameter)
+		return errors.New("tls: server sent an unnecessary HelloRetryRequest message")
+	}
+
+	if hs.serverHello.cookie != nil {
+		hs.hello.cookie = hs.serverHello.cookie
+	}
+
 	if hs.serverHello.serverShare.group != 0 {
 		c.sendAlert(alertDecodeError)
 		return errors.New("tls: received malformed key_share extension")
 	}
 
-	curveID := hs.serverHello.selectedGroup
-	if curveID == 0 {
-		c.sendAlert(alertMissingExtension)
-		return errors.New("tls: received HelloRetryRequest without selected group")
-	}
-	curveOK := false
-	for _, id := range hs.hello.supportedCurves {
-		if id == curveID {
-			curveOK = true
-			break
+	// If the server sent a key_share extension selecting a group, ensure it's
+	// a group we advertised but did not send a key share for, and send a key
+	// share for it this time.
+	if curveID := hs.serverHello.selectedGroup; curveID != 0 {
+		curveOK := false
+		for _, id := range hs.hello.supportedCurves {
+			if id == curveID {
+				curveOK = true
+				break
+			}
 		}
+		if !curveOK {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: server selected unsupported group")
+		}
+		if hs.ecdheParams.CurveID() == curveID {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: server sent an unnecessary HelloRetryRequest key_share")
+		}
+		if _, ok := curveForCurveID(curveID); curveID != tls.X25519 && !ok {
+			c.sendAlert(alertInternalError)
+			return errors.New("tls: CurvePreferences includes unsupported curve")
+		}
+		params, err := generateECDHEParameters(configRand(c.config), curveID)
+		if err != nil {
+			c.sendAlert(alertInternalError)
+			return err
+		}
+		hs.ecdheParams = params
+		hs.hello.keyShares = []keyShare{{group: curveID, data: params.PublicKey()}}
 	}
-	if !curveOK {
-		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: server selected unsupported group")
-	}
-	if hs.ecdheParams.CurveID() == curveID {
-		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: server sent an unnecessary HelloRetryRequest message")
-	}
-	if _, ok := curveForCurveID(curveID); curveID != tls.X25519 && !ok {
-		c.sendAlert(alertInternalError)
-		return errors.New("tls: CurvePreferences includes unsupported curve")
-	}
-	params, err := generateECDHEParameters(configRand(c.config), curveID)
-	if err != nil {
-		c.sendAlert(alertInternalError)
-		return err
-	}
-	hs.ecdheParams = params
-	hs.hello.keyShares = []keyShare{{group: curveID, data: params.PublicKey()}}
-
-	hs.hello.cookie = hs.serverHello.cookie
 
 	hs.hello.raw = nil
 	if len(hs.hello.pskIdentities) > 0 {
@@ -349,6 +373,8 @@ func (hs *clientHandshakeStateTLS13) processServerHello() error {
 	c.didResume = true
 	c.peerCertificates = hs.session.serverCertificates
 	c.verifiedChains = hs.session.verifiedChains
+	c.ocspResponse = hs.session.ocspResponse
+	c.scts = hs.session.scts
 	return nil
 }
 
@@ -431,6 +457,15 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 	// Either a PSK or a certificate is always used, but not both.
 	// See RFC 8446, Section 4.1.1.
 	if hs.usingPSK {
+		// Make sure the connection is still being verified whether or not this
+		// is a resumption. Resumptions currently don't reverify certificates so
+		// they don't call verifyServerCertificate. See Issue 31641.
+		if c.config.VerifyConnection != nil {
+			if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+				c.sendAlert(alertBadCertificate)
+				return err
+			}
+		}
 		hs.state = clientStateReadServerFinished
 		return nil
 	}
@@ -670,6 +705,10 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {
 		return nil
 	}
+	sessionCache, ok := c.config.ClientSessionCache.(ClientSessionCache)
+	if !ok {
+		return nil
+	}
 
 	// See RFC 8446, Section 4.6.1.
 	if msg.lifetime == 0 {
@@ -691,7 +730,7 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 	// to do the least amount of work on NewSessionTicket messages before we
 	// know if the ticket will be used. Forward secrecy of resumed connections
 	// is guaranteed by the requirement for pskModeDHE.
-	session := clientSessionState{
+	session := &ClientSessionState{
 		sessionTicket:      msg.label,
 		vers:               c.vers,
 		cipherSuite:        c.cipherSuite,
@@ -702,10 +741,12 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 		nonce:              msg.nonce,
 		useBy:              configTime(c.config).Add(lifetime),
 		ageAdd:             msg.ageAdd,
+		ocspResponse:       c.ocspResponse,
+		scts:               c.scts,
 	}
 
 	cacheKey := clientSessionCacheKey(c.config)
-	c.config.ClientSessionCache.Put(cacheKey, session.toTLS())
+	sessionCache.PutClientSession(cacheKey, session)
 
 	return nil
 }

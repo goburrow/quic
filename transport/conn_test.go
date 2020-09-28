@@ -8,6 +8,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/goburrow/quic/tls13"
 )
 
 func TestClientConnInitialState(t *testing.T) {
@@ -83,7 +85,7 @@ func TestHandshake(t *testing.T) {
 	}
 	server, err := Accept([]byte("server"), nil, serverConfig)
 	p := &testEndpoint{client: client, server: server}
-	err = p.handshake()
+	_, err = p.handshake()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +125,7 @@ func TestHandshakeWithRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.server = server
-	err = p.handshake()
+	_, err = p.handshake()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,17 +410,60 @@ func TestConnClose(t *testing.T) {
 	}
 }
 
-func newTestConn() (*testEndpoint, error) {
-	clientCID := []byte("client-cid")
+func TestConnResumption(t *testing.T) {
 	clientConfig := newTestConfig()
 	clientConfig.TLS.ServerName = "localhost"
 	clientConfig.TLS.RootCAs = testCA
+	clientConfig.TLS.ClientSessionCache = tls13.NewLRUClientSessionCache(10)
+	client, err := Connect([]byte("client"), clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
+	serverConfig := newTestConfig()
+	serverConfig.TLS.Certificates = testCerts
+	server, err := Accept([]byte("server"), nil, serverConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &testEndpoint{
+		client: client,
+		server: server,
+	}
+	hs1, err := p.handshake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("first handshake: %d bytes", hs1)
+
+	p.client.Close(true, 0, "")
+	_, err = p.sendToServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.client, _ = Connect([]byte("new-client"), clientConfig)
+	p.server, _ = Accept([]byte("new-server"), nil, serverConfig)
+	hs2, err := p.handshake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("resume handshake: %d bytes", hs2)
+	if hs1 <= hs2 {
+		// TODO: 0-RTT
+		t.Fatalf("expect less roundtrip than %d, actual %d", hs1, hs2)
+	}
+}
+
+func newTestConn() (*testEndpoint, error) {
+	clientConfig := newTestConfig()
+	clientConfig.TLS.ServerName = "localhost"
+	clientConfig.TLS.RootCAs = testCA
+	clientCID := []byte("client-cid")
 	client, err := Connect(clientCID, clientConfig)
 	if err != nil {
 		return nil, err
 	}
-
 	serverConfig := newTestConfig()
 	serverConfig.TLS.Certificates = testCerts
 	serverCID := []byte("server-cid")
@@ -430,7 +475,7 @@ func newTestConn() (*testEndpoint, error) {
 		client: client,
 		server: server,
 	}
-	err = p.handshake()
+	_, err = p.handshake()
 	if err != nil {
 		return nil, err
 	}
@@ -509,35 +554,38 @@ func (t *testEndpoint) retry() error {
 	return err
 }
 
-func (t *testEndpoint) handshake() error {
+func (t *testEndpoint) handshake() (int, error) {
 	start := time.Now()
+	count := 0
 	for t.client.ConnectionState() != StateActive || t.server.ConnectionState() != StateActive {
 		n, err := t.client.Read(t.buf[:])
 		if err != nil {
-			return err
+			return count, err
 		}
 		if n > 0 {
+			count += n
 			_, err = t.server.Write(t.buf[:n])
 			if err != nil {
-				return err
+				return count, err
 			}
 		}
 		n, err = t.server.Read(t.buf[:])
 		if err != nil {
-			return err
+			return count, err
 		}
 		if n > 0 {
+			count += n
 			_, err = t.client.Write(t.buf[:n])
 			if err != nil {
-				return err
+				return count, err
 			}
 		}
 		elapsed := time.Since(start)
 		if elapsed > 2*time.Second {
-			return fmt.Errorf("handshake too slow: %v", elapsed)
+			return count, fmt.Errorf("handshake too slow: %v", elapsed)
 		}
 	}
-	return nil
+	return count, nil
 }
 
 func BenchmarkCreateConn(b *testing.B) {

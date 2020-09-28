@@ -28,6 +28,7 @@ cd /path/to/quic-interop-runner
 python3 -m venv venv
 . venv/bin/activate
 pip install -r requirements.txt
+./certs.sh .
 # Run test cases
 ./run.py -s quiwi -c quiwi
 ```

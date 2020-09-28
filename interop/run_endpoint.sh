@@ -16,10 +16,10 @@ if [ -z "$QLOGDIR" ]; then
 fi
 
 case "$TESTCASE" in
-    handshake | transfer | multiconnect | retry | chacha20)
+    handshake | transfer | multiconnect | retry | chacha20 | resumption)
         echo "test case supported:" "$TESTCASE"
         ;;
-    resumption | zerortt | http3)
+    zerortt | http3)
         echo "test case not supported:" "$TESTCASE"
         exit 127
         ;;
@@ -33,7 +33,7 @@ run_client() {
     CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3"
     case "$TESTCASE" in
     multiconnect)
-        # Create multiple connections
+        # Create multiple connections instead of multiple streams.
         for REQ in $REQUESTS; do
             NAME="$(basename $REQ)"
             PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client-$NAME.qlog"
@@ -44,23 +44,28 @@ run_client() {
         wait
         return
         ;;
+    resumption)
+        CLIENT_PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client.qlog"
+        ;;
     chacha20)
-        CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256"
+        CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256 -multi -qlog $QLOGDIR/client.qlog"
+        ;;
+    *)
+        CLIENT_PARAMS="$CLIENT_PARAMS -multi -qlog $QLOGDIR/client.qlog"
         ;;
     esac
-    CLIENT_PARAMS="$CLIENT_PARAMS $QLOGDIR/client.qlog"
-    echo "# CLIENT_PARAMS: $CLIENT_PARAMS"
+    echo "# CLIENT_PARAMS:" "$CLIENT_PARAMS"
     "$APPDIR/quiwi" client $CLIENT_PARAMS $REQUESTS 2>"$LOGDIR/client.txt"
 }
 
 run_server() {
-    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert $APPDIR/cert.pem -key $APPDIR/key.pem -root $WWWDIR -qlog $QLOGDIR/server.qlog -v 3"
+    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert /certs/cert.pem -key /certs/priv.key -root $WWWDIR -qlog $QLOGDIR/server.qlog -v 3"
     case "$TESTCASE" in
     retry)
         SERVER_PARAMS="$SERVER_PARAMS -retry"
         ;;
     esac
-    echo "# SERVER_PARAMS: $SERVER_PARAMS"
+    echo "# SERVER_PARAMS:" "$SERVER_PARAMS"
     "$APPDIR/quiwi" server $SERVER_PARAMS 2>"$LOGDIR/server.txt"
     # FIXME: no qlog transformation as the script is terminated
 }

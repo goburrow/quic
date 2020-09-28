@@ -108,7 +108,7 @@ func (s *Server) recv(p *packet) {
 			freePacket(p)
 			return
 		}
-		if p.header.Version != transport.ProtocolVersion {
+		if !transport.VersionSupported(p.header.Version) {
 			// Negotiate version
 			s.negotiate(p.addr, &p.header)
 			freePacket(p)

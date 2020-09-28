@@ -16,6 +16,9 @@ import (
 
 // serverHandshake performs a TLS handshake as a server.
 func (c *Conn) serverHandshake() error {
+	if c.config == nil {
+		c.config = defaultConfig()
+	}
 	if c.serverHs == nil {
 		c.serverHs = &serverHandshakeStateTLS13{
 			c:     c,
@@ -65,6 +68,19 @@ func (c *Conn) processCertsFromClient(certificate tls.Certificate) error {
 		c.verifiedChains = chains
 	}
 
+	c.peerCertificates = certs
+	c.ocspResponse = certificate.OCSPStaple
+	c.scts = certificate.SignedCertificateTimestamps
+
+	if len(certs) > 0 {
+		switch certs[0].PublicKey.(type) {
+		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
+		default:
+			c.sendAlert(alertUnsupportedCertificate)
+			return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
+		}
+	}
+
 	if c.config.VerifyPeerCertificate != nil {
 		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
 			c.sendAlert(alertBadCertificate)
@@ -72,20 +88,6 @@ func (c *Conn) processCertsFromClient(certificate tls.Certificate) error {
 		}
 	}
 
-	if len(certs) == 0 {
-		return nil
-	}
-
-	switch certs[0].PublicKey.(type) {
-	case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
-	default:
-		c.sendAlert(alertUnsupportedCertificate)
-		return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
-	}
-
-	c.peerCertificates = certs
-	c.ocspResponse = certificate.OCSPStaple
-	c.scts = certificate.SignedCertificateTimestamps
 	return nil
 }
 

@@ -52,7 +52,7 @@ func TestRecoverySetTimer(t *testing.T) {
 
 func TestRecoveryLossOnReordering(t *testing.T) {
 	x := newLossRecoveryTest(t)
-	x.r.setHandshakeComplete()
+	x.r.setHandshakeConfirmed()
 
 	now := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	x.send(packetSpaceApplication, 0, 100, now, &pingFrame{})

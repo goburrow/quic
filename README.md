@@ -8,6 +8,25 @@ The goal is to provide low level APIs for applications or protocols using QUIC a
 TLS 1.3 support is based on standard Go TLS package (https://github.com/golang/go/tree/master/src/crypto/tls),
 licensed under the 3-clause BSD license.
 
+## Features
+
+- [X] Handshake with TLS 1.3
+- [X] Version negotiation
+- [X] Address validation
+- [X] Loss detection
+- [X] Congestion control
+- [X] Streams
+- [X] Flow control
+- [X] ChaCha20 header protection
+- [X] Unreliable datagram
+- [X] TLS session resumption
+- [X] qlog
+- [ ] Zero RTT
+- [ ] Key update
+- [ ] Path MTU discovery
+- [ ] Connection migration
+- [ ] HTTP/3 - intentionally not implemented
+
 ## Development
 
 Build command:
@@ -84,7 +103,7 @@ Examples
 ./quiwi client https://quic.tech:4433/
 ```
 
-## Datagram
+### Datagram
 
 ```
 Usage: quiwi datagram [arguments] [url]
