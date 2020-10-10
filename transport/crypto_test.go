@@ -12,7 +12,7 @@ import (
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-client-initial
 func TestDecryptClientInitial(t *testing.T) {
 	const clientInitial = `
-	cdff00001d088394c8f03e5157080000 449e9cdb990bfb66bc6a93032b50dd89
+	cdff00001f088394c8f03e5157080000 449e9cdb990bfb66bc6a93032b50dd89
 	73972d149421874d3849e3708d71354e a33bcdc356f3ea6e2a1a1bd7c3d14003
 	8d3e784d04c30a2cdb40c32523aba2da fe1c1bf3d27a6be38fe38ae033fbb071
 	3c1c73661bb6639795b42b97f77068ea d51f11fbf9489af2501d09481e6c64d4
@@ -49,7 +49,7 @@ func TestDecryptClientInitial(t *testing.T) {
 	a10b0c9875125e257c7bfdf27eef4060 bd3d00f4c14fd3e3496c38d3c5d1a566
 	8c39350effbc2d16ca17be4ce29f02ed 969504dda2a8c6b9ff919e693ee79e09
 	089316e7d1d89ec099db3b2b268725d8 88536a4b8bf9aee8fb43e82a4d919d48
-	1802771a449b30f3fa2289852607b660`
+	395781bc0a3e8125b4dd506ca025eb37`
 	const clientPayload = `
 	060040f1010000ed0303ebf8fa56f129 39b9584a3896472ec40bb863cfd3e868
 	04fe3a47f06a2b69484c000004130113 02010000c000000010000e00000b6578
@@ -90,11 +90,11 @@ func TestDecryptClientInitial(t *testing.T) {
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-server-initial
 func TestDecryptServerInitial(t *testing.T) {
 	const serverInitial = `
-	c7ff00001d0008f067a5502a4262b500 4075fb12ff07823a5d24534d906ce4c7
+	c7ff00001f0008f067a5502a4262b500 4075fb12ff07823a5d24534d906ce4c7
 	6782a2167e3479c0f7f6395dc2c91676 302fe6d70bb7cbeb117b4ddb7d173498
 	44fd61dae200b8338e1b932976b61d91 e64a02e9e0ee72e3a6f63aba4ceeeec5
-	be2f24f2d86027572943533846caa13e 6f163fb257473dcca25396e88724f1e5
-	d964dedee9b633`
+	be2f24f2d86027572943533846caa13e 6f163fb257473d76f0e78487aca6427b
+	da2e7e70a7ee48`
 	const serverPayload = `
 	02000000000600405a020000560303ee fce7f7b37ba1d1632e96677825ddf739
 	88cfc79825df566dc5430b9a045a1200 130100002e00330024001d00209d3c94
@@ -130,7 +130,7 @@ func TestDecryptServerInitial(t *testing.T) {
 // https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry
 func TestComputeRetryIntegrity(t *testing.T) {
 	odcid := testdata.DecodeHex(`8394c8f03e515708`)
-	retry := testdata.DecodeHex(`ffff00001d0008f067a5502a4262b5746f6b656e`)
+	retry := testdata.DecodeHex(`ffff00001f0008f067a5502a4262b5746f6b656e`)
 	b := make([]byte, 0, 128)
 	b = append(b, byte(len(odcid)))
 	b = append(b, odcid...)
@@ -142,8 +142,8 @@ func TestComputeRetryIntegrity(t *testing.T) {
 	}
 	actual = actual[len(odcid)+1:]
 	expect := testdata.DecodeHex(`
-	ffff00001d0008f067a5502a4262b574 6f6b656ed16926d81f6f9ca2953a8aa4
-	575e1e49`)
+	ffff00001f0008f067a5502a4262b574 6f6b656ec70ce5de430b4bdb7df1a383
+	3a75f986`)
 	if !bytes.Equal(expect, actual) {
 		t.Fatalf("integrity tag\nexpect: %x\nactual: %x", expect, actual)
 	}
@@ -155,10 +155,10 @@ func TestComputeRetryIntegrity(t *testing.T) {
 func BenchmarkRetryIntegrity(b *testing.B) {
 	odcid := testdata.DecodeHex(`8394c8f03e515708`)
 	pseudoPacket := make([]byte, 0, 128)
-	pseudoPacket = append(pseudoPacket, testdata.DecodeHex(`00208394c8f03e515708ffff00001d0008f067a5502a4262b5746f6b656e`)...)
+	pseudoPacket = append(pseudoPacket, testdata.DecodeHex(`00208394c8f03e515708ffff00001f0008f067a5502a4262b5746f6b656e`)...)
 	retryPacket := testdata.DecodeHex(`
-	ffff00001d0008f067a5502a4262b574 6f6b656ed16926d81f6f9ca2953a8aa4
-	575e1e49`)
+	ffff00001f0008f067a5502a4262b574 6f6b656ec70ce5de430b4bdb7df1a383
+	3a75f986`)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_, err := computeRetryIntegrity(pseudoPacket)

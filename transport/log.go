@@ -33,6 +33,7 @@ const (
 	logTriggerPayloadDecryptError = "payload_decrypt_error"
 	logTriggerUnexpectedPacket    = "unexpected_packet"
 	logTriggerDuplicate           = "duplicate"
+	logTriggerUnsupportedVersion  = "unsupported_version"
 )
 
 // LogEvent is event sent by connection

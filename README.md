@@ -18,8 +18,9 @@ licensed under the 3-clause BSD license.
 - [X] Streams
 - [X] Flow control
 - [X] ChaCha20 header protection
-- [X] Unreliable datagram
 - [X] TLS session resumption
+- [X] Anti-amplification
+- [X] Unreliable datagram
 - [X] qlog
 - [ ] Zero RTT
 - [ ] Key update

@@ -29,10 +29,11 @@ const (
 	// Endpoints should use an initial congestion window of 10 times the maximum datagram size,
 	// limited to the larger of 14720 or twice the maximum datagram size
 	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#initial-cwnd
-	initialWindowPackets = 10
-	maxDatagramSize      = 1452
-	initialWindow        = initialWindowPackets * maxDatagramSize
-	minimumWindow        = 2 * maxDatagramSize
+	initialMaxDatagramSize  = 1472
+	initialCongestionWindow = 10 * initialMaxDatagramSize
+	// The minimum congestion window is the smallest value the congestion window can decrease
+	// to as a response to loss. The recommended value is 2 * max_datagram_size.
+	minimumCongestionWindow = 2 * initialMaxDatagramSize
 
 	// Reduction in congestion window when a new loss event is detected.
 	// NOTE: The value in spec is 0.5, but used as "x/2" here to avoid casting to float.
@@ -45,7 +46,10 @@ const (
 	persistentCongestionThreshold = 3
 
 	maxProbes = 2
-
+	// Prior to validating the client address, servers MUST NOT send more than three times
+	// as many bytes as the number of bytes they have received.
+	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-address-validation-during-c
+	maxAmplificationFactor = 3
 	// maxUint64 indicates infinity
 	maxUint64 = ^uint64(0)
 )
@@ -135,7 +139,9 @@ type lossRecovery struct {
 	lostCount uint64
 
 	// Control PTO calculation.
-	handshakeConfirmed bool
+	hasHandshakeKeys               bool
+	peerCompletedAddressValidation bool
+	handshakeConfirmed             bool
 
 	congestion congestionControl
 }
@@ -162,7 +168,7 @@ func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 			s.timeOfLastAckElicitingPacket[space] = p.timeSent
 		}
 		s.congestion.onPacketSent(p.sentBytes)
-		s.setLossDetectionTimer()
+		s.setLossDetectionTimer(p.timeSent)
 	}
 }
 
@@ -217,7 +223,8 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 	// the server has validated the client's address.
 	// TODO: PeerCompletedAddressValidation()
 	s.ptoCount = 0
-	s.setLossDetectionTimer()
+	s.lossProbes[space] = 0
+	s.setLossDetectionTimer(now)
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-estimating-smoothed_rtt-and
@@ -265,31 +272,22 @@ func (s *lossRecovery) onPacketsAcked(packets []*sentPacket, space packetSpace) 
 }
 
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
-func (s *lossRecovery) setLossDetectionTimer() {
+func (s *lossRecovery) setLossDetectionTimer(now time.Time) {
 	lossTime, _ := s.earliestLossTime()
 	if !lossTime.IsZero() {
 		// Time threshold loss detection.
 		s.lossDetectionTimer = lossTime
 		return
 	}
-	// TODO: PeerCompletedAddressValidation():
-	//   // Assume clients validate the server's address implicitly.
-	//   if (endpoint is server):
-	//     return true
-	//   // Servers complete address validation when a
-	//   // protected packet is received.
-	//   return has received Handshake ACK ||
-	//        has received 1-RTT ACK ||
-	//        has received HANDSHAKE_DONE
-	if s.congestion.bytesInFlight == 0 {
+	if s.congestion.bytesInFlight == 0 && s.peerCompletedAddressValidation {
 		// There is nothing to detect lost, so no timer is set.
 		// However, the client needs to arm the timer if the
 		// server might be blocked by the anti-amplification limit.
 		s.lossDetectionTimer = time.Time{}
 		return
 	}
-	// PTO timer
-	timeout, _ := s.earliestProbeTime()
+	// Determine which PN space to arm PTO for.
+	timeout, _ := s.earliestProbeTime(now)
 	s.lossDetectionTimer = timeout
 }
 
@@ -299,7 +297,7 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 	lossTime, space := s.earliestLossTime()
 	if !lossTime.IsZero() {
 		s.detectLostPackets(space, now)
-		s.setLossDetectionTimer()
+		s.setLossDetectionTimer(now)
 		return
 	}
 	// TODO:
@@ -315,28 +313,14 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 	if probes > maxProbes {
 		probes = maxProbes
 	}
-	_, space = s.earliestProbeTime()
+	_, space = s.earliestProbeTime(now)
 	s.lossProbes[space] = uint8(probes)
-
-	sent := s.sent[space]
-	if len(sent) > 0 {
-		// Retransmit the frames from the oldest sent packets on PTO.
-		// Calculate starting point first to keep lost packets in order.
-		i := len(sent) - probes
-		if i < 0 {
-			i = 0
-		}
-		for ; i < len(sent); i++ {
-			p := sent[i]
-			if p.ackEliciting {
-				s.lost[space] = append(s.lost[space], p)
-				p.ackEliciting = false // So it will not be marked as lost again.
-			}
-			// The packet may not really lost, so do not change congestion control.
-			// It is kept in the sent list so we can actually declare it lost or acked later.
-		}
-	}
-	s.setLossDetectionTimer()
+	// PTO. Send new data if available, else retransmit old data.
+	// If neither is available, send a single PING frame.
+	// TODO: When there are no ack eliciting packets, the connection might send 2 ping packets in a row.
+	// Maybe it should resend a packet from the next space instead.
+	s.markResendAckElicitingPackets(space, probes)
+	s.setLossDetectionTimer(now)
 }
 
 // detectLostPackets is called every time an ACK is received or the time threshold loss detection timer expires.
@@ -369,9 +353,11 @@ func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 			}
 			return true
 		}
-		tm := p.timeSent.Add(lossDelay)
-		if lossTime.IsZero() || lossTime.After(tm) {
-			lossTime = tm
+		if p.ackEliciting {
+			tm := p.timeSent.Add(lossDelay)
+			if lossTime.IsZero() || lossTime.After(tm) {
+				lossTime = tm
+			}
 		}
 		return false
 	})
@@ -381,10 +367,33 @@ func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 	}
 }
 
+func (s *lossRecovery) markResendAckElicitingPackets(space packetSpace, probes int) {
+	// Retransmit the frames from the oldest sent packets on PTO.
+	// Calculate starting point first to keep lost packets in order.
+	sent := s.sent[space]
+	i := len(sent) - 1
+	if i >= 0 {
+		for ; i > 0 && probes > 0; i-- {
+			if sent[i].ackEliciting {
+				probes--
+			}
+		}
+		for ; i < len(sent); i++ {
+			p := sent[i]
+			if p.ackEliciting {
+				s.lost[space] = append(s.lost[space], p)
+				p.ackEliciting = false // So it will not be marked as lost again.
+			}
+			// The packet may not really lost, so do not change congestion control.
+			// It is kept in the sent list so we can actually declare it lost or acked later.
+		}
+	}
+}
+
 // When Initial or Handshake keys are discarded, packets from the space are discarded
 // and loss detection state is updated.
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-upon-dropping-initial-or-ha
-func (s *lossRecovery) onPacketNumberSpaceDiscarded(space packetSpace) {
+func (s *lossRecovery) onPacketNumberSpaceDiscarded(space packetSpace, now time.Time) {
 	// Remove any unacknowledged packets from flight.
 	var unackedBytes uint64
 	for _, p := range s.sent[space] {
@@ -401,7 +410,7 @@ func (s *lossRecovery) onPacketNumberSpaceDiscarded(space packetSpace) {
 	s.lossTime[space] = time.Time{}
 	s.lossProbes[space] = 0
 	s.ptoCount = 0
-	s.setLossDetectionTimer()
+	s.setLossDetectionTimer(now)
 }
 
 // roundTripTime retruns smoothed RTT when available.
@@ -447,15 +456,24 @@ func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 
 // earliestProbeTime returns the earliest PTO timeout.
 // https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
-func (s *lossRecovery) earliestProbeTime() (time.Time, packetSpace) {
+func (s *lossRecovery) earliestProbeTime(now time.Time) (time.Time, packetSpace) {
 	// duration = (smoothed_rtt + max(4 * rttvar, kGranularity)) * (2 ^ pto_count)
 	duration := s.probeTimeout() * (1 << s.ptoCount)
-	space := packetSpaceInitial
-	timeout := s.timeOfLastAckElicitingPacket[space]
-	if !timeout.IsZero() {
-		timeout = timeout.Add(duration)
+	// Arm PTO from now when there are no inflight packets.
+	if s.congestion.bytesInFlight == 0 {
+		if s.hasHandshakeKeys {
+			return now.Add(duration), packetSpaceHandshake
+		}
+		return now.Add(duration), packetSpaceInitial
 	}
-	for i := space + 1; i < packetSpaceCount; i++ {
+	space := packetSpaceInitial
+	timeout := time.Time{}
+	for i := space; i < packetSpaceCount; i++ {
+		// Check no in-flight packets in space.
+		// XXX: To avoid a loop, it only checks if there is any sending packets.
+		if len(s.sent[i]) == 0 {
+			continue
+		}
 		if space == packetSpaceApplication && !s.handshakeConfirmed {
 			// Skip Application Data until handshake complete.
 			continue
@@ -550,6 +568,14 @@ func (s *lossRecovery) setMaxAckDelay(maxAckDelay time.Duration) {
 	}
 }
 
+func (s *lossRecovery) setHasHandshakeKeys() {
+	s.hasHandshakeKeys = true
+}
+
+func (s *lossRecovery) setPeerCompletedAddressValidation() {
+	s.peerCompletedAddressValidation = true
+}
+
 func (s *lossRecovery) setHandshakeConfirmed() {
 	s.handshakeConfirmed = true
 }
@@ -557,7 +583,7 @@ func (s *lossRecovery) setHandshakeConfirmed() {
 func (s *lossRecovery) canSend() uint64 {
 	if s.ptoCount > 0 {
 		// Ignore congestion window if packet is sent on PTO timer expiration.
-		return minimumWindow
+		return minimumCongestionWindow
 	}
 	return s.congestion.canSend()
 }
@@ -582,7 +608,7 @@ type congestionControl struct {
 }
 
 func (s *congestionControl) init() {
-	s.congestionWindow = initialWindow
+	s.congestionWindow = initialCongestionWindow
 	s.slowStartThreshold = maxUint64
 }
 
@@ -607,7 +633,7 @@ func (s *congestionControl) onPacketAcked(sentBytes uint64, sentTime time.Time) 
 		s.congestionWindow += sentBytes
 	} else {
 		// Congestion avoidance.
-		s.congestionWindow += maxDatagramSize * sentBytes / s.congestionWindow
+		s.congestionWindow += initialMaxDatagramSize * sentBytes / s.congestionWindow
 	}
 }
 
@@ -628,8 +654,8 @@ func (s *congestionControl) onNewCongestionEvent(sentTime, now time.Time) {
 	if !s.inRecovery(sentTime) {
 		s.recoveryStartTime = now
 		s.congestionWindow = s.congestionWindow / lossReductionFactor
-		if s.congestionWindow < minimumWindow {
-			s.congestionWindow = minimumWindow
+		if s.congestionWindow < minimumCongestionWindow {
+			s.congestionWindow = minimumCongestionWindow
 		}
 		s.slowStartThreshold = s.congestionWindow
 	}
@@ -640,7 +666,7 @@ func (s *congestionControl) inRecovery(sentTime time.Time) bool {
 }
 
 func (s *congestionControl) collapseWindow() {
-	s.congestionWindow = minimumWindow
+	s.congestionWindow = minimumCongestionWindow
 }
 
 func (s *congestionControl) canSend() uint64 {

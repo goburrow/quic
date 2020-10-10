@@ -8,7 +8,9 @@ import (
 
 const (
 	// ProtocolVersion is the supported QUIC version
-	ProtocolVersion = 0xff000000 + 29
+	ProtocolVersion = 0xff000000 + 32
+	// minProtocolVersion is the minimum version supported.
+	minProtocolVersion = 0xff000000 + 29
 
 	// MaxCIDLength is the maximum length of a Connection ID
 	MaxCIDLength = 20
@@ -58,5 +60,5 @@ func NewConfig() *Config {
 
 // VersionSupported returns true when the provided QUIC transport version is supported.
 func VersionSupported(version uint32) bool {
-	return version == ProtocolVersion
+	return version <= ProtocolVersion && version >= minProtocolVersion
 }

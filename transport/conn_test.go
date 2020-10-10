@@ -84,12 +84,13 @@ func TestHandshake(t *testing.T) {
 		Certificates: testCerts,
 	}
 	server, err := Accept([]byte("server"), nil, serverConfig)
-	p := &testEndpoint{client: client, server: server}
-	_, err = p.handshake()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("server handshaked scid=%x dcid=%x odcid=%x", server.scid, server.dcid, server.odcid)
+	p := newTestEndpoint(t, client, server)
+	p.assertHandshake()
+	t.Logf("server handshaked scid=%x dcid=%x odcid=%x clientTx=%d serverTx=%d",
+		server.scid, server.dcid, server.odcid, p.clientTx, p.serverTx)
 }
 
 func TestHandshakeWithRetry(t *testing.T) {
@@ -99,44 +100,29 @@ func TestHandshakeWithRetry(t *testing.T) {
 	clientConfig.TLS = &tls.Config{
 		InsecureSkipVerify: true,
 	}
-	client, err := Connect([]byte("client-cid"), clientConfig)
-	if err != nil {
-		t.Fatal(err)
+	p := newTestEndpoint(t, newTestClient(clientConfig), nil)
+	p.assertNegotiateVersion()
+	if p.client.version != ProtocolVersion {
+		t.Fatalf("expect negotiated version %v, actual %v", ProtocolVersion, p.client.version)
 	}
-	p := &testEndpoint{client: client}
-	err = p.negotiateVersion()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.version != ProtocolVersion {
-		t.Fatalf("expect negotiated version %v, actual %v", ProtocolVersion, client.version)
-	}
-	err = p.retry()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("client retried scid=%x dcid=%x odcid=%x", client.scid, client.dcid, client.odcid)
+	p.assertRetry()
+	t.Logf("client retried scid=%x dcid=%x odcid=%x", p.client.scid, p.client.dcid, p.client.odcid)
 	serverConfig := NewConfig()
 	serverConfig.TLS = &tls.Config{
 		Certificates: testCerts,
 	}
-	server, err := Accept([]byte("server-cid"), client.odcid, serverConfig)
+	server, err := Accept([]byte("server-cid"), p.client.odcid, serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.server = server
-	_, err = p.handshake()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("server handshaked scid=%x dcid=%x odcid=%x", server.scid, server.dcid, server.odcid)
+	p.assertHandshake()
+	t.Logf("server handshaked scid=%x dcid=%x odcid=%x clientTx=%d serverTx=%d",
+		server.scid, server.dcid, server.odcid, p.clientTx, p.serverTx)
 }
 
 func TestConnStream(t *testing.T) {
-	p, err := newTestConn()
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := newTestConn(t)
 	ct, err := p.client.Stream(4)
 	if err != nil {
 		t.Fatal(err)
@@ -149,10 +135,7 @@ func TestConnStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err = p.sendToServer()
-	if err != nil {
-		t.Fatal(err)
-	}
+	p.assertClientSend()
 	events := p.server.Events(nil)
 	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
 		events[1].Type != EventStreamWritable || events[1].ID != 4 {
@@ -181,10 +164,7 @@ func TestConnStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err = p.sendToClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	p.assertServerSend()
 	events = p.client.Events(nil)
 	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
 		events[1].Type != EventStreamComplete || events[1].ID != 4 {
@@ -410,107 +390,270 @@ func TestConnClose(t *testing.T) {
 	}
 }
 
+func TestConnHandshakeLoss(t *testing.T) {
+	now := testTime()
+	config := newTestConfig()
+	config.TLS.ServerName = "localhost"
+	config.TLS.RootCAs = testCA
+	config.TLS.Certificates = testCerts
+	config.TLS.Time = func() time.Time {
+		return now
+	}
+	p := newTestEndpoint(t, newTestClient(config), newTestServer(config))
+	p.assertClientSend() // CI0: crypto
+	p.serverSendLoss()   // SI0+SH0 (L): crypto
+
+	now = now.Add(1 * time.Second) // 1s
+	p.assertClientLossTimer(now)
+	p.assertServerLossTimer(now)
+	p.client.Write(nil) // timed out
+	p.clientSendLoss()  // CI1 (L): resend crypto
+	p.server.Write(nil)
+	p.serverSendLoss() // SI1 (L): resend crypto
+
+	now = now.Add(1 * time.Second) // 2s
+	p.assertServerLossTimer(now)
+	p.server.Write(nil)
+	err := p.serverSend() // SH1 (L): resend Handshake
+	if err == nil || err.Error() != "packet_dropped: key_unavailable" {
+		t.Fatalf("expect error %v, actual %v", "key_unavailable", err)
+	}
+	err = p.serverSend() // SH2 (L): ping
+	if err == nil || err.Error() != "packet_dropped: key_unavailable" {
+		t.Fatalf("expect error %v, actual %v", "key_unavailable", err)
+	}
+
+	now = now.Add(1 * time.Second) // 3s
+	p.assertClientLossTimer(now)
+	p.client.Write(nil)
+	p.assertClientSend() // CI2: resend crypto
+	p.assertServerSend() // SI2: resend ack
+
+	now = now.Add(2 * time.Second) // 5s
+	p.assertServerLossTimer(now)
+	p.server.Write(nil)
+	p.assertServerSend() // SI3: ack 0,2, crypto
+	p.clientSendLoss()   // CI3 (L): ack 2,3
+	p.serverSendLoss()   // SI4 (L): ping
+
+	p.client.Write(nil)
+	p.assertClientSend() // CI4: ack, ping
+	p.assertServerSend() // SH3: crypto
+	p.clientSendLoss()   // CH0 (L): crypto
+
+	now = now.Add(1 * time.Second) // 6s
+	p.client.Write(nil)
+	p.assertClientSend() // CH1: crypto
+	p.assertServerSend() // SH4: ack + SA0: done
+
+	if p.client.ConnectionState() != StateActive {
+		t.Fatal("client has not handshaked")
+	}
+	if p.server.ConnectionState() != StateActive {
+		t.Fatal("server has not handshaked")
+	}
+	t.Logf("server tx: %d, client tx: %d", p.serverTx, p.clientTx)
+}
+
+func TestConnHandshakeTimeout(t *testing.T) {
+	now := testTime()
+	config := newTestConfig()
+	config.Params.MaxIdleTimeout = 10 * time.Second
+	config.TLS.ServerName = "localhost"
+	config.TLS.RootCAs = testCA
+	config.TLS.Certificates = testCerts
+	config.TLS.Time = func() time.Time {
+		return now
+	}
+	p := newTestEndpoint(t, newTestClient(config), newTestServer(config))
+	p.assertClientSend() // CI0: crypto
+	p.serverSendLoss()   // SI0+SH0: crypto
+
+	now = now.Add(1 * time.Second) // 1
+	p.server.Write(nil)
+	p.serverSendLoss() // SI1: crypto
+
+	now = now.Add(1 * time.Second) // 2
+	p.server.Write(nil)
+	p.serverSendLoss() // SH1: crypto
+	p.serverSendLoss() // SH2: ping
+
+	now = now.Add(3 * time.Second) // 5
+	p.server.Write(nil)
+	p.serverSendLoss() // SI2: crypto
+	p.serverSendLoss() // SI3: ping
+	p.client.Write(nil)
+	p.assertClientSend()
+	p.serverSendLoss() // SI4: ack
+
+	now = now.Add(5 * time.Second) // 10
+	p.server.Write(nil)
+	p.serverSendLoss() // SI3: ping
+	p.serverSendLoss() // SH4: ping
+
+	now = now.Add(10 * time.Second)
+	p.server.Write(nil)
+	if p.server.ConnectionState() != StateClosed {
+		t.Fatal("server has not closed")
+	}
+}
+
 func TestConnResumption(t *testing.T) {
 	clientConfig := newTestConfig()
 	clientConfig.TLS.ServerName = "localhost"
 	clientConfig.TLS.RootCAs = testCA
 	clientConfig.TLS.ClientSessionCache = tls13.NewLRUClientSessionCache(10)
-	client, err := Connect([]byte("client"), clientConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	serverConfig := newTestConfig()
 	serverConfig.TLS.Certificates = testCerts
-	server, err := Accept([]byte("server"), nil, serverConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := &testEndpoint{
-		client: client,
-		server: server,
-	}
-	hs1, err := p.handshake()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("first handshake: %d bytes", hs1)
+
+	p := newTestEndpoint(t, newTestClient(clientConfig), newTestServer(serverConfig))
+	p.assertHandshake()
+	tx1 := p.clientTx + p.serverTx
+	t.Logf("first handshake: %d bytes", tx1)
 
 	p.client.Close(true, 0, "")
-	_, err = p.sendToServer()
-	if err != nil {
-		t.Fatal(err)
-	}
+	p.assertClientSend()
 
-	p.client, _ = Connect([]byte("new-client"), clientConfig)
-	p.server, _ = Accept([]byte("new-server"), nil, serverConfig)
-	hs2, err := p.handshake()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("resume handshake: %d bytes", hs2)
-	if hs1 <= hs2 {
-		// TODO: 0-RTT
-		t.Fatalf("expect less roundtrip than %d, actual %d", hs1, hs2)
+	client, _ := Connect([]byte("new-client"), clientConfig)
+	server, _ := Accept([]byte("new-server"), nil, serverConfig)
+	p = newTestEndpoint(t, client, server)
+	p.assertHandshake()
+	tx2 := p.clientTx + p.serverTx
+	t.Logf("resume handshake: %d bytes", tx2)
+	if tx1 <= tx2 {
+		t.Fatalf("expect less roundtrip than %d, actual %d", tx1, tx2)
 	}
 }
 
-func newTestConn() (*testEndpoint, error) {
-	clientConfig := newTestConfig()
-	clientConfig.TLS.ServerName = "localhost"
-	clientConfig.TLS.RootCAs = testCA
-	clientCID := []byte("client-cid")
-	client, err := Connect(clientCID, clientConfig)
+func newTestClient(config *Config) *Conn {
+	if config == nil {
+		config = newTestConfig()
+		config.TLS.ServerName = "localhost"
+		config.TLS.RootCAs = testCA
+	}
+	cid := []byte("client-cid")
+	conn, err := Connect(cid, config)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	serverConfig := newTestConfig()
-	serverConfig.TLS.Certificates = testCerts
-	serverCID := []byte("server-cid")
-	server, err := Accept(serverCID, nil, serverConfig)
+	return conn
+}
+
+func newTestServer(config *Config) *Conn {
+	if config == nil {
+		config = newTestConfig()
+		config.TLS.Certificates = testCerts
+	}
+	cid := []byte("server-cid")
+	conn, err := Accept(cid, nil, config)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	p := &testEndpoint{
-		client: client,
-		server: server,
-	}
-	_, err = p.handshake()
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return conn
+}
+
+func newTestConn(t *testing.T) *testEndpoint {
+	p := newTestEndpoint(t, newTestClient(nil), newTestServer(nil))
+	p.assertHandshake()
+	return p
 }
 
 type testEndpoint struct {
-	client *Conn
-	server *Conn
-	buf    [1400]byte
+	t *testing.T
+
+	client   *Conn
+	clientTx int
+	server   *Conn
+	serverTx int
+
+	buf [1400]byte
 }
 
-func (t *testEndpoint) sendToServer() (int, error) {
-	return t.send(t.server, t.client)
+func newTestEndpoint(t *testing.T, client, server *Conn) *testEndpoint {
+	return &testEndpoint{
+		t:      t,
+		client: client,
+		server: server,
+	}
 }
 
-func (t *testEndpoint) sendToClient() (int, error) {
-	return t.send(t.client, t.server)
-}
-
-func (t *testEndpoint) send(to *Conn, from *Conn) (int, error) {
-	n, err := from.Read(t.buf[:])
+func (t *testEndpoint) assertClientSend() {
+	err := t.clientSend()
 	if err != nil {
-		return 0, err
+		t.t.Helper()
+		t.t.Fatal(err)
+	}
+}
+
+func (t *testEndpoint) clientSend() error {
+	n, err := t.client.Read(t.buf[:])
+	if err != nil {
+		return err
 	}
 	if n > 0 {
-		m, err := to.Write(t.buf[:n])
+		t.clientTx += n
+		m, err := t.server.Write(t.buf[:n])
 		if err != nil {
-			return 0, err
+			return err
 		}
 		if n != m {
-			return 0, fmt.Errorf("expect write %v, actual %v", n, m)
+			return fmt.Errorf("expect write to server %v, actual %v", n, m)
 		}
 	}
-	return n, nil
+	return nil
+}
+
+func (t *testEndpoint) assertServerSend() {
+	err := t.serverSend()
+	if err != nil {
+		t.t.Helper()
+		t.t.Fatal(err)
+	}
+}
+
+func (t *testEndpoint) serverSend() error {
+	n, err := t.server.Read(t.buf[:])
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		t.serverTx += n
+		m, err := t.client.Write(t.buf[:n])
+		if err != nil {
+			return err
+		}
+		if n != m {
+			return fmt.Errorf("expect write to client %v, actual %v", n, m)
+		}
+	}
+	return nil
+}
+
+func (t *testEndpoint) clientSendLoss() {
+	n, _ := t.client.Read(t.buf[:])
+	if n <= 0 {
+		t.t.Helper()
+		t.t.Fatalf("expect client read, actual %v", n)
+	}
+	t.clientTx += n
+}
+
+func (t *testEndpoint) serverSendLoss() {
+	n, _ := t.server.Read(t.buf[:])
+	if n <= 0 {
+		t.t.Helper()
+		t.t.Fatalf("expect server read, actual %v", n)
+	}
+	t.serverTx += n
+}
+
+func (t *testEndpoint) assertNegotiateVersion() {
+	err := t.negotiateVersion()
+	if err != nil {
+		t.t.Helper()
+		t.t.Fatalf("negotiate version: %v", err)
+	}
 }
 
 func (t *testEndpoint) negotiateVersion() error {
@@ -521,6 +664,7 @@ func (t *testEndpoint) negotiateVersion() error {
 	if n == 0 {
 		return fmt.Errorf("client first packet is empty")
 	}
+	t.clientTx += n
 	h := Header{}
 	_, err = h.Decode(t.buf[:n], 0)
 	if err != nil {
@@ -531,8 +675,20 @@ func (t *testEndpoint) negotiateVersion() error {
 	if err != nil {
 		return err
 	}
-	_, err = t.client.Write(b[:n])
-	return err
+	t.serverTx += n
+	n, err = t.client.Write(b[:n])
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *testEndpoint) assertRetry() {
+	err := t.retry()
+	if err != nil {
+		t.t.Helper()
+		t.t.Fatalf("retry: %v", err)
+	}
 }
 
 func (t *testEndpoint) retry() error {
@@ -540,6 +696,7 @@ func (t *testEndpoint) retry() error {
 	if err != nil {
 		return err
 	}
+	t.clientTx += n
 	h := Header{}
 	_, err = h.Decode(t.buf[:n], 0)
 	if err != nil {
@@ -550,42 +707,95 @@ func (t *testEndpoint) retry() error {
 	if err != nil {
 		return err
 	}
-	_, err = t.client.Write(b[:n])
-	return err
+	t.serverTx += n
+	n, err = t.client.Write(b[:n])
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func (t *testEndpoint) handshake() (int, error) {
-	start := time.Now()
-	count := 0
+func (t *testEndpoint) assertHandshake() {
+	err := t.handshake()
+	if err != nil {
+		t.t.Helper()
+		t.t.Fatalf("handshake: %v", err)
+	}
+}
+
+func (t *testEndpoint) handshake() error {
+	i := 0
 	for t.client.ConnectionState() != StateActive || t.server.ConnectionState() != StateActive {
 		n, err := t.client.Read(t.buf[:])
 		if err != nil {
-			return count, err
+			return err
 		}
 		if n > 0 {
-			count += n
-			_, err = t.server.Write(t.buf[:n])
+			t.clientTx += n
+			n, err = t.server.Write(t.buf[:n])
 			if err != nil {
-				return count, err
+				return err
 			}
 		}
 		n, err = t.server.Read(t.buf[:])
 		if err != nil {
-			return count, err
+			return err
 		}
 		if n > 0 {
-			count += n
-			_, err = t.client.Write(t.buf[:n])
+			t.serverTx += n
+			n, err = t.client.Write(t.buf[:n])
 			if err != nil {
-				return count, err
+				return err
 			}
 		}
-		elapsed := time.Since(start)
-		if elapsed > 2*time.Second {
-			return count, fmt.Errorf("handshake too slow: %v", elapsed)
+		i++
+		if i > 10 {
+			return fmt.Errorf("no progress")
 		}
 	}
-	return count, nil
+	return nil
+}
+
+func (t *testEndpoint) assertClientLossTimer(now time.Time) {
+	if now.Before(t.client.recovery.lossDetectionTimer) {
+		t.t.Helper()
+		t.t.Fatalf("expect client loss timer before %v, actual %v", now, t.client.recovery.lossDetectionTimer)
+	}
+}
+
+func (t *testEndpoint) assertServerLossTimer(now time.Time) {
+	if now.Before(t.server.recovery.lossDetectionTimer) {
+		t.t.Helper()
+		t.t.Fatalf("expect server loss timer before %v, actual %v", now, t.server.recovery.lossDetectionTimer)
+	}
+}
+
+func (t *testEndpoint) logState() {
+	t.t.Logf("client:\n%v", connState(t.client))
+	t.t.Logf("server:\n%v", connState(t.server))
+}
+
+func connState(conn *Conn) string {
+	buf := &bytes.Buffer{}
+	fmt.Fprintf(buf, "state: %v\n", conn.state)
+	re := conn.recovery
+	fmt.Fprintf(buf, "recovery:\n")
+	fmt.Fprintf(buf, "  timer: %v %v\n", re.lossDetectionTimer, re.lossTime)
+	fmt.Fprintf(buf, "  pto: %v %v %v\n", re.probeTimeout(), re.ptoCount, re.lossProbes)
+	fmt.Fprintf(buf, "  sent:\n")
+	for i := range re.sent {
+		for _, p := range re.sent[i] {
+			fmt.Fprintf(buf, "    [%v] %v: %v\n", packetSpace(i), p.packetNumber, p.frames)
+		}
+	}
+	fmt.Fprintf(buf, "  lost:\n")
+	for i := range re.lost {
+		for _, p := range re.lost[i] {
+			fmt.Fprintf(buf, "    [%v] %v: %v\n", packetSpace(i), p.packetNumber, p.frames)
+		}
+	}
+	fmt.Fprintf(buf, "idle: %v\n", conn.idleTimer)
+	return buf.String()
 }
 
 func BenchmarkCreateConn(b *testing.B) {

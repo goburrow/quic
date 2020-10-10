@@ -14,6 +14,7 @@ DLDIR="/downloads"
 if [ -z "$QLOGDIR" ]; then
     QLOGDIR="$LOGDIR"
 fi
+#MULTIPROCESS=1
 
 case "$TESTCASE" in
     handshake | transfer | multiconnect | retry | chacha20 | resumption)
@@ -30,19 +31,23 @@ case "$TESTCASE" in
 esac
 
 run_client() {
-    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3"
+    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -version 0xff00001d -v 3"
     case "$TESTCASE" in
     multiconnect)
-        # Create multiple connections instead of multiple streams.
-        for REQ in $REQUESTS; do
-            NAME="$(basename $REQ)"
-            PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client-$NAME.qlog"
-            echo "# CLIENT_PARAMS: $PARAMS"
-            "$APPDIR/quiwi" client $PARAMS "$REQ" 2>>"$LOGDIR/client.txt" &
-            sleep 2
-        done
-        wait
-        return
+        if [ "$MULTIPROCESS" = 1 ]; then
+            # Fork a new process for each connection.
+            for REQ in $REQUESTS; do
+                NAME="$(basename $REQ)"
+                PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client-$NAME.qlog"
+                echo "# CLIENT_PARAMS: $PARAMS"
+                "$APPDIR/quiwi" client $PARAMS "$REQ" 2>>"$LOGDIR/client.txt" &
+                sleep 2
+            done
+            wait
+            return
+        else
+            CLIENT_PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client.qlog"
+        fi
         ;;
     resumption)
         CLIENT_PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client.qlog"

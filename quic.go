@@ -173,7 +173,7 @@ func (s *localConn) handleConn(c *Conn) {
 	defer s.connClosed(c)
 	established := false
 	for c.conn.ConnectionState() != transport.StateClosed {
-		p := s.pollConn(c)
+		s.pollConn(c)
 		if established {
 			s.serveConn(c)
 		} else {
@@ -192,27 +192,24 @@ func (s *localConn) handleConn(c *Conn) {
 				s.serveConn(c)
 			}
 		}
-		if p == nil {
-			// For sending data
-			p = newPacket()
-		}
+		p := newPacket()
 		s.sendConn(c, p.buf[:maxDatagramSize])
 		freePacket(p)
 	}
 }
 
-func (s *localConn) pollConn(c *Conn) *packet {
+func (s *localConn) pollConn(c *Conn) {
 	timeout := c.conn.Timeout()
 	if timeout < 0 {
 		// TODO
 		timeout = 10 * time.Second
 	}
 	timer := time.NewTimer(timeout)
-	var p *packet
 	select {
-	case p = <-c.recvCh:
+	case p := <-c.recvCh:
 		// Got packet
 		err := s.recvConn(c, p.data)
+		freePacket(p)
 		if err == nil {
 			// Maybe another packets arrived too while we processed the first one.
 			s.pollConnDelayed(c)
@@ -226,7 +223,6 @@ func (s *localConn) pollConn(c *Conn) *packet {
 		c.conn.Close(true, transport.NoError, "bye")
 	}
 	timer.Stop()
-	return p
 }
 
 func (s *localConn) pollConnDelayed(c *Conn) {
@@ -253,11 +249,7 @@ func (s *localConn) pollConnDelayed(c *Conn) {
 func (s *localConn) recvConn(c *Conn, data []byte) error {
 	n, err := c.conn.Write(data)
 	if err != nil {
-		if err == transport.ErrPacketDropped {
-			// Just ignore dropped packets
-			return nil
-		}
-		if err == transport.ErrKeysUnavailable {
+		if _, ok := transport.IsPacketDropped(err); ok {
 			// TODO: queue packet for later processing.
 			return nil
 		}

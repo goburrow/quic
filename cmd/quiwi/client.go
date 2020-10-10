@@ -32,6 +32,7 @@ func (clientCommand) Run(args []string) error {
 	insecure := cmd.Bool("insecure", false, "skip verifying server certificate")
 	root := cmd.String("root", "", "root download directory")
 	multi := cmd.Bool("multi", false, "download files using multiple streams")
+	version := cmd.Uint("version", 0, "use specific QUIC version")
 	cipher := cmd.String("cipher", "", "TLS 1.3 cipher suite, e.g. TLS_CHACHA20_POLY1305_SHA256")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
@@ -59,6 +60,9 @@ func (clientCommand) Run(args []string) error {
 		urls[i] = addrURL
 	}
 	config := newConfig()
+	if *version > 0 {
+		config.Version = uint32(*version)
+	}
 	config.TLS.ServerName = urls[len(urls)-1].Hostname()
 	config.TLS.InsecureSkipVerify = *insecure
 	switch *cipher {
