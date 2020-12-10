@@ -4,6 +4,7 @@
 
 ```
 cd /path/to/quiche/tools/apps
+# rustup update
 cargo build --release
 # Client
 RUST_LOG=trace ./target/release/quiche-client --no-verify https://127.0.0.1:4433

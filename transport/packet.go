@@ -476,7 +476,7 @@ func NegotiateVersion(b, dcid, scid []byte) (int, error) {
 			dcid: dcid,
 			scid: scid,
 		},
-		supportedVersions: []uint32{ProtocolVersion},
+		supportedVersions: supportedVersions[:],
 	}
 	return p.encode(b)
 }
@@ -714,7 +714,7 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 	p := packet{
 		typ: packetTypeRetry,
 		header: packetHeader{
-			version: ProtocolVersion,
+			version: supportedVersions[0],
 			dcid:    dcid,
 			scid:    scid,
 		},

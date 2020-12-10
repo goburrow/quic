@@ -102,8 +102,8 @@ func TestHandshakeWithRetry(t *testing.T) {
 	}
 	p := newTestEndpoint(t, newTestClient(clientConfig), nil)
 	p.assertNegotiateVersion()
-	if p.client.version != ProtocolVersion {
-		t.Fatalf("expect negotiated version %v, actual %v", ProtocolVersion, p.client.version)
+	if p.client.version != supportedVersions[0] {
+		t.Fatalf("expect negotiated version %v, actual %v", supportedVersions[0], p.client.version)
 	}
 	p.assertRetry()
 	t.Logf("client retried scid=%x dcid=%x odcid=%x", p.client.scid, p.client.dcid, p.client.odcid)

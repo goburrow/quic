@@ -14,7 +14,7 @@ func TestPacketInitial(t *testing.T) {
 	p := packet{
 		typ: packetTypeInitial,
 		header: packetHeader{
-			version: ProtocolVersion,
+			version: supportedVersions[0],
 			dcid:    dcid,
 			scid:    scid,
 		},
@@ -74,8 +74,8 @@ func TestPacketVersionNegotiation(t *testing.T) {
 	if !bytes.Equal(scid, p.header.scid) {
 		t.Errorf("expect scid %x, actual %x", scid, p.header.scid)
 	}
-	if len(p.supportedVersions) != 1 || p.supportedVersions[0] != ProtocolVersion {
-		t.Errorf("expect supported versions: [%d], actual: %v", ProtocolVersion, p.supportedVersions)
+	if len(p.supportedVersions) != len(supportedVersions) || p.supportedVersions[0] != supportedVersions[0] {
+		t.Errorf("expect supported versions: [%d], actual: %v", supportedVersions[0], p.supportedVersions)
 	}
 
 	h := Header{}
@@ -144,8 +144,8 @@ func TestPacketRetry(t *testing.T) {
 	if h.Flags != 0xf0 {
 		t.Errorf("expect flags 0x%x, actual 0x%x", 0xf0, h.Flags)
 	}
-	if h.Version != ProtocolVersion {
-		t.Errorf("expect version %d, actual %d", ProtocolVersion, h.Version)
+	if h.Version != supportedVersions[0] {
+		t.Errorf("expect version %d, actual %d", supportedVersions[0], h.Version)
 	}
 	if !bytes.Equal(dcid, h.DCID) {
 		t.Errorf("expect dcid %x, actual %x", dcid, h.DCID)

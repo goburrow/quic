@@ -7,11 +7,6 @@ import (
 )
 
 const (
-	// ProtocolVersion is the supported QUIC version
-	ProtocolVersion = 0xff000000 + 32
-	// minProtocolVersion is the minimum version supported.
-	minProtocolVersion = 0xff000000 + 29
-
 	// MaxCIDLength is the maximum length of a Connection ID
 	MaxCIDLength = 20
 
@@ -27,6 +22,14 @@ const (
 	MinInitialPacketSize = 1200
 )
 
+// supportedVersions are the QUIC versions supported by this implementation.
+var supportedVersions = [...]uint32{
+	0xff000000 + 32,
+	0xff000000 + 31,
+	0xff000000 + 30,
+	0xff000000 + 29,
+}
+
 // Config is a QUIC connection configuration.
 // This implementaton utilizes tls.Config.Rand and tls.Config.Time if available.
 type Config struct {
@@ -38,7 +41,7 @@ type Config struct {
 // NewConfig creates a default configuration.
 func NewConfig() *Config {
 	return &Config{
-		Version: ProtocolVersion,
+		Version: supportedVersions[0],
 		Params: Parameters{
 			MaxIdleTimeout:    30 * time.Second,
 			MaxUDPPayloadSize: MaxPacketSize,
@@ -60,5 +63,10 @@ func NewConfig() *Config {
 
 // VersionSupported returns true when the provided QUIC transport version is supported.
 func VersionSupported(version uint32) bool {
-	return version <= ProtocolVersion && version >= minProtocolVersion
+	for _, v := range supportedVersions {
+		if v == version {
+			return true
+		}
+	}
+	return false
 }
