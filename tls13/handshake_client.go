@@ -379,20 +379,17 @@ func clientSessionCacheKey(config *tls.Config) string {
 	return config.ServerName
 }
 
-// mutualProtocol finds the mutual Next Protocol Negotiation or ALPN protocol
-// given list of possible protocols and a list of the preference order. The
-// first list must not be empty. It returns the resulting protocol and flag
-// indicating if the fallback case was reached.
-func mutualProtocol(protos, preferenceProtos []string) (string, bool) {
+// mutualProtocol finds the mutual ALPN protocol given list of possible
+// protocols and a list of the preference order.
+func mutualProtocol(protos, preferenceProtos []string) string {
 	for _, s := range preferenceProtos {
 		for _, c := range protos {
 			if s == c {
-				return s, false
+				return s
 			}
 		}
 	}
-
-	return protos[0], true
+	return ""
 }
 
 // hostnameInSNI converts name into an appropriate hostname for SNI.

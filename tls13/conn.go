@@ -307,6 +307,7 @@ func (c *Conn) connectionStateLocked() tls.ConnectionState {
 	state.Version = c.vers
 	state.NegotiatedProtocol = c.clientProtocol
 	state.DidResume = c.didResume
+	state.NegotiatedProtocolIsMutual = true
 	state.ServerName = c.serverName
 	state.CipherSuite = c.cipherSuite
 	state.PeerCertificates = c.peerCertificates
