@@ -71,12 +71,11 @@ func BenchmarkAddressValidator(b *testing.B) {
 }
 
 func TestServerNoConnection(t *testing.T) {
-	s := newServer()
 	socket, err := net.ListenPacket("udp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s = newServer()
+	s := NewServer(newServerConfig())
 	s.SetListener(socket)
 	wg := sync.WaitGroup{}
 	wg.Add(1)

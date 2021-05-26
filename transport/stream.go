@@ -80,7 +80,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 		return 0, newError(StreamStateError, "cannot write to uni stream")
 	}
 	if s.send.stopReceived || s.send.resetStream != deliveryNone {
-		return 0, nil
+		return 0, newError(StreamStateError, sprint("sending terminated: ", s.send.resetError))
 	}
 	n := int(s.flow.canSend())
 	if n == 0 {
@@ -90,7 +90,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 		b = b[:n]
 	}
 	n, err := s.send.Write(b)
-	if err == nil {
+	if n > 0 {
 		// Keep flow sent bytes in sync with read offset of the stream
 		s.flow.setSend(s.send.length)
 	}
@@ -105,7 +105,8 @@ func (s *Stream) WriteString(b string) (int, error) {
 
 // isReadable returns true if the stream has any data to read.
 func (s *Stream) isReadable() bool {
-	return s.recv.ready() || (s.recv.fin && !s.recv.finRead)
+	return (s.recv.ready() || (s.recv.fin && !s.recv.finRead)) &&
+		s.recv.stopSending == deliveryNone && !s.recv.resetReceived
 }
 
 // updateStopSending returns application error code for terminating receiving part of the stream,
@@ -131,7 +132,8 @@ func (s *Stream) resetRecv(finalSize uint64) error {
 func (s *Stream) isWritable() bool {
 	// XXX: To avoid over buffer, we only tell application to fill the send buffer
 	// when there is only some data left (8KB) to send.
-	return !s.send.stopReceived && !s.send.fin && s.flow.canSend() > 0 && s.send.buf.size() < minStreamBufferWritable
+	return s.flow.canSend() > 0 && s.send.buf.size() < minStreamBufferWritable &&
+		!s.send.fin && s.send.resetStream == deliveryNone && !s.send.stopReceived
 }
 
 // isFlushable returns true if the stream has data and is allowed to send.
@@ -264,6 +266,7 @@ func (s *recvStream) push(data []byte, offset uint64, fin bool) error {
 		data = data[s.offset-offset:]
 		offset = s.offset
 	}
+	// buf will create a copy of data.
 	s.buf.write(data, offset)
 	if end > s.length {
 		s.length = end
@@ -292,12 +295,12 @@ func (s *recvStream) reset(finalSize uint64) error {
 
 // Read makes recvStream an io.Reader.
 func (s *recvStream) Read(b []byte) (int, error) {
-	if s.fin && s.offset >= s.length {
-		s.finRead = true
-		return 0, io.EOF
-	}
 	n := s.buf.read(b, s.offset)
 	s.offset += uint64(n)
+	if s.fin && s.offset >= s.length {
+		s.finRead = true
+		return n, io.EOF
+	}
 	return n, nil
 }
 

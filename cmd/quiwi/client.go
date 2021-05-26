@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -36,6 +37,7 @@ func (clientCommand) Run(args []string) error {
 	cipher := cmd.String("cipher", "", "TLS 1.3 cipher suite, e.g. TLS_CHACHA20_POLY1305_SHA256")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
+	useAsync := cmd.Bool("async", false, "use asynchronous Stream APIs")
 	cmd.Usage = func() {
 		fmt.Fprintln(cmd.Output(), "Usage: quiwi client [arguments] <url>")
 		cmd.PrintDefaults()
@@ -78,8 +80,8 @@ func (clientCommand) Run(args []string) error {
 		return fmt.Errorf("unsupported cipher: %v", *cipher)
 	}
 	handler := clientHandler{
-		buf:  newBuffers(2048, 10),
-		root: *root,
+		root:  *root,
+		async: *useAsync,
 	}
 	client := quic.NewClient(config)
 	client.SetHandler(&handler)
@@ -100,10 +102,10 @@ func (clientCommand) Run(args []string) error {
 	if err := client.ListenAndServe(*listenAddr); err != nil {
 		return err
 	}
-	if *multi || len(handler.files) == 1 {
-		// Download all files using multiple streams.
+	if *multi {
+		// Download all files using multiple streams. All urls must have same host.
 		handler.files = urls
-		handler.wg.Add(1)
+		handler.wg.Add(1) // For connection closed
 		if err := client.Connect(canonicalAddr(handler.files[0])); err != nil {
 			return err
 		}
@@ -112,7 +114,7 @@ func (clientCommand) Run(args []string) error {
 		// Create a new connection for each download.
 		for i := range urls {
 			handler.files = urls[i : i+1]
-			handler.wg.Add(1)
+			handler.wg.Add(1) // For connection closed
 			if err := client.Connect(canonicalAddr(handler.files[0])); err != nil {
 				return err
 			}
@@ -122,18 +124,29 @@ func (clientCommand) Run(args []string) error {
 	return client.Close()
 }
 
+// clientHandler implements quic.Handler.
 type clientHandler struct {
 	wg    sync.WaitGroup
-	buf   buffers
 	root  string     // Download directory. If empty, write to stdout
 	files []*url.URL // List of files to download
+	async bool
 }
 
+// Serve handles connection events.
 func (s *clientHandler) Serve(c *quic.Conn, events []transport.Event) {
+	if s.async {
+		s.serveAsync(c, events)
+	} else {
+		s.serveSync(c, events)
+	}
+}
+
+// serveSync demonstrates using synchronous Stream APIs.
+func (s *clientHandler) serveSync(c *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
-		case quic.EventConnAccept, transport.EventStreamCreatable:
-			err := s.downloadFiles(c)
+		case transport.EventConnOpen, transport.EventStreamCreatable:
+			err := s.handleStreamCreatable(c)
 			if err != nil {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
@@ -145,31 +158,29 @@ func (s *clientHandler) Serve(c *quic.Conn, events []transport.Event) {
 				return
 			}
 			if len(s.files) == 0 && len(s.getRequests(c)) == 0 {
+				// Download finished
 				c.Close()
 				return
 			}
-		case quic.EventConnClose:
+		case transport.EventConnClosed:
 			// Clean up
 			for _, f := range s.getRequests(c) {
 				s.closeFile(f)
-				s.wg.Done()
 			}
 			s.wg.Done()
 		}
 	}
 }
 
-func (s *clientHandler) downloadFiles(c *quic.Conn) error {
+func (s *clientHandler) handleStreamCreatable(c *quic.Conn) error {
 	for len(s.files) > 0 {
 		fileURL := s.files[0]
-		st, id, err := c.NewStream(true)
-		if err != nil {
-			if err, ok := err.(*transport.Error); ok && err.Code == transport.StreamLimitError {
-				return nil
-			}
-			return err
+		streamID, ok := c.NewStream(true)
+		if !ok {
+			break
 		}
 		var output *os.File
+		var err error
 		if s.root == "" {
 			output = os.Stdout
 		} else {
@@ -180,14 +191,13 @@ func (s *clientHandler) downloadFiles(c *quic.Conn) error {
 			}
 		}
 		req := fmt.Sprintf("GET %s\r\n", fileURL.Path)
-		_, err = st.WriteString(req)
+		_, err = c.StreamWrite(streamID, []byte(req))
 		if err != nil {
 			return err
 		}
-		st.Close()
+		c.StreamClose(streamID)
 		s.files = s.files[1:]
-		s.getRequests(c)[id] = output
-		s.wg.Add(1)
+		s.getRequests(c)[streamID] = output
 	}
 	return nil
 }
@@ -198,31 +208,25 @@ func (s *clientHandler) handleStreamReadable(c *quic.Conn, streamID uint64) erro
 	if f == nil {
 		return nil
 	}
-	st, err := c.Stream(streamID)
-	if err != nil {
-		return err
-	}
-	buf := s.buf.pop()
-	defer s.buf.push(buf)
+	buf := buffers.pop()
+	defer buffers.push(buf)
 	for {
-		n, err := st.Read(buf)
+		n, err := c.StreamRead(streamID, buf)
 		if n > 0 {
 			_, err := f.Write(buf[:n])
 			if err != nil {
 				s.closeFile(f)
 				delete(requests, streamID)
-				s.wg.Done()
-				return st.CloseRead(1)
+				return c.StreamCloseRead(streamID, 1)
 			}
 		}
 		if err != nil {
 			s.closeFile(f)
 			delete(requests, streamID)
-			s.wg.Done()
 			if err == io.EOF {
 				return nil
 			}
-			st.CloseRead(1)
+			c.StreamCloseRead(streamID, 1)
 			return err
 		}
 		if n <= 0 {
@@ -244,6 +248,79 @@ func (s *clientHandler) closeFile(f *os.File) {
 	// Do not close file when download directory is not specified as it is stdout.
 	if s.root != "" {
 		f.Close()
+	}
+}
+
+// serveAsync demonstrates using asynchronous Stream APIs.
+func (s *clientHandler) serveAsync(c *quic.Conn, events []transport.Event) {
+	for _, e := range events {
+		switch e.Type {
+		case transport.EventConnOpen, transport.EventStreamCreatable:
+			for len(s.files) > 0 {
+				streamID, ok := c.NewStream(true)
+				if !ok {
+					// Exceeded stream limits
+					break
+				}
+				st, err := c.Stream(streamID)
+				if err != nil {
+					c.CloseWithError(transport.ApplicationError, err.Error())
+					return
+				}
+				fileURL := s.files[0]
+				s.files = s.files[1:]
+				if c.UserData() == nil {
+					c.SetUserData(1)
+				} else {
+					c.SetUserData(c.UserData().(int) + 1)
+				}
+				go s.downloadFileAsync(st, fileURL)
+			}
+		case transport.EventStreamClosed:
+			if c.UserData() != nil {
+				streams := c.UserData().(int) - 1
+				c.SetUserData(streams)
+				if streams == 0 && len(s.files) == 0 {
+					// Download finished
+					c.Close()
+				}
+			}
+		case transport.EventConnClosed:
+			s.wg.Done()
+		}
+	}
+}
+
+func (s *clientHandler) downloadFileAsync(st *quic.Stream, fileURL *url.URL) {
+	var output *os.File
+	if s.root == "" {
+		output = os.Stdout
+	} else {
+		name := filepath.Join(s.root, path.Clean(fileURL.Path))
+		f, err := os.Create(name)
+		if err != nil {
+			log.Printf("download %v: %v", fileURL.Path, err)
+			return
+		}
+		defer f.Close()
+		output = f
+	}
+	req := fmt.Sprintf("GET %s\r\n", fileURL.Path)
+	_, err := st.Write([]byte(req))
+	if err != nil {
+		log.Printf("download %v: %v", fileURL.Path, err)
+		return
+	}
+	err = st.Close()
+	if err != nil {
+		log.Printf("download %v: %v", fileURL.Path, err)
+		st.CloseRead(1)
+		return
+	}
+	_, err = io.Copy(output, st)
+	if err != nil {
+		log.Printf("download %v: %v", fileURL.Path, err)
+		st.CloseRead(1)
 	}
 }
 

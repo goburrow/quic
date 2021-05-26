@@ -860,6 +860,8 @@ func (s *packetNumberSpace) canDecrypt() bool {
 	return s.opener.aead != nil
 }
 
+// decryptPacket decrypts the given packet at b and then writes decrypted payload to b
+// at the position (offset) of packet body.
 func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, error) {
 	pnOffset, err := p.packetNumberOffset(b)
 	if err != nil {

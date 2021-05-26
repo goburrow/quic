@@ -2,6 +2,7 @@ package quic
 
 import (
 	"crypto/tls"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -16,26 +17,20 @@ func (f handlerFunc) Serve(c *Conn, e []transport.Event) {
 }
 
 func TestServerAndClient(t *testing.T) {
-	socket, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := newServer()
-	s.SetListener(socket)
+	s, c := newPipe(nil, nil)
+	// Server
 	s.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
 		for _, e := range events {
 			switch e.Type {
-			case EventConnAccept:
-			case transport.EventStreamReadable:
-				st, err := conn.Stream(e.ID)
-				if st == nil || err != nil {
-					t.Errorf("expect client stream created, actual %v %v", st, err)
-					conn.Close()
-					return
+			case transport.EventConnOpen:
+			case transport.EventStreamOpen:
+				if e.ID != 4 || e.Data != 1 {
+					t.Errorf("expect client open stream %d, actual %v", 4, e)
 				}
+			case transport.EventStreamReadable:
 				buf := make([]byte, 8)
-				n, err := st.Read(buf)
-				if err != nil {
+				n, err := conn.StreamRead(e.ID, buf)
+				if err != io.EOF {
 					t.Errorf("server stream receive: %v", err)
 					conn.Close()
 					return
@@ -43,9 +38,9 @@ func TestServerAndClient(t *testing.T) {
 				if string(buf[:n]) != "ping" {
 					t.Errorf("expect server receive: ping. Got %s", buf[:n])
 				}
-				n, err = st.Write([]byte("pong"))
-				if err != nil {
-					t.Errorf("server stream send: %v", err)
+				n, err = conn.StreamWrite(e.ID, []byte("pong"))
+				if n != 4 || err != nil {
+					t.Errorf("server stream send: %v %v", n, err)
 					conn.Close()
 					return
 				}
@@ -53,7 +48,7 @@ func TestServerAndClient(t *testing.T) {
 				if e.ID != 4 {
 					t.Errorf("expect writable stream %d, actual %d", 4, e.ID)
 				}
-			case EventConnClose:
+			case transport.EventConnClosed:
 			default:
 				t.Errorf("unexpected event: %#v", e)
 			}
@@ -66,33 +61,27 @@ func TestServerAndClient(t *testing.T) {
 		}
 	}()
 	go s.Serve()
+
+	// Client
 	recvData := make(chan []byte, 1)
-	c := newClient()
 	c.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
 		for _, e := range events {
 			switch e.Type {
-			case EventConnAccept:
-				st, err := conn.Stream(4)
-				if st == nil || err != nil {
-					t.Errorf("expect client stream created, actual %v %v", st, err)
+			case transport.EventConnOpen:
+				_, err := conn.StreamWrite(4, []byte("ping"))
+				if err != nil {
+					t.Errorf("write stream %v", err)
 					conn.Close()
 					return
 				}
-				st.Write([]byte("ping"))
-				st.Close()
+				conn.StreamClose(4)
 			case transport.EventStreamReadable:
-				st, err := conn.Stream(e.ID)
-				if st == nil || err != nil {
-					t.Errorf("expect client stream created, actual %v %v", st, err)
-					conn.Close()
-					return
-				}
 				buf := make([]byte, 8)
-				n, err := st.Read(buf)
-				if err == nil {
+				n, err := conn.StreamRead(e.ID, buf)
+				if n > 0 {
 					recvData <- buf[:n]
 				} else {
-					t.Errorf("client stream receive: %v", err)
+					t.Errorf("client stream receive: %v %v", n, err)
 					recvData <- nil
 				}
 				conn.Close()
@@ -101,24 +90,23 @@ func TestServerAndClient(t *testing.T) {
 					t.Errorf("expect writable stream %d, actual %d", 4, e.ID)
 				}
 			case transport.EventStreamComplete:
-				close(recvData)
-			case EventConnClose:
+				if e.ID != 4 {
+					t.Errorf("expect stream send complete %d, actual %d", 4, e.ID)
+				}
+			case transport.EventConnClosed:
 			default:
 				t.Errorf("unexpected event: %#v", e)
 			}
 		}
 	}))
-	err = c.ListenAndServe("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer func() {
 		err := c.Close()
 		if err != nil {
 			t.Errorf("client close: %v", err)
 		}
 	}()
-	err = c.Connect(socket.LocalAddr().String())
+	go c.Serve()
+	err := c.Connect(s.LocalAddr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,15 +121,15 @@ func TestServerAndClient(t *testing.T) {
 }
 
 func TestClientCloseHandshake(t *testing.T) {
-	closeCh := make(chan struct{}, 2)
-	socket, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	clientConfig := transport.NewConfig()
+	clientConfig.TLS = &tls.Config{
+		ServerName: "quic",
 	}
-	s := newServer()
-	s.SetListener(socket)
+	s, c := newPipe(nil, clientConfig)
+
+	closeCh := make(chan struct{}, 2)
 	s.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
-		if len(events) != 1 || events[0].Type != EventConnClose {
+		if len(events) != 1 || events[0].Type != transport.EventConnClosed {
 			t.Errorf("expect only close event, got %v", events)
 		}
 		closeCh <- struct{}{}
@@ -149,23 +137,16 @@ func TestClientCloseHandshake(t *testing.T) {
 	defer s.Close()
 	go s.Serve()
 
-	clientConfig := transport.NewConfig()
-	clientConfig.TLS = &tls.Config{
-		ServerName: "quic",
-	}
-	c := NewClient(clientConfig)
 	c.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
-		if len(events) != 1 || events[0].Type != EventConnClose {
+		if len(events) != 1 || events[0].Type != transport.EventConnClosed {
 			t.Errorf("expect only close event, got %v", events)
 		}
 		closeCh <- struct{}{}
 	}))
-	err = c.ListenAndServe("127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer c.Close()
-	err = c.Connect(socket.LocalAddr().String())
+	go c.Serve()
+
+	err := c.Connect(s.LocalAddr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +160,29 @@ func TestClientCloseHandshake(t *testing.T) {
 	}
 }
 
-func newServer() *Server {
+func newPipe(serverConfig, clientConfig *transport.Config) (*Server, *Client) {
+	ss, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	cs, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	if serverConfig == nil {
+		serverConfig = newServerConfig()
+	}
+	if clientConfig == nil {
+		clientConfig = newClientConfig()
+	}
+	s := NewServer(serverConfig)
+	s.SetListener(ss)
+	c := NewClient(clientConfig)
+	c.SetListener(cs)
+	return s, c
+}
+
+func newServerConfig() *transport.Config {
 	cert, err := tls.LoadX509KeyPair("testdata/cert.pem", "testdata/key.pem")
 	if err != nil {
 		panic(err)
@@ -188,13 +191,13 @@ func newServer() *Server {
 	config.TLS = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 	}
-	return NewServer(config)
+	return config
 }
 
-func newClient() *Client {
+func newClientConfig() *transport.Config {
 	config := transport.NewConfig()
 	config.TLS = &tls.Config{
 		InsecureSkipVerify: true,
 	}
-	return NewClient(config)
+	return config
 }

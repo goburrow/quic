@@ -150,8 +150,8 @@ func (s rangeSet) String() string {
 
 // rangeBuffer represents a fragment of data at an offset.
 type rangeBuffer struct {
-	data   []byte
 	offset uint64
+	data   []byte
 }
 
 func (s *rangeBuffer) String() string {
@@ -159,13 +159,13 @@ func (s *rangeBuffer) String() string {
 }
 
 // newRangeBuffer creates a new buffer with a copy of data.
-func newRangeBuffer(data []byte, offset uint64) *rangeBuffer {
+func newRangeBuffer(data []byte, offset uint64) rangeBuffer {
 	var d []byte
 	if len(data) > 0 {
 		d = make([]byte, len(data))
 		copy(d, data)
 	}
-	return &rangeBuffer{
+	return rangeBuffer{
 		data:   d,
 		offset: offset,
 	}
@@ -186,7 +186,7 @@ func (s *rangeBufferList) write(data []byte, offset uint64) {
 		i = 0
 	}
 	for ; i < len(*s); i++ {
-		b := &(*s)[i]
+		b := (*s)[i]
 		bStart := b.offset
 		bEnd := b.offset + uint64(len(b.data))
 		if bStart <= offset {
@@ -225,7 +225,7 @@ func (s *rangeBufferList) write(data []byte, offset uint64) {
 			// Split the new buffer
 			//   XXXXXX
 			// OOOOOOOOO
-			b := newRangeBuffer(data[:bStart-offset], offset)
+			b = newRangeBuffer(data[:bStart-offset], offset)
 			s.insert(idx, b)
 			data = data[bEnd-offset:]
 			offset = bEnd
@@ -239,7 +239,7 @@ func (s *rangeBufferList) write(data []byte, offset uint64) {
 func (s *rangeBufferList) read(data []byte, offset uint64) int {
 	var i, n int
 	for i = 0; i < len(*s); i++ {
-		b := &(*s)[i]
+		b := (*s)[i]
 		if b.offset != offset {
 			break
 		}
@@ -249,8 +249,10 @@ func (s *rangeBufferList) read(data []byte, offset uint64) int {
 		}
 		n += k
 		if k < len(b.data) {
-			b.data = b.data[k:]
-			b.offset += uint64(k)
+			(*s)[i] = rangeBuffer{
+				data:   b.data[k:],
+				offset: b.offset + uint64(k),
+			}
 			break
 		}
 		offset += uint64(k)
@@ -266,7 +268,9 @@ func (s *rangeBufferList) pop(max int) ([]byte, uint64) {
 	if len(*s) == 0 || max <= 0 {
 		return nil, 0
 	}
-	offset := (*s)[0].offset
+	// Use offset from the first segment
+	first := (*s)[0]
+	offset := first.offset
 	n := 0
 	// Peek available bytes
 	for _, b := range *s {
@@ -280,20 +284,28 @@ func (s *rangeBufferList) pop(max int) ([]byte, uint64) {
 		}
 	}
 	// No allocation needed if data is the whole first buffer
-	if n == len((*s)[0].data) {
-		r := (*s)[0]
+	if n == len(first.data) {
+		b := first.data
 		s.shift(1)
-		return r.data, offset
+		return b, offset
+	}
+	if n < len(first.data) {
+		b := first.data[:n]
+		(*s)[0] = rangeBuffer{
+			data:   first.data[n:],
+			offset: offset + uint64(n),
+		}
+		return b, offset
 	}
 	b := make([]byte, n)
 	n = s.read(b, offset)
 	return b[:n], offset
 }
 
-func (s *rangeBufferList) insert(idx int, r *rangeBuffer) {
+func (s *rangeBufferList) insert(idx int, r rangeBuffer) {
 	ls := append(*s, rangeBuffer{})
 	copy(ls[idx+1:], ls[idx:])
-	ls[idx] = *r
+	ls[idx] = r
 	*s = ls
 }
 

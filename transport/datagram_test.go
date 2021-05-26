@@ -140,10 +140,12 @@ func TestDatagramRecv(t *testing.T) {
 	if x.isReadable() {
 		t.Fatalf("expect readable %v, actual %v", false, x.isReadable())
 	}
-	err = x.pushRecv([]byte("read1"))
+	b := []byte("read1")
+	err = x.pushRecv(b)
 	if err != nil {
 		t.Fatalf("expect push %v, actual %v", nil, err)
 	}
+	b[4] = '2' // later ensure received data is intact.
 	err = x.pushRecv([]byte("rd2"))
 	if err != nil {
 		t.Fatalf("expect push %v, actual %v", nil, err)
@@ -151,7 +153,7 @@ func TestDatagramRecv(t *testing.T) {
 	if !x.isReadable() {
 		t.Fatalf("expect readable %v, actual %v", true, x.isReadable())
 	}
-	b := make([]byte, 10)
+	b = make([]byte, 10)
 	n, err := x.Read(b)
 	if n != 5 || err != nil || string(b[:n]) != "read1" {
 		t.Fatalf("expect read %v %v, actual %v %v %s", 5, nil, n, err, b[:n])

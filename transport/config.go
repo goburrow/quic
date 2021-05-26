@@ -1,4 +1,32 @@
 // Package transport provides implementation of QUIC transport protocol.
+//
+// To create a server or client connection:
+//
+// 	serverConfig := transport.NewConfig() // Server also requires a TLS certificate
+// 	server, err := transport.Accept(scid, odcid, serverConfig)
+//
+// 	clientConfig := transport.NewConfig()
+// 	client, err := transport.Connect(scid, config)
+//
+// To use the connection, feed it with input data and then get output data
+// sending to peer:
+//
+// 	for { // Loop until the connection is closed
+// 		timeout := server.Timeout()
+// 		// (A negative timeout means that the timer should be disarmed)
+// 		select {
+// 			case data := <-dataChanel:  // Got data from peer
+// 				n, err := conn.Write(data)
+// 			case <-time.After(timeout): // Got receiving timeout
+// 				n, err := conn.Write(nil)
+// 		}
+// 		// Get and process connection events
+// 		events = conn.Events(events)
+// 		for { // Loop until err != nil or n == 0
+// 			n, err := conn.Read(buf)
+// 			// Send buf[:n] to peer
+// 		}
+// 	}
 package transport
 
 import (

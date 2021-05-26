@@ -4,14 +4,20 @@ import "fmt"
 
 // Suppported event types
 const (
+	EventConnOpen   = "conn_open"   // New connection established.
+	EventConnClosed = "conn_closed" // Connection closed.
+
+	EventStreamOpen      = "stream_open"      // A new stream has been opened by peer.
 	EventStreamReadable  = "stream_readable"  // Received stream data and readable
 	EventStreamWritable  = "stream_writable"  // Stream is unblocked and can add more data
 	EventStreamCreatable = "stream_creatable" // Maximum streams increased by peer.
 
-	EventStreamStop     = "stream_stop"     // Received stream stop sending
-	EventStreamReset    = "stream_reset"    // Received stream reset
+	EventStreamStop     = "stream_stop"     // Received stream stop sending from peer.
+	EventStreamReset    = "stream_reset"    // Received stream reset from peer.
 	EventStreamComplete = "stream_complete" // All sending data has been acked.
+	EventStreamClosed   = "stream_closed"   // Stream is fully closed and no longer available.
 
+	EventDatagramWritable = "datagram_writable" // Datagram is supported by peer.
 	EventDatagramReadable = "datagram_readable" // Received datagram.
 )
 
@@ -23,7 +29,36 @@ type Event struct {
 }
 
 func (s Event) String() string {
-	return fmt.Sprintf("%s:%d", s.Type, s.ID)
+	if s.Data == 0 {
+		return fmt.Sprintf("%s:%d", s.Type, s.ID)
+	}
+	return fmt.Sprintf("%s:%d(%d)", s.Type, s.ID, s.Data)
+}
+
+// newEventStreamOpen creates an event where a connection state is set to Active.
+func newEventConnectionOpen() Event {
+	return Event{
+		Type: EventConnOpen,
+	}
+}
+
+// newEventConnectionClosed creates an event where a connection state is set to Closed.
+func newEventConnectionClosed() Event {
+	return Event{
+		Type: EventConnClosed,
+	}
+}
+
+// newEventStreamOpen creates an event where a stream is opened by peer.
+func newEventStreamOpen(id uint64, bidi bool) Event {
+	e := Event{
+		Type: EventStreamOpen,
+		ID:   id,
+	}
+	if bidi {
+		e.Data = 1
+	}
+	return e
 }
 
 // newEventStreamReadable creates an event where a STREAM frame was received and data is readable.
@@ -76,6 +111,22 @@ func newEventStreamComplete(id uint64) Event {
 	return Event{
 		Type: EventStreamComplete,
 		ID:   id,
+	}
+}
+
+// newEventStreamClosed creates an event where the stream is fully closed and garbage collected.
+func newEventStreamClosed(id uint64) Event {
+	return Event{
+		Type: EventStreamClosed,
+		ID:   id,
+	}
+}
+
+// newEventDatagramWritable creates an event when peer accepts DATAGRAM.
+func newEventDatagramWritable(max uint64) Event {
+	return Event{
+		Type: EventDatagramWritable,
+		Data: max,
 	}
 }
 

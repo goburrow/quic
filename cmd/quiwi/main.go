@@ -91,19 +91,21 @@ func (w *keyLogWriter) Write(b []byte) (int, error) {
 	return w.w.Write(b)
 }
 
-type buffers struct {
+var buffers = newBufferCache(2048, 10)
+
+type bufferCache struct {
 	list chan []byte
 	size int
 }
 
-func newBuffers(size, length int) buffers {
-	return buffers{
+func newBufferCache(size, length int) bufferCache {
+	return bufferCache{
 		list: make(chan []byte, length),
 		size: size,
 	}
 }
 
-func (s *buffers) pop() []byte {
+func (s *bufferCache) pop() []byte {
 	var b []byte
 	select {
 	case b = <-s.list:
@@ -114,7 +116,7 @@ func (s *buffers) pop() []byte {
 	return b
 }
 
-func (s *buffers) push(b []byte) {
+func (s *bufferCache) push(b []byte) {
 	if cap(b) != s.size {
 		panic("invalid buffer capacity")
 	}

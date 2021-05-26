@@ -142,7 +142,7 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 }
 
 // Write consumes received data.
-// NOTE: b in be will be modified as data is decrypted directly to b.
+// NOTE: b will be modified as data is decrypted directly to b.
 func (s *Conn) Write(b []byte) (int, error) {
 	now := s.time()
 	// Keep track bytes received from client to limit bytes send back
@@ -163,7 +163,6 @@ func (s *Conn) Write(b []byte) (int, error) {
 		n += i
 	}
 	s.checkTimeout(now)
-	s.addStreamEvents()
 	return n, nil
 }
 
@@ -629,9 +628,6 @@ func (s *Conn) recvFrameStream(b []byte, now time.Time) (int, error) {
 	// A receiver maintains a cumulative sum of bytes received on all streams,
 	// which is used to check for flow control violations
 	s.flow.addRecv(uint64(len(f.data)))
-	if st.isReadable() {
-		s.addEvent(newEventStreamReadable(f.streamID))
-	}
 	s.logFrameProcessed(&f, now)
 	return n, nil
 }
@@ -818,9 +814,6 @@ func (s *Conn) recvFrameDatagram(b []byte, now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if s.datagram.isReadable() {
-		s.addEvent(newEventDatagramReadable())
-	}
 	s.logFrameProcessed(&f, now)
 	return n, nil
 }
@@ -889,7 +882,10 @@ func (s *Conn) setPeerParams(params *Parameters, now time.Time) {
 	// Update loss recovery state
 	s.recovery.setMaxAckDelay(s.peerParams.MaxAckDelay)
 	// Datagram
-	s.datagram.setMaxSend(s.peerParams.MaxDatagramPayloadSize)
+	if s.peerParams.MaxDatagramPayloadSize > 0 {
+		s.datagram.setMaxSend(s.peerParams.MaxDatagramPayloadSize)
+		s.addEvent(newEventDatagramWritable(s.peerParams.MaxDatagramPayloadSize))
+	}
 	s.logParametersSet(params, now)
 }
 
@@ -1383,12 +1379,16 @@ func (s *Conn) Timeout() time.Duration {
 func (s *Conn) checkTimeout(now time.Time) {
 	if !s.drainingTimer.IsZero() && !now.Before(s.drainingTimer) {
 		debug("draining timeout expired")
-		s.setState(StateClosed, now)
+		if s.state < StateClosed {
+			s.setState(StateClosed, now)
+		}
 		return
 	}
 	if !s.idleTimer.IsZero() && !now.Before(s.idleTimer) {
 		debug("idle timeout expired")
-		s.setState(StateClosed, now)
+		if s.state < StateClosed {
+			s.setState(StateClosed, now)
+		}
 		return
 	}
 	if !s.recovery.lossDetectionTimer.IsZero() && !now.Before(s.recovery.lossDetectionTimer) {
@@ -1430,14 +1430,18 @@ func (s *Conn) ConnectionState() ConnectionState {
 	return s.state
 }
 
-// Events consumes received events. It appends to provided events slice
-// and clear received events.
+// Events consumes received connection events as well as stream and datagram events.
+// It appends to provided events slice and clears received events.
 func (s *Conn) Events(events []Event) []Event {
 	events = append(events, s.events...)
 	for i := range s.events {
 		s.events[i] = Event{}
 	}
 	s.events = s.events[:0]
+	if s.state == StateActive {
+		events = s.addStreamEvents(events)
+		events = s.addDatagramEvents(events)
+	}
 	return events
 }
 
@@ -1604,6 +1608,9 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 	st.flow.init(maxRecv, maxSend)
 	// Manually set connection flow control to get updated read bytes
 	st.connFlow = &s.flow
+	if !st.local {
+		s.addEvent(newEventStreamOpen(id, st.bidi))
+	}
 	return st, nil
 }
 
@@ -1611,6 +1618,7 @@ func (s *Conn) getOrCreateStream(id uint64, local bool) (*Stream, error) {
 func (s *Conn) checkStreamsState(now time.Time) {
 	if s.state == StateActive {
 		s.streams.checkClosed(func(id uint64) {
+			s.addEvent(newEventStreamClosed(id))
 			s.logStreamClosed(id, now)
 		})
 	}
@@ -1619,6 +1627,12 @@ func (s *Conn) checkStreamsState(now time.Time) {
 func (s *Conn) setState(state ConnectionState, now time.Time) {
 	s.logConnectionState(s.state, state, now)
 	s.state = state
+	switch state {
+	case StateActive:
+		s.addEvent(newEventConnectionOpen())
+	case StateClosed:
+		s.addEvent(newEventConnectionClosed())
+	}
 	debug("set state=%v", state)
 }
 
@@ -1628,24 +1642,32 @@ func (s *Conn) dropPacketSpace(space packetSpace, now time.Time) {
 	debug("dropped space=%v", space)
 }
 
-func (s *Conn) addStreamEvents() {
-	if s.state != StateActive || s.flow.canSend() == 0 {
-		return
-	}
-	for id, st := range s.streams.streams {
-		if st.isWritable() {
-			s.addEvent(newEventStreamWritable(id))
+func (s *Conn) addStreamEvents(events []Event) []Event {
+	if len(s.streams.streams) > 0 {
+		for id, st := range s.streams.streams {
+			if st.isReadable() {
+				events = append(events, newEventStreamReadable(id))
+			}
+		}
+		if s.flow.canSend() > 0 {
+			for id, st := range s.streams.streams {
+				if st.isWritable() {
+					events = append(events, newEventStreamWritable(id))
+				}
+			}
 		}
 	}
+	return events
+}
+
+func (s *Conn) addDatagramEvents(events []Event) []Event {
+	if s.datagram.isReadable() {
+		events = append(events, newEventDatagramReadable())
+	}
+	return events
 }
 
 func (s *Conn) addEvent(e Event) {
-	// Ensure event is unique. Maybe use Bloom Filter?
-	for i := len(s.events) - 1; i >= 0; i-- {
-		if s.events[i] == e {
-			return
-		}
-	}
 	s.events = append(s.events, e)
 }
 

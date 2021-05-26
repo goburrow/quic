@@ -236,10 +236,7 @@ func (s *Server) newConn(addr net.Addr, odcid []byte) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := newRemoteConn(addr, scid, conn)
-	// XXX: Handle in transport package?
-	c.nextStreamIDBidi++
-	c.nextStreamIDUni++
+	c := newRemoteConn(addr, scid, conn, false)
 	s.logger.attachLogger(c)
 	return c, nil
 }

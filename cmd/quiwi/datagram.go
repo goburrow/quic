@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -30,6 +31,7 @@ func (datagramCommand) Run(args []string) error {
 	certFile := cmd.String("cert", "cert.pem", "TLS certificate path (server only)")
 	keyFile := cmd.String("key", "key.pem", "TLS certificate key path (server only)")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
+	data := cmd.String("data", "", "Datagram for sending (or from stdin if empty)")
 	cmd.Usage = func() {
 		fmt.Fprintln(cmd.Output(), "Usage: quiwi datagram [arguments] [url]")
 		cmd.PrintDefaults()
@@ -78,7 +80,7 @@ func (datagramCommand) Run(args []string) error {
 	client := quic.NewClient(config)
 	client.SetLogger(*logLevel, os.Stderr)
 	clientHandler := &datagramClientHandler{
-		dgram: make(chan []byte),
+		data:  *data,
 		close: make(chan struct{}),
 	}
 	client.SetHandler(clientHandler)
@@ -96,15 +98,15 @@ func (datagramCommand) Run(args []string) error {
 }
 
 type datagramClientHandler struct {
-	dgram chan []byte
+	data  string
 	close chan struct{}
 }
 
 func (s *datagramClientHandler) Serve(c *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
-		case quic.EventConnAccept:
-			_, err := c.Datagram().Write([]byte("hello"))
+		case transport.EventDatagramWritable:
+			err := s.handleDatagramWritable(c)
 			if err != nil {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
@@ -115,17 +117,36 @@ func (s *datagramClientHandler) Serve(c *quic.Conn, events []transport.Event) {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
-		case quic.EventConnClose:
+		case transport.EventConnClosed:
 			close(s.close)
 			return
 		}
 	}
 }
 
+func (s *datagramClientHandler) handleDatagramWritable(c *quic.Conn) error {
+	if len(s.data) > 0 {
+		return c.DatagramWrite([]byte(s.data))
+	}
+	// Read from stdin and send each line in a datagram.
+	go func(dgram *quic.Datagram) {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			b := scanner.Bytes()
+			if len(b) > 0 {
+				_, err := dgram.Write(b)
+				if err != nil {
+					return
+				}
+			}
+		}
+	}(c.Datagram())
+	return nil
+}
+
 func (s *datagramClientHandler) handleDatagramReadable(c *quic.Conn) error {
-	dgram := c.Datagram()
 	for {
-		d := dgram.Pop()
+		d := c.DatagramRead()
 		if len(d) > 0 {
 			_, err := fmt.Fprintf(os.Stdout, "recv: %s\n", d)
 			if err != nil {
@@ -148,7 +169,7 @@ func (s *datagramServerHandler) Serve(c *quic.Conn, events []transport.Event) {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
-		case quic.EventConnClose:
+		case transport.EventConnClosed:
 			return
 		}
 	}
@@ -156,11 +177,10 @@ func (s *datagramServerHandler) Serve(c *quic.Conn, events []transport.Event) {
 
 func (s *datagramServerHandler) handleDatagramReadable(c *quic.Conn) error {
 	// Echo back
-	dgram := c.Datagram()
 	for {
-		d := dgram.Pop()
+		d := c.DatagramRead()
 		if len(d) > 0 {
-			err := dgram.Push(d)
+			err := c.DatagramWrite(d)
 			if err != nil {
 				return err
 			}

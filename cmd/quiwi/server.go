@@ -42,6 +42,7 @@ func (serverCommand) Run(args []string) error {
 	root := cmd.String("root", "www", "root directory")
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
+	useAsync := cmd.Bool("async", false, "use asynchronous Stream APIs")
 	enableRetry := cmd.Bool("retry", false, "enable address validation using Retry packet")
 	cmd.Usage = func() {
 		fmt.Fprintln(cmd.Output(), "Usage: quiwi server [arguments]")
@@ -76,8 +77,8 @@ func (serverCommand) Run(args []string) error {
 	}
 	server := quic.NewServer(config)
 	server.SetHandler(&serverHandler{
-		root: *root,
-		buf:  newBuffers(2048, 10),
+		root:  *root,
+		async: *useAsync,
 	})
 	if *enableRetry {
 		// Stateless retry
@@ -108,12 +109,23 @@ func (serverCommand) Run(args []string) error {
 	return server.ListenAndServe(*listenAddr)
 }
 
+// serverHandler implements quic.Handler
 type serverHandler struct {
-	root string
-	buf  buffers
+	root  string
+	async bool
 }
 
+// Serve processes connection events.
 func (s *serverHandler) Serve(c *quic.Conn, events []transport.Event) {
+	if s.async {
+		s.serveAsync(c, events)
+	} else {
+		s.serveSync(c, events)
+	}
+}
+
+// serveSync demonstrates using synchronous Stream APIs.
+func (s *serverHandler) serveSync(c *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
 		case transport.EventStreamReadable:
@@ -128,7 +140,7 @@ func (s *serverHandler) Serve(c *quic.Conn, events []transport.Event) {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
-		case quic.EventConnClose:
+		case transport.EventConnClosed:
 			for _, f := range s.getResponses(c) {
 				f.Close()
 			}
@@ -137,54 +149,31 @@ func (s *serverHandler) Serve(c *quic.Conn, events []transport.Event) {
 }
 
 func (s *serverHandler) handleStreamReadable(c *quic.Conn, streamID uint64) error {
-	st, err := c.Stream(streamID)
-	if err != nil {
-		return err
-	}
 	// TODO: Here we assume the whole request is in a single read.
-	buf := s.buf.pop()
-	defer s.buf.push(buf)
-	n, err := st.Read(buf)
-	if n == 0 || err != nil {
+	buf := buffers.pop()
+	defer buffers.push(buf)
+	n, err := c.StreamRead(streamID, buf)
+	if n <= 0 {
 		if err == io.EOF {
 			return nil
 		}
 		return err
 	}
-	// Parse request
-	req := string(buf[:n])
-	if !strings.HasPrefix(req, "GET /") {
-		st.WriteString("not found")
-		return st.Close()
-	}
-	reqURL, err := url.ParseRequestURI(strings.TrimSpace(req[4:]))
-	if err != nil {
-		st.WriteString("not found")
-		return st.Close()
-	}
-	st.CloseRead(0)
-	// Send file
-	name := filepath.Join(s.root, path.Clean(reqURL.Path))
-	f, err := os.Open(name)
-	if err != nil {
-		st.WriteString("not found")
-		return st.Close()
-	}
-	if info, err := f.Stat(); err != nil || info.Mode().IsDir() {
-		f.Close()
-		st.WriteString("not found")
-		return st.Close()
+	f := getFile(s.root, string(buf[:n]))
+	if f == nil {
+		c.StreamWrite(streamID, []byte("not found"))
+		return c.StreamClose(streamID)
 	}
 	// Write initial data
 	for i := 0; i < 4; i++ {
 		n, err := f.Read(buf)
 		if n > 0 {
-			m, err := st.Write(buf[:n])
+			m, err := c.StreamWrite(streamID, buf[:n])
 			if m < n {
 				_, err = f.Seek(int64(m-n), io.SeekCurrent)
 				if err != nil {
 					f.Close()
-					st.CloseWrite(1)
+					c.StreamCloseWrite(streamID, 1)
 					return err
 				}
 				break
@@ -193,10 +182,10 @@ func (s *serverHandler) handleStreamReadable(c *quic.Conn, streamID uint64) erro
 		if err != nil {
 			f.Close()
 			if err == io.EOF {
-				st.Close() // Done sending
+				c.StreamClose(streamID) // Done sending
 				return nil
 			}
-			st.CloseWrite(1) // Internal error
+			c.StreamCloseWrite(streamID, 1) // Internal error
 			return err
 		}
 	}
@@ -210,23 +199,19 @@ func (s *serverHandler) handleStreamWritable(c *quic.Conn, streamID uint64) erro
 	if f == nil {
 		return nil
 	}
-	st, err := c.Stream(streamID)
-	if err != nil {
-		return err
-	}
-	buf := s.buf.pop()
-	defer s.buf.push(buf)
+	buf := buffers.pop()
+	defer buffers.push(buf)
 	for i := 0; i < 4; i++ {
 		n, err := f.Read(buf)
 		if n > 0 {
-			m, _ := st.Write(buf[:n])
+			m, _ := c.StreamWrite(streamID, buf[:n])
 			if m < n {
 				// Will send it again
 				_, err = f.Seek(int64(m-n), io.SeekCurrent)
 				if err != nil {
 					f.Close()
 					delete(responses, streamID)
-					st.CloseWrite(1)
+					c.StreamCloseWrite(streamID, 1)
 					return err
 				}
 				return nil
@@ -236,10 +221,10 @@ func (s *serverHandler) handleStreamWritable(c *quic.Conn, streamID uint64) erro
 			f.Close()
 			delete(responses, streamID)
 			if err == io.EOF {
-				st.Close() // Done sending
+				c.StreamClose(streamID) // Done sending
 				return nil
 			}
-			st.CloseWrite(1) // Internal error
+			c.StreamCloseWrite(streamID, 1) // Internal error
 			return err
 		}
 	}
@@ -253,6 +238,67 @@ func (s *serverHandler) getResponses(c *quic.Conn) map[uint64]*os.File {
 		return responses
 	}
 	return c.UserData().(map[uint64]*os.File)
+}
+
+// serveAsync demonstrates using asynchronous Stream APIs.
+func (s *serverHandler) serveAsync(c *quic.Conn, events []transport.Event) {
+	for _, e := range events {
+		switch e.Type {
+		case transport.EventStreamOpen:
+			st, err := c.Stream(e.ID)
+			if err != nil {
+				c.CloseWithError(transport.ApplicationError, err.Error())
+				return
+			}
+			go s.handleStreamAsync(st)
+		}
+	}
+}
+
+// handleStream must be run in a new goroutine.
+func (s *serverHandler) handleStreamAsync(st *quic.Stream) {
+	defer st.Close()
+	//st.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	// TODO: Here we assume the whole request is in a single read.
+	buf := buffers.pop()
+	defer buffers.push(buf)
+	n, _ := st.Read(buf)
+	if n <= 0 {
+		st.CloseWrite(1)
+		return
+	}
+	f := getFile(s.root, string(buf[:n]))
+	if f == nil {
+		st.Write([]byte("not found"))
+		return
+	}
+	defer f.Close()
+	_, err := io.CopyBuffer(st, f, buf)
+	if err != nil {
+		st.CloseWrite(1)
+	}
+}
+
+func getFile(root, req string) *os.File {
+	// Parse request
+	if !strings.HasPrefix(req, "GET /") {
+		return nil
+	}
+	reqURL, err := url.ParseRequestURI(strings.TrimSpace(req[4:]))
+	if err != nil {
+		return nil
+	}
+	name := filepath.Join(root, path.Clean(reqURL.Path))
+	f, err := os.Open(name)
+	if err != nil {
+		return nil
+	}
+	if info, err := f.Stat(); err != nil || info.Mode().IsDir() {
+		f.Close()
+		return nil
+	}
+	return f
 }
 
 // acmeHandler listens on the standard TLS port (443) and handles "tls-alpn-01" challenge

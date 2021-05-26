@@ -137,16 +137,20 @@ func TestConnStream(t *testing.T) {
 	}
 	p.assertClientSend()
 	events := p.server.Events(nil)
-	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
-		events[1].Type != EventStreamWritable || events[1].ID != 4 {
+	if len(events) != 4 ||
+		events[0].Type != EventConnOpen ||
+		events[1].Type != EventStreamOpen || events[1].ID != 4 || events[1].Data != 1 ||
+		events[2].Type != EventStreamReadable || events[2].ID != 4 ||
+		events[3].Type != EventStreamWritable || events[3].ID != 4 {
 		t.Fatalf("events %+v", events)
 	}
-	st, err := p.server.Stream(events[0].ID)
+	streamID := events[1].ID
+	st, err := p.server.Stream(streamID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	n, err = st.Read(p.buf[:])
-	if n != 5 || err != nil {
+	if n != 5 || err != io.EOF {
 		t.Fatalf("server stream read %v %v", n, err)
 	}
 	if string(p.buf[:n]) != "hello" {
@@ -166,12 +170,14 @@ func TestConnStream(t *testing.T) {
 	}
 	p.assertServerSend()
 	events = p.client.Events(nil)
-	if len(events) != 2 || events[0].Type != EventStreamReadable || events[0].ID != 4 ||
-		events[1].Type != EventStreamComplete || events[1].ID != 4 {
+	if len(events) != 3 ||
+		events[0].Type != EventConnOpen ||
+		events[1].Type != EventStreamComplete || events[1].ID != 4 ||
+		events[2].Type != EventStreamReadable || events[2].ID != 4 {
 		t.Fatalf("events %+v", events)
 	}
 	n, err = ct.Read(p.buf[:])
-	if n != 3 || err != nil {
+	if n != 3 || err != io.EOF {
 		t.Fatalf("client stream read %v %v", n, err)
 	}
 	if string(p.buf[:n]) != "hi!" {
@@ -297,8 +303,11 @@ func TestConnRecvResetStream(t *testing.T) {
 		t.Fatalf("expect flow recv %v, actual %+v", 10, conn.flow)
 	}
 	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStreamReset || events[0].ID != 5 || events[0].Data != 5 {
-		t.Fatalf("event %+v", events)
+	if len(events) != 3 ||
+		events[0].Type != EventStreamOpen || events[0].ID != 3 || events[0].Data != 0 ||
+		events[1].Type != EventStreamOpen || events[1].ID != 5 || events[1].Data != 1 ||
+		events[2].Type != EventStreamReset || events[2].ID != 5 || events[2].Data != 5 {
+		t.Fatalf("events %+v", events)
 	}
 }
 

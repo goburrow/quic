@@ -1,5 +1,5 @@
 # Quiwi 🥝
-[![GoDoc](https://godoc.org/github.com/goburrow/quic?status.svg)](https://godoc.org/github.com/goburrow/quic)
+[![Go Reference](https://pkg.go.dev/badge/github.com/goburrow/quic.svg)](https://pkg.go.dev/github.com/goburrow/quic)
 ![](https://github.com/goburrow/quic/workflows/Go/badge.svg)
 
 QUIC transport protocol (https://github.com/quicwg/base-drafts/) implementation in Go, inspired by Cloudflare Quiche.
@@ -22,13 +22,18 @@ licensed under the 3-clause BSD license.
 - [X] Anti-amplification
 - [X] Unreliable datagram
 - [X] qlog
-- [ ] Zero RTT
 - [ ] Key update
-- [ ] Path MTU discovery
 - [ ] Connection migration
+- [ ] Path MTU discovery
+- [ ] Zero RTT
 - [ ] HTTP/3 - intentionally not implemented
 
 ## Development
+
+Run tests:
+```
+go test ./...
+```
 
 Build command:
 ```
@@ -43,6 +48,68 @@ go build -gcflags '-m' 2>&1 | sort -V > debug.txt
 
 # Raspberry Pi Zero
 GOOS=linux GOARCH=arm GOARM=6 CGO_ENABLED=0 go build
+```
+
+### APIs
+
+Package `transport` provides low-level APIs to control QUIC connections.
+Applications write input data to the connection and read output data for sending to peer.
+
+```go
+config := transport.NewConfig()
+server, err := transport.Accept(scid, odcid, config)
+```
+```go
+config := transport.NewConfig()
+client, err := transport.Connect(scid, config)
+```
+```go
+for { // Loop until the connection is closed
+	timeout := conn.Timeout()
+	// (A negative timeout means that the timer should be disarmed)
+	select {
+		case data := <-dataChanel:  // Got data from peer
+			n, err := conn.Write(data)
+		case <-time.After(timeout): // Got receiving timeout
+			n, err := conn.Write(nil)
+	}
+	// Get and process connection events
+	events = conn.Events(events)
+	for { // Loop until err != nil or n == 0
+		n, err := conn.Read(buf)
+		// Send buf[:n] to peer
+	}
+}
+```
+
+The root package `quic` instead provides high-level APIs where QUIC data are transferred over UDP.
+
+```go
+server := quic.NewServer(config)
+server.SetHandler(handler)
+err := server.ListenAndServe(address)
+```
+
+```go
+client := quic.NewClient(config)
+client.SetHandler(handler)
+err := client.ListenAndServe(address)
+err = client.Connect(serverAddress)
+// wait
+client.Close()
+```
+
+Applications get connection events in the handler to control QUIC connections:
+
+```
+func (handler) Serve(conn *quic.Conn, events []transport.Event) {
+	for _, e := range events {
+		switch e.Type {
+		case transport.EventConnOpen:
+		case transport.EventConnClosed:
+		}
+	}
+}
 ```
 
 ### Server
@@ -102,6 +169,8 @@ Usage: quiwi client [arguments] <url>
 Examples
 ```
 ./quiwi client https://quic.tech:4433/
+
+./quiwi client -insecure https://localhost:4433/file.txt
 ```
 
 ### Datagram
@@ -110,6 +179,8 @@ Examples
 Usage: quiwi datagram [arguments] [url]
   -cert string
     	TLS certificate path (server only) (default "cert.pem")
+  -data string
+    	Datagram for sending (or from stdin if empty)
   -insecure
     	skip verifying server certificate (client only)
   -key string
@@ -126,7 +197,7 @@ Examples:
 ./quiwi datagram -listen 127.0.0.1:4433
 
 # Client
-./quiwi datagram -insecure https://127.0.0.1:4433
+./quiwi datagram -insecure -data hello https://127.0.0.1:4433
 ```
 
 ## Testing

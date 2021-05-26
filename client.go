@@ -132,7 +132,7 @@ func (s *Client) newConn(addr net.Addr) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := newRemoteConn(addr, scid, conn)
+	c := newRemoteConn(addr, scid, conn, true)
 	s.logger.attachLogger(c)
 	return c, nil
 }

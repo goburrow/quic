@@ -24,17 +24,20 @@ func TestStreamRecv(t *testing.T) {
 	if err != nil || n != 4 || string(b[:n]) != "recv" {
 		t.Fatalf("expect read %v %v %s, actual %v %v %s", 4, nil, "recv", n, err, b[:n])
 	}
-	// Continue consume
-	n, err = s.Read(b)
-	if err != nil || n != 6 || string(b[:n]) != "stream" {
-		t.Fatalf("expect read %v %v %s, actual %v %v %s", 6, nil, "stream", n, err, b[:n])
-	}
-	// End
 	if !s.isReadable() {
 		t.Fatalf("expect readable: %v", &s)
 	}
-	_, err = s.Read(b)
-	if err != io.EOF {
+	// Continue consume
+	n, err = s.Read(b)
+	if err != io.EOF || n != 6 || string(b[:n]) != "stream" {
+		t.Fatalf("expect read %v %v %s, actual %v %v %s", 6, io.EOF, "stream", n, err, b[:n])
+	}
+	// End
+	if s.isReadable() {
+		t.Fatalf("expect not readable: %v", &s)
+	}
+	n, err = s.Read(b)
+	if n != 0 || err != io.EOF {
 		t.Fatalf("expect error %v, actual %v", io.EOF, err)
 	}
 	if s.isReadable() {
@@ -77,8 +80,8 @@ func TestStreamRecvRetry(t *testing.T) {
 	}
 	s.pushRecv(data, 10, false)
 	n, err = s.Read(b)
-	if err != nil || n != 14 || string(b[:n]) != "reamrecvstream" {
-		t.Fatalf("expect read %v %v %s, actual %v %v %s", 14, nil, "reamrecvstream", n, err, b[:n])
+	if err != io.EOF || n != 14 || string(b[:n]) != "reamrecvstream" {
+		t.Fatalf("expect read %v %v %s, actual %v %v %s", 14, io.EOF, "reamrecvstream", n, err, b[:n])
 	}
 	n, err = s.Read(b)
 	if err != io.EOF || n != 0 {
@@ -149,8 +152,8 @@ func TestStreamRecvEOF(t *testing.T) {
 	}
 	s.pushRecv(b[:10], 0, false)
 	n, err = s.Read(b)
-	if err != nil || n != 10 {
-		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
+	if err != io.EOF || n != 10 {
+		t.Fatalf("expect read %v %v, actual %v %v", 0, io.EOF, n, err)
 	}
 	n, err = s.Read(b)
 	if err != io.EOF || n != 0 {
@@ -185,8 +188,8 @@ func TestStreamCloseWriteBidi(t *testing.T) {
 		t.Fatalf("expect writable %v, actual %v", false, s.isWritable())
 	}
 	n, err := s.WriteString("more")
-	if n != 0 || err != nil {
-		t.Fatalf("expect write %v %v, actual %v %v", 0, nil, n, err)
+	if n != 0 || err == nil || err.Error() != "stream_state_error sending terminated: 100" {
+		t.Fatalf("expect write %v %v, actual %v %v", 0, errorCodeString(StreamStateError), n, err)
 	}
 	// Sending
 	b, off, fin := s.popSend(10)
@@ -317,7 +320,7 @@ func TestStreamLocalBidi(t *testing.T) {
 		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.totalSend)
 	}
 	// Receive data
-	err = s.pushRecv(b[:4], 0, true)
+	err = s.pushRecv(b[:4], 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,11 +417,17 @@ func TestStreamUpdateMaxStreamsBidi(t *testing.T) {
 	var b [8]byte
 	st := sm.get(0)
 	st.pushRecv(b[:1], 0, true)
-	st.Read(b[:])
+	n, err := st.Read(b[:0])
+	if n != 0 || err != nil {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 0, nil, n, err)
+	}
 	if st.recv.isClosed() {
 		t.Fatalf("expect recv stream not closed, actual %v", st.recv.isClosed())
 	}
-	st.Read(b[:])
+	n, err = st.Read(b[:])
+	if n != 1 || err != io.EOF {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 1, io.EOF, n, err)
+	}
 	if !st.recv.isClosed() {
 		t.Fatalf("expect recv stream closed, actual %v", st.recv.isClosed())
 	}

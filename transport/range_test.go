@@ -116,7 +116,7 @@ func TestRangeBufferInsertPos(t *testing.T) {
 	n := rand.Intn(1000)
 	min, max := maxUint64, uint64(0)
 	for i := 0; i < n; i++ {
-		b := &rangeBuffer{
+		b := rangeBuffer{
 			data:   nil,
 			offset: rand.Uint64(),
 		}
@@ -231,9 +231,14 @@ func TestRangeBufferPop(t *testing.T) {
 	x.ls.write(data[100:120], 100)
 	x.ls.write(data[150:180], 150)
 
-	read, offset := x.ls.pop(10)
-	if offset != 0 || !bytes.Equal(data[:10], read) {
-		t.Fatalf("data does not match:\nexpect: %x\nactual: %x (offset=%d)", data[:10], read, offset)
+	read, offset := x.ls.pop(2)
+	if offset != 0 || !bytes.Equal(data[:2], read) {
+		t.Fatalf("data does not match:\nexpect: %x\nactual: %x (offset=%d)", data[:2], read, offset)
+	}
+	x.assertSnapshot("ranges=4 [2,10) [10,100) [100,120) [150,180)")
+	read, offset = x.ls.pop(8)
+	if offset != 2 || !bytes.Equal(data[2:10], read) {
+		t.Fatalf("data does not match:\nexpect: %x\nactual: %x (offset=%d)", data[2:10], read, offset)
 	}
 	x.assertSnapshot("ranges=3 [10,100) [100,120) [150,180)")
 	read, offset = x.ls.pop(150)
