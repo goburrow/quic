@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"io"
 	"time"
 )
@@ -106,11 +107,11 @@ func newConn(config *Config, scid, odcid []byte, isClient bool) (*Conn, error) {
 	s.recovery.init()
 	s.flow.init(s.localParams.InitialMaxData, 0)
 	if len(scid) > 0 {
-		s.scid = append(s.scid[:0], scid...)
+		s.scid = copyBytes(scid)
 	}
 	s.localParams.InitialSourceCID = s.scid // SCID is fixed so can use its reference
 	if len(odcid) > 0 {
-		s.odcid = append(s.odcid[:0], odcid...)
+		s.odcid = copyBytes(odcid)
 		s.localParams.OriginalDestinationCID = s.odcid
 		s.localParams.RetrySourceCID = s.scid
 		s.didRetry = true // So odcid will not be set again
@@ -206,7 +207,7 @@ func (s *Conn) recv(b []byte, now time.Time) (int, error) {
 	}
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#version-negotiation
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-6
 func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) (int, error) {
 	// VN packet can only be sent by server
 	if !s.isClient || s.didVersionNegotiation || s.state != StateAttempted {
@@ -224,7 +225,7 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) 
 	}
 	var newVersion uint32
 	for _, v := range p.supportedVersions {
-		if VersionSupported(v) {
+		if IsVersionSupported(v) {
 			newVersion = v
 			break
 		}
@@ -244,7 +245,7 @@ func (s *Conn) recvPacketVersionNegotiation(b []byte, p *packet, now time.Time) 
 	return p.headerLen + n, nil
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#validate-handshake
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1
 func (s *Conn) recvPacketRetry(b []byte, p *packet, now time.Time) (int, error) {
 	// Retry packet can only be sent by server
 	// Packet's SCID must not be equal to the client's DCID.
@@ -267,11 +268,11 @@ func (s *Conn) recvPacketRetry(b []byte, p *packet, now time.Time) (int, error) 
 		return 0, newError(InvalidToken, "")
 	}
 	s.didRetry = true
-	s.token = append(s.token[:0], p.token...)
+	s.token = copyBytes(p.token)
 	// Update CIDs and crypto: dcid => odcid, header.scid => dcid
-	s.odcid = append(s.odcid[:0], s.dcid...)
-	s.dcid = append(s.dcid[:0], p.header.scid...)
-	s.rscid = s.dcid // DCID is now fixed
+	s.odcid = copyBytes(s.dcid)
+	s.dcid = copyBytes(p.header.scid)
+	s.rscid = copyBytes(p.header.scid)
 	s.deriveInitialKeyMaterial(s.dcid)
 	// Reset connection state to send another initial packet
 	s.gotPeerCID = false
@@ -290,7 +291,7 @@ func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error
 		return 0, newPacketDroppedError(logTriggerUnknownConnectionID)
 	}
 	if !s.isClient && !s.didVersionNegotiation {
-		if !VersionSupported(p.header.version) {
+		if !IsVersionSupported(p.header.version) {
 			return 0, newPacketDroppedError(logTriggerUnsupportedVersion)
 		}
 		s.version = p.header.version
@@ -302,18 +303,18 @@ func (s *Conn) recvPacketInitial(b []byte, p *packet, now time.Time) (int, error
 	if !s.gotPeerCID {
 		if s.isClient {
 			if len(s.odcid) == 0 {
-				s.odcid = append(s.odcid[:0], s.dcid...)
+				s.odcid = copyBytes(s.dcid)
 			}
 		} else {
 			if !s.didRetry {
-				s.odcid = append(s.odcid[:0], p.header.dcid...)
+				s.odcid = copyBytes(p.header.dcid)
 				s.localParams.OriginalDestinationCID = s.odcid
 				s.handshake.setTransportParams(&s.localParams)
 			}
 		}
 		// Replace the randomly generated destination connection ID with
 		// the one supplied by the server.
-		s.dcid = append(s.dcid[:0], p.header.scid...)
+		s.dcid = copyBytes(p.header.scid)
 		s.gotPeerCID = true
 	}
 	return s.recvPacket(b, p, packetSpaceInitial, now)
@@ -326,7 +327,7 @@ func (s *Conn) recvPacketHandshake(b []byte, p *packet, now time.Time) (int, err
 		return 0, newPacketDroppedError(logTriggerUnknownConnectionID)
 	}
 	if !s.isClient && !s.didVersionNegotiation {
-		if !VersionSupported(p.header.version) {
+		if !IsVersionSupported(p.header.version) {
 			return 0, newPacketDroppedError(logTriggerUnsupportedVersion)
 		}
 		s.version = p.header.version
@@ -366,7 +367,7 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 	// Process acked frames
 	s.processAckedPackets(space)
 
-	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-abandoning-initial-packets
+	// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.2.1
 	// A server stops sending and processing Initial packets when it receives its first Handshake packet.
 	if space == packetSpaceHandshake {
 		if !s.isClient && pnSpace.largestRecvPacketTime.IsZero() {
@@ -387,7 +388,7 @@ func (s *Conn) recvPacket(b []byte, p *packet, space packetSpace, now time.Time)
 	return p.packetSize, nil
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#frames
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-12.4
 // recvFrames sets ackElicited if a received frame is an ack eliciting.
 func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now time.Time) error {
 	// To avoid sending an ACK in response to an ACK-only packet, we need
@@ -408,7 +409,7 @@ func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now t
 		case typ == frameTypePadding:
 			n, err = s.recvFramePadding(b, now)
 		case typ == frameTypePing:
-			s.recvFramePing(b, now)
+			n, err = s.recvFramePing(b, now)
 		case typ == frameTypeAck || typ == frameTypeAckECN:
 			n, err = s.recvFrameAck(b, space, now)
 		case typ == frameTypeResetStream:
@@ -454,6 +455,9 @@ func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now t
 			debug("error processing frame 0x%x: %v", typ, err)
 			return err
 		}
+		if n <= 0 {
+			panic(sprint("no progress processing frame ", typ))
+		}
 		if !ackElicited {
 			ackElicited = isFrameAckEliciting(typ)
 		}
@@ -468,15 +472,21 @@ func (s *Conn) recvFrames(b []byte, pktType packetType, space packetSpace, now t
 func (s *Conn) recvFramePadding(b []byte, now time.Time) (int, error) {
 	var f paddingFrame
 	n, err := f.decode(b)
-	s.logFrameProcessed(&f, now)
+	if err == nil {
+		s.logFrameProcessed(&f, now)
+	}
 	return n, err
 }
 
-func (s *Conn) recvFramePing(b []byte, now time.Time) {
+func (s *Conn) recvFramePing(b []byte, now time.Time) (int, error) {
 	// Will ack
 	var f pingFrame
-	debug("received frame 0x%x: %v", b[0], &f)
-	s.logFrameProcessed(&f, now)
+	n, err := f.decode(b)
+	if err == nil {
+		debug("received frame 0x%x: %v", b[0], &f)
+		s.logFrameProcessed(&f, now)
+	}
+	return n, err
 }
 
 func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, error) {
@@ -889,7 +899,7 @@ func (s *Conn) setPeerParams(params *Parameters, now time.Time) {
 	s.logParametersSet(params, now)
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-authenticating-connection-i
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-7.3
 //
 // Client                                                  Server
 // Initial: DCID=S1, SCID=C1 ->
@@ -955,7 +965,7 @@ func (s *Conn) Read(b []byte) (int, error) {
 		return 0, err
 	}
 	// Coalesce packets when possible.
-	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#packet-coalesce
+	// https://www.rfc-editor.org/rfc/rfc9000.html#section-12.2
 	if space < packetSpaceApplication && s.state < StateDraining {
 		avail := minInt(s.maxPacketSize(), len(b))
 		if avail-n >= 96 { // Enough for a handshake packet
@@ -1061,7 +1071,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 	s.onPacketSent(op, space)
 	// TODO: Log real payload length without crypto overhead
 	s.logPacketSent(&p, op.frames, now)
-	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-abandoning-initial-packets
+	// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.2.1
 	// A client stops both sending and processing Initial packets when it sends its first Handshake packet.
 	if p.packetNumber == 0 {
 		if s.isClient {
@@ -1411,7 +1421,7 @@ func (s *Conn) setIdleTimer(now time.Time) {
 }
 
 // Close sets the connection to closing state.
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#draining
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.2
 func (s *Conn) Close(app bool, errCode uint64, reason string) {
 	if s.closeFrame != nil || s.state >= StateDraining {
 		// Closing or draining or already closed
@@ -1428,6 +1438,11 @@ func (s *Conn) Close(app bool, errCode uint64, reason string) {
 // ConnectionState returns the current connection state.
 func (s *Conn) ConnectionState() ConnectionState {
 	return s.state
+}
+
+// HandshakeState returns TLS handshake state.
+func (s *Conn) HandshakeState() tls.ConnectionState {
+	return s.handshake.tlsConn.ConnectionState()
 }
 
 // Events consumes received connection events as well as stream and datagram events.
@@ -1793,4 +1808,10 @@ func (s *Conn) logConnectionState(old, new ConnectionState, now time.Time) {
 		logConnectionState(&e, old, new)
 		s.logEventFn(e)
 	}
+}
+
+func copyBytes(src []byte) []byte {
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	return dst
 }

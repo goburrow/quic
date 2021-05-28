@@ -79,13 +79,14 @@ func (s *Datagram) Write(b []byte) (n int, err error) {
 	case s.conn.cmdCh <- cmd:
 		// Wait for result
 		err = <-s.wrData.resultCh
-		if err == errWait {
+		for err == errWait {
 			select {
 			case <-s.closeCh:
 				err = errClosed
 			case <-s.wrData.deadlineCh:
 				err = errDeadlineExceeded
-			case err = <-s.wrData.waitCh:
+			case <-s.wrData.waitCh:
+				err = <-s.wrData.resultCh
 			}
 		}
 	}
@@ -117,13 +118,14 @@ func (s *Datagram) Read(b []byte) (n int, err error) {
 	case s.conn.cmdCh <- cmd:
 		// Wait for result
 		err = <-s.rdData.resultCh
-		if err == errWait {
+		for err == errWait {
 			select {
 			case <-s.closeCh:
 				err = errClosed
 			case <-s.rdData.deadlineCh:
 				err = errDeadlineExceeded
-			case err = <-s.rdData.waitCh:
+			case <-s.rdData.waitCh:
+				err = <-s.rdData.resultCh
 			}
 		}
 	}
@@ -179,7 +181,7 @@ func (s *Datagram) recvReadData(r io.Reader) (bool, error) {
 }
 
 func (s *Datagram) isReading() bool {
-	return s.rdData.hasBuf()
+	return s.rdData.checkWaiting()
 }
 
 func (s *Datagram) sendWriteResult(err error) {
@@ -188,10 +190,6 @@ func (s *Datagram) sendWriteResult(err error) {
 
 func (s *Datagram) sendReadResult(err error) {
 	s.rdData.sendResult(err)
-}
-
-func (s *Datagram) sendReadWait(err error) {
-	s.rdData.sendWaitResult(err)
 }
 
 func (s *Datagram) setClosed() {

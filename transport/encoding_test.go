@@ -128,3 +128,23 @@ func (t *codecTest) assertOffset(n int) {
 		t.t.Fatalf("expect offset: %d, actual: %d", n, t.c.offset())
 	}
 }
+
+func TestDecodePacketNumber(t *testing.T) {
+	data := []struct {
+		pn        uint64
+		largest   uint64
+		truncated uint64
+		len       int
+	}{
+		{0xa82f9b32, 0xa82f30ea, 0x9b32, 2},
+		{0, 0, 0, 1},
+		{1, 0, 1, 1},
+		{2, 0, 2, 4},
+	}
+	for _, d := range data {
+		pn := decodePacketNumber(d.largest, d.truncated, d.len)
+		if pn != d.pn {
+			t.Fatalf("expect packet number 0x%x actual 0x%x", d.pn, pn)
+		}
+	}
+}

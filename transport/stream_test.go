@@ -269,12 +269,19 @@ func TestStreamClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("close stream: %v", err)
 	}
+	if s.send.isClosed() {
+		t.Fatalf("expect not closed: %+v", &s)
+	}
 	if !s.isFlushable() {
 		t.Fatalf("expect flushable: %+v", &s)
 	}
 	b, off, fin = s.popSend(20)
 	if len(b) != 0 || off != 6 || fin != true {
 		t.Fatalf("expect pop %q %v %v, actual %s %v %v", "", 6, true, b, off, fin)
+	}
+	s.ackSend(0, 6)
+	if !s.send.isClosed() {
+		t.Fatalf("expect send closed: %+v", &s)
 	}
 }
 

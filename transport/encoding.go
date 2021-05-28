@@ -137,7 +137,7 @@ func (s *codec) offset() int {
 	return s.i
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#integer-encoding
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-16
 func varintLen(v uint64) int {
 	if v>>14 == 0 {
 		if v>>6 == 0 {
@@ -266,4 +266,21 @@ func putPacketNumber(b []byte, v uint64, length int) {
 	default:
 		panic("unexpected packet number length")
 	}
+}
+
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-a.3
+func decodePacketNumber(largest, truncated uint64, length int) uint64 {
+	expected := largest + 1
+	win := uint64(1) << (uint(length) * 8)
+	hwin := win / 2
+	// The incoming packet number should be greater than (expected - hwin)
+	// and less than or equal to (expected + hwin)
+	candidate := (expected & ^(win - 1)) | truncated
+	if candidate+hwin <= expected {
+		return candidate + win
+	}
+	if candidate > expected+hwin && candidate > win {
+		return candidate - win
+	}
+	return candidate
 }

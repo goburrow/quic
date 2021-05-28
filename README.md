@@ -2,7 +2,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/goburrow/quic.svg)](https://pkg.go.dev/github.com/goburrow/quic)
 ![](https://github.com/goburrow/quic/workflows/Go/badge.svg)
 
-QUIC transport protocol (https://github.com/quicwg/base-drafts/) implementation in Go, inspired by Cloudflare Quiche.
+QUIC transport protocol (https://quicwg.org/) implementation in Go.
 The goal is to provide low level APIs for applications or protocols using QUIC as a transport. 
 
 TLS 1.3 support is based on standard Go TLS package (https://github.com/golang/go/tree/master/src/crypto/tls),
@@ -26,7 +26,7 @@ licensed under the 3-clause BSD license.
 - [ ] Connection migration
 - [ ] Path MTU discovery
 - [ ] Zero RTT
-- [ ] HTTP/3 - intentionally not implemented
+- [ ] HTTP/3
 
 ## Development
 
@@ -41,7 +41,7 @@ cd cmd/quiwi
 go build
 
 # To enable tracing
-go build -tags debug
+go build -tags quicdebug
 
 # Check heap allocations
 go build -gcflags '-m' 2>&1 | sort -V > debug.txt
@@ -52,7 +52,8 @@ GOOS=linux GOARCH=arm GOARM=6 CGO_ENABLED=0 go build
 
 ### APIs
 
-Package `transport` provides low-level APIs to control QUIC connections.
+Package [transport](https://pkg.go.dev/github.com/goburrow/quic@main/transport) provides
+low-level APIs to control QUIC connections.
 Applications write input data to the connection and read output data for sending to peer.
 
 ```go
@@ -82,7 +83,9 @@ for { // Loop until the connection is closed
 }
 ```
 
-The root package `quic` instead provides high-level APIs where QUIC data are transferred over UDP.
+The root package [quic](https://pkg.go.dev/github.com/goburrow/quic@main) instead provides
+high-level APIs where QUIC data are transferred over UDP.
+It also handles version negotiation, address validation and logging.
 
 ```go
 server := quic.NewServer(config)
@@ -101,7 +104,7 @@ client.Close()
 
 Applications get connection events in the handler to control QUIC connections:
 
-```
+```go
 func (handler) Serve(conn *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
@@ -202,7 +205,7 @@ Examples:
 
 ## Testing
 
-See interop/README.md
+See [interop/README.md](interop/README.md)
 
 ## Fuzzing
 

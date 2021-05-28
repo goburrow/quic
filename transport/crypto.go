@@ -16,22 +16,13 @@ const (
 	cryptoMaxData = 1 << 20
 )
 
-type cryptoLevel uint8
-
-const (
-	cryptoLevelInitial cryptoLevel = iota
-	cryptoLevelZeroRTT
-	cryptoLevelHandshake
-	cryptoLevelOneRTT
-)
-
-// version ff00001d
+// version 1
 var initialSalt = [...]byte{
-	0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97,
-	0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99,
+	0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+	0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#initial-secrets
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.2
 func newInitialSecrets(cid []byte) (client, server packetProtection) {
 	suite := tls13.CipherSuiteByID(tls.TLS_AES_128_GCM_SHA256)
 	initialSecret := suite.Extract(cid, initialSalt[:])
@@ -57,7 +48,7 @@ func quicTrafficKey(suite tls13.CipherSuite, secret []byte) (key, iv, hp []byte)
 	return
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#packet-protection
+// https://www.rfc-editor.org/rfc/rfc9001#section-5
 type packetProtection struct {
 	aead  cipher.AEAD
 	hp    headerProtection
@@ -75,7 +66,7 @@ func (s *packetProtection) init(suite tls13.CipherSuite, secret []byte) {
 	}
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#aead
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.3
 // Length of b and payload must include crypto overhead.
 func (s *packetProtection) encryptPayload(b []byte, packetNumber uint64, payloadLen int) []byte {
 	s.makeNonce(packetNumber)
@@ -109,7 +100,7 @@ func (s *packetProtection) makeNonce(packetNumber uint64) {
 }
 
 // pnOffset is where Packet Number starts.
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#header-protect
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.4
 //
 // Long Header:
 // +-+-+-+-+-+-+-+-+
@@ -183,7 +174,7 @@ const (
 	headerMaskLen   = maxPacketNumberLength + 1
 )
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-header-protection
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.4
 type headerProtection struct {
 	block cipher.Block // AES Cipher
 	key   [32]byte     // ChaCha20 key. For AES it is used as buffer to avoid allocating to heap
@@ -210,7 +201,7 @@ func (s *headerProtection) aesInit(key []byte) {
 	s.block = block
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-aes-based-header-protection
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.4.3
 // mask = AES-ECB(hp_key, sample)
 func (s *headerProtection) aesMask(sample, mask []byte) {
 	s.block.Encrypt(s.key[:headerSampleLen], sample)
@@ -221,7 +212,7 @@ func (s *headerProtection) chaCha20Init(key []byte) {
 	copy(s.key[:], key)
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-chacha20-based-header-prote
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.4.4
 // counter = sample[0..3]
 // nonce = sample[4..15]
 // mask = ChaCha20(hp_key, counter, nonce, {0,0,0,0,0})
@@ -239,13 +230,13 @@ func (s *headerProtection) chacha20Mask(sample, mask []byte) {
 const retryIntegrityTagLen = 16
 
 var retryIntegrityKey = [...]byte{
-	0xcc, 0xce, 0x18, 0x7e, 0xd0, 0x9a, 0x09, 0xd0,
-	0x57, 0x28, 0x15, 0x5a, 0x6c, 0xb9, 0x6b, 0xe1,
+	0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+	0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 }
 
 var retryIntegrityNonce = [...]byte{
-	0xe5, 0x49, 0x30, 0xf9, 0x7f, 0x21, 0x36, 0xf0,
-	0x53, 0x0a, 0x8c, 0x1c,
+	0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
+	0x23, 0x98, 0x25, 0xbb,
 }
 
 var retryIntegrityAEAD cipher.AEAD
@@ -267,7 +258,7 @@ func newRetryIntegrityAEAD() cipher.AEAD {
 }
 
 // computeRetryIntegrity append retry integrity tag to given pseudo retry packet.
-// https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry-packet-integrity
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.8
 func computeRetryIntegrity(pseudo []byte) ([]byte, error) {
 	aead := newRetryIntegrityAEAD()
 	if cap(pseudo)-len(pseudo) < aead.Overhead() {

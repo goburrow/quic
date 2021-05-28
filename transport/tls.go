@@ -31,7 +31,7 @@ const (
 )
 
 // Parameters is QUIC transport parameters.
-// See https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#transport-parameters
+// https://www.rfc-editor.org/rfc/rfc9000#section-7.4
 type Parameters struct {
 	// OriginalDestinationCID is the DCID from the first Initial packet.
 	OriginalDestinationCID []byte // Only sent by server
@@ -64,7 +64,7 @@ type Parameters struct {
 	DisableActiveMigration bool
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#transport-parameter-encoding
+// https://www.rfc-editor.org/rfc/rfc9000#section-18
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // |                  Transport Parameter 1 (*)                  ...
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+

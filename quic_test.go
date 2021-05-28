@@ -167,6 +167,7 @@ func newPipe(serverConfig, clientConfig *transport.Config) (*Server, *Client) {
 	}
 	cs, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
+		ss.Close()
 		panic(err)
 	}
 	if serverConfig == nil {

@@ -59,7 +59,7 @@ func newConfig() *transport.Config {
 	c.Params.InitialMaxStreamsUni = 8
 	c.TLS = &tls.Config{
 		NextProtos: []string{
-			fmt.Sprintf("hq-%d", c.Version&0xff),
+			"hq-interop",
 			"http/0.9",
 		},
 		ClientSessionCache: tls13.NewLRUClientSessionCache(10),

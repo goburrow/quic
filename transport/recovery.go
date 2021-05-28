@@ -8,27 +8,27 @@ import (
 
 const (
 	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
-	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#packet-threshold
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1.1
 	packetThreshold = 3
 
 	// Maximum reordering in time before time threshold loss detection considers a packet lost.
 	// Specified as an RTT multiplier.
-	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#time-threshold
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1.2
 	// NOTE: The value in spec is 9/8, but used as "x + x/8" here to avoid casting to float.
 	timeThreshold = 8
 
 	// Timer granularity.
-	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#time-threshold
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1.2
 	granularity = 1 * time.Millisecond
 
 	// When no previous RTT is available, the initial RTT should be set to 333ms,
 	// resulting in a 1 second initial timeout
-	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#pto-handshake
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.2
 	initialRTT = 333 * time.Millisecond
 
 	// Endpoints should use an initial congestion window of 10 times the maximum datagram size,
 	// limited to the larger of 14720 or twice the maximum datagram size
-	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#initial-cwnd
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-7.2
 	initialMaxDatagramSize  = 1472
 	initialCongestionWindow = 10 * initialMaxDatagramSize
 	// The minimum congestion window is the smallest value the congestion window can decrease
@@ -42,19 +42,19 @@ const (
 	// The period of time for persistent congestion to be established,
 	// specified as a PTO multiplier. The recommended value is 3, which is approximately
 	// equivalent to two TLPs before an RTO in TCP.
-	// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#persistent-congestion
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-7.6
 	persistentCongestionThreshold = 3
 
 	maxProbes = 2
 	// Prior to validating the client address, servers MUST NOT send more than three times
 	// as many bytes as the number of bytes they have received.
-	// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-address-validation-during-c
+	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.2.1
 	maxAmplificationFactor = 3
 	// maxUint64 indicates infinity
 	maxUint64 = ^uint64(0)
 )
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-sent-packet-fields
+// https://www.rfc-editor.org/rfc/rfc9002.html#name-sent-packet-fields
 type sentPacket struct {
 	packetNumber uint64    // The packet number of the sent packet.
 	frames       []frame   // The Frames included in the packet.
@@ -103,7 +103,7 @@ func (s *sentPacket) String() string {
 	return buf.String()
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html
+// https://www.rfc-editor.org/rfc/rfc9002.html
 type lossRecovery struct {
 	latestRTT   time.Duration // The most recent RTT measurement made when receiving an ack for a previously unacked packet.
 	smoothedRTT time.Duration // The exponentially-weighted moving average RTT of the connection.
@@ -146,7 +146,7 @@ type lossRecovery struct {
 	congestion congestionControl
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-initialization
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.4
 func (s *lossRecovery) init() {
 	for i := packetSpaceInitial; i < packetSpaceCount; i++ {
 		s.largestAckedPacket[i] = maxUint64
@@ -157,7 +157,7 @@ func (s *lossRecovery) init() {
 }
 
 // After a packet is sent, information about the packet is stored.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-sending-a-packet
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.5
 func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 	s.sent[space] = append(s.sent[space], p)
 	if p.packetNumber > s.largestSentPacket[space] {
@@ -173,7 +173,7 @@ func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 }
 
 // When an ACK frame is received, it may newly acknowledge any number of packets.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-receiving-an-acknowledgm
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.7
 func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, space packetSpace, now time.Time) {
 	largestAcked := ranges.largest()
 	if largestAcked > s.largestSentPacket[space] {
@@ -227,7 +227,7 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 	s.setLossDetectionTimer(now)
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-estimating-smoothed_rtt-and
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-5.3
 func (s *lossRecovery) updateRTT(latestRTT time.Duration, ackDelay time.Duration) {
 	s.latestRTT = latestRTT
 	if s.smoothedRTT == 0 {
@@ -271,7 +271,7 @@ func (s *lossRecovery) onPacketsAcked(packets []*sentPacket, space packetSpace) 
 	}
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.8
 func (s *lossRecovery) setLossDetectionTimer(now time.Time) {
 	lossTime, _ := s.earliestLossTime()
 	if !lossTime.IsZero() {
@@ -292,7 +292,7 @@ func (s *lossRecovery) setLossDetectionTimer(now time.Time) {
 }
 
 // onLossDetectionTimeout checks lossDetectionTimer to detect whether a packet was lost.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-timeout
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.9
 func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 	lossTime, space := s.earliestLossTime()
 	if !lossTime.IsZero() {
@@ -324,7 +324,7 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 }
 
 // detectLostPackets is called every time an ACK is received or the time threshold loss detection timer expires.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-detecting-lost-packets
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.10
 func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 	// loss_delay = max(kTimeThreshold * max(latest_rtt, smoothed_rtt), kGranularity)
 	lossDelay := s.roundTripTime()
@@ -392,7 +392,7 @@ func (s *lossRecovery) markResendAckElicitingPackets(space packetSpace, probes i
 
 // When Initial or Handshake keys are discarded, packets from the space are discarded
 // and loss detection state is updated.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-upon-dropping-initial-or-ha
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.11
 func (s *lossRecovery) onPacketNumberSpaceDiscarded(space packetSpace, now time.Time) {
 	// Remove any unacknowledged packets from flight.
 	var unackedBytes uint64
@@ -428,7 +428,7 @@ func (s *lossRecovery) roundTripTime() time.Duration {
 //
 //   PTO = smoothed_rtt + max(4*rttvar, kGranularity) + max_ack_delay
 //
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-computing-pto
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.1
 func (s *lossRecovery) probeTimeout() time.Duration {
 	pto := s.roundTripTime() + s.maxAckDelay
 	if s.rttVariance*4 > granularity {
@@ -440,7 +440,7 @@ func (s *lossRecovery) probeTimeout() time.Duration {
 }
 
 // earliestLossTime returns the earliest loss time.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.8
 func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 	space := packetSpaceInitial
 	lossTime := s.lossTime[space]
@@ -455,7 +455,7 @@ func (s *lossRecovery) earliestLossTime() (time.Time, packetSpace) {
 }
 
 // earliestProbeTime returns the earliest PTO timeout.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-setting-the-loss-detection-
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-a.8
 func (s *lossRecovery) earliestProbeTime(now time.Time) (time.Time, packetSpace) {
 	// duration = (smoothed_rtt + max(4 * rttvar, kGranularity)) * (2 ^ pto_count)
 	duration := s.probeTimeout() * (1 << s.ptoCount)
@@ -502,7 +502,7 @@ func (s *lossRecovery) inPersistentCongestion(largestLostPacket *sentPacket) boo
 }
 
 // onPacketsLost is invoked when detectAndRemoveLostPackets deems packets lost.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-packets-lost
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.8
 func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, now time.Time) {
 	s.lostCount += uint64(len(packets))
 	for _, p := range packets {
@@ -588,7 +588,7 @@ func (s *lossRecovery) canSend() uint64 {
 	return s.congestion.canSend()
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-variables-of-interest-2
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.2
 type congestionControl struct {
 	// bytesInFlight is the sum of the size in bytes of all sent packets that contain at least
 	// one ack-eliciting or PADDING frame, and have not been acked or declared lost.
@@ -618,7 +618,7 @@ func (s *congestionControl) onPacketSent(sentBytes uint64) {
 
 // onPacketsAcked is invoked from loss detection's onAckReceived and
 // is supplied with the newly acked_packets from sent_packets.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-packet-acknowledgement
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.5
 func (s *congestionControl) onPacketAcked(sentBytes uint64, sentTime time.Time) {
 	if s.bytesInFlight < sentBytes {
 		s.bytesInFlight = 0
@@ -647,7 +647,7 @@ func (s *congestionControl) onPacketLost(sentBytes uint64) {
 
 // onNewCongestionEvent is invoked from ProcessECN and OnPacketsLost when a new congestion event is detected.
 // May start a new recovery period and reduces the congestion window.
-// https://quicwg.org/base-drafts/draft-ietf-quic-recovery.html#name-on-new-congestion-event
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.6
 func (s *congestionControl) onNewCongestionEvent(sentTime, now time.Time) {
 	// Start a new congestion event if packet was sent after the
 	// start of the previous congestion recovery period.

@@ -24,7 +24,7 @@ docker pull martenseemann/quic-interop-iperf-endpoint
 # Build image
 ./build-docker.sh
 # or with debug
-./build-docker.sh -tags debug
+./build-docker.sh -tags quicdebug
 ```
 
 ```
@@ -59,4 +59,4 @@ flask run -h 0.0.0.0
 
 ## QVis
 
-https://qvis.edm.uhasselt.be/
+https://qvis.quictools.info/

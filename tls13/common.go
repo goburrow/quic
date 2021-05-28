@@ -83,7 +83,7 @@ const (
 	extensionSignatureAlgorithmsCert uint16 = 50
 	extensionKeyShare                uint16 = 51
 	extensionRenegotiationInfo       uint16 = 0xff01
-	extensionQUICTransportParams     uint16 = 0xffa5
+	extensionQUICTransportParams     uint16 = 0x39
 )
 
 // TLS signaling cipher suite values

@@ -108,7 +108,7 @@ func (s *Server) recv(p *packet) {
 			freePacket(p)
 			return
 		}
-		if !transport.VersionSupported(p.header.Version) {
+		if !transport.IsVersionSupported(p.header.Version) {
 			// Negotiate version
 			s.negotiate(p.addr, &p.header)
 			freePacket(p)
@@ -147,6 +147,7 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 		return
 	}
 	token := s.addrValid.GenerateToken(addr, h.DCID)
+	// Header => Retry: DCID => ODCID, SCID => DCID, newCID => SCID
 	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
 	if err != nil {
 		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
@@ -170,7 +171,7 @@ func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
 // this method (instead of s.handleConn) is invoked in a new goroutine so that
 // server can continue process other packets.
 func (s *Server) handleNewConn(p *packet) {
-	var odcid []byte
+	var scid, odcid []byte
 	if s.addrValid != nil {
 		// Retry token
 		if len(p.header.Token) == 0 {
@@ -184,8 +185,10 @@ func (s *Server) handleNewConn(p *packet) {
 			freePacket(p)
 			return
 		}
+		// Reuse the SCID sent in Retry
+		scid = p.header.DCID
 	}
-	c, err := s.newConn(p.addr, odcid)
+	c, err := s.newConn(p.addr, scid, odcid)
 	if err != nil {
 		s.logger.log(levelError, "packet_dropped addr=%s %s trigger=create_connection_failed message=%v", p.addr, &p.header, err)
 		freePacket(p)
@@ -225,12 +228,14 @@ func (s *Server) handleNewConn(p *packet) {
 	s.handleConn(c)
 }
 
-func (s *Server) newConn(addr net.Addr, odcid []byte) (*Conn, error) {
+func (s *Server) newConn(addr net.Addr, scid, odcid []byte) (*Conn, error) {
 	// Generate id for new connection since short packets don't include CID length so
-	// we use MaxCIDLength for all connections
-	scid := make([]byte, cidLength)
-	if err := s.rand(scid); err != nil {
-		return nil, err
+	// we use a fixed length for all connections
+	if len(scid) != cidLength {
+		scid = make([]byte, cidLength)
+		if err := s.rand(scid); err != nil {
+			return nil, err
+		}
 	}
 	conn, err := transport.Accept(scid, odcid, s.config)
 	if err != nil {
@@ -263,7 +268,7 @@ func (s *Server) Close() error {
 }
 
 // AddressValidator generates and validates server retry token.
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#token-integrity
+// https://www.rfc-editor.org/rfc/rfc9000.html#token-integrity
 type AddressValidator interface {
 	// GenerateToken creates a new token from given addr and odcid.
 	GenerateToken(addr net.Addr, odcid []byte) []byte

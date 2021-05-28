@@ -6,7 +6,7 @@ import (
 	"strconv"
 )
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#error-codes
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-20
 const (
 	NoError                 uint64 = 0x0
 	InternalError           uint64 = 0x1

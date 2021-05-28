@@ -43,6 +43,43 @@ func TestFrameCrypto(t *testing.T) {
 	testFrame(t, f, "060103010203")
 }
 
+func TestFramePadding(t *testing.T) {
+	f := newPaddingFrame(1)
+	testFrame(t, f, "00")
+	f = newPaddingFrame(5)
+	testFrame(t, f, "0000000000")
+
+	n, err := f.decode(nil)
+	if n != 1 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 1, nil, n, err)
+	}
+	n, err = f.decode([]byte{0x80, 0, 0, 0})
+	if n != 4 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 4, nil, n, err)
+	}
+	n, err = f.decode([]byte{0x40, 0, 0})
+	if n != 3 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 3, nil, n, err)
+	}
+	if int(*f) != 3 {
+		t.Fatalf("expect padding length: %v, actual: %v", 3, f)
+	}
+}
+
+func TestFramePing(t *testing.T) {
+	f := &pingFrame{}
+	testFrame(t, f, "01")
+
+	n, err := f.decode(nil)
+	if n != 1 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 1, nil, n, err)
+	}
+	n, err = f.decode([]byte{0x40, 1})
+	if n != 2 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 2, nil, n, err)
+	}
+}
+
 func TestFrameAck(t *testing.T) {
 	f := &ackFrame{
 		largestAck:    0x1234,
@@ -305,6 +342,15 @@ func TestFramePathResponse(t *testing.T) {
 func TestFrameHandshakeDone(t *testing.T) {
 	f := &handshakeDoneFrame{}
 	testFrame(t, f, "1e")
+
+	n, err := f.decode(nil)
+	if n != 1 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 1, nil, n, err)
+	}
+	n, err = f.decode([]byte{0xc0, 0, 0, 0, 0, 0, 0, 0x1e})
+	if n != 8 || err != nil {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 2, nil, n, err)
+	}
 }
 
 func TestFrameDatagram(t *testing.T) {
@@ -332,7 +378,7 @@ func TestFuzzFrame(t *testing.T) {
 		}
 	}()
 	frames := []frame{
-		newPaddingFrame(0),
+		newPaddingFrame(1),
 		&pingFrame{},
 		&ackFrame{},
 		&resetStreamFrame{},

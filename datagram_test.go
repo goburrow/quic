@@ -145,6 +145,33 @@ func TestDatagramReadTimeout(t *testing.T) {
 	}
 }
 
+func TestDatagramReadBlock(t *testing.T) {
+	conn := newRemoteConn(nil, nil, nil, true)
+	defer close(conn.cmdCh)
+	dg := newDatagram(conn)
+	data := make([]byte, 10)
+
+	go func() {
+		c := <-conn.cmdCh
+		if c.cmd != cmdDatagramRead {
+			t.Errorf("unexpected command: %+v", c)
+		}
+		dg.sendReadResult(errWait)
+		time.Sleep(10 * time.Millisecond)
+		reading := dg.isReading()
+		if !reading {
+			t.Errorf("expect reading: %v, actual: %v", true, reading)
+		}
+		dg.recvReadData(bytes.NewReader([]byte("datagram")))
+		dg.sendReadResult(nil)
+	}()
+
+	n, err := dg.Read(data)
+	if err != nil || string(data[:n]) != "datagram" {
+		t.Fatalf("expect read error: %v %v (%s), actual: %v %v (%s)", len(data), io.EOF, "datagram", n, err, data[:n])
+	}
+}
+
 func TestDatagram(t *testing.T) {
 	sc := newServerConfig()
 	sc.Params.MaxDatagramPayloadSize = 100

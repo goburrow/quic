@@ -96,7 +96,7 @@ func packetNumberLenHeaderFlag(n int) uint8 {
 }
 
 // packetHeader is the version-independent header of QUIC packets.
-// https://quicwg.org/base-drafts/draft-ietf-quic-invariants.html#name-quic-packet-headers
+// https://www.rfc-editor.org/rfc/rfc8999.html#section-5
 //
 // Long header:
 //
@@ -408,7 +408,8 @@ func (s *Header) String() string {
 		s.Type, s.Version, s.DCID, s.SCID, s.Token)
 }
 
-// Version Negotiation Packet: https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#packet-version
+// Version Negotiation Packet:
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.1
 //
 // +-+-+-+-+-+-+-+-+
 // |1|  Unused (7) |
@@ -481,7 +482,8 @@ func NegotiateVersion(b, dcid, scid []byte) (int, error) {
 	return p.encode(b)
 }
 
-// Initial Packet: https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#packet-initial
+// Initial Packet:
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.2
 //
 // +-+-+-+-+-+-+-+-+
 // |1|1| 0 |R R|P P|
@@ -627,7 +629,8 @@ func (s *packet) decodeLong(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
-// Retry Packet: https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#packet-retry
+// Retry Packet:
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.5
 //
 // +-+-+-+-+-+-+-+-+
 // |1|1| 3 | Unused|
@@ -676,7 +679,8 @@ func (s *packet) decodeRetry(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
-// Retry Pseudo-Packet: https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#name-retry-packet-integrity
+// Retry Pseudo-Packet:
+// https://www.rfc-editor.org/rfc/rfc9001#section-5.8
 //
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 // | ODCID Len (8) |
@@ -735,7 +739,7 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 	return n, nil
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#short-header
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3
 // +-+-+-+-+-+-+-+-+
 // |0|1|S|R|R|K|P P|
 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -818,13 +822,14 @@ type packetNumberSpace struct {
 	recvPacketNeedAck rangeSet
 	// recvPacketNumbers tracks packet numbers received.
 	recvPacketNumbers packetNumberWindow
-	// ackElicited indicates received packets need to be acknowledged.
-	ackElicited bool
 
 	opener packetProtection
 	sealer packetProtection
 
 	cryptoStream Stream
+
+	// ackElicited indicates received packets need to be acknowledged.
+	ackElicited bool
 }
 
 func (s *packetNumberSpace) init() {
@@ -903,21 +908,4 @@ func (s *packetNumberSpace) onPacketReceived(pn uint64, now time.Time) {
 
 func (s *packetNumberSpace) ready() bool {
 	return s.ackElicited || s.cryptoStream.isFlushable()
-}
-
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#sample-packet-number-decoding
-func decodePacketNumber(largest, truncated uint64, length int) uint64 {
-	expected := largest + 1
-	win := uint64(1) << (uint(length) * 8)
-	hwin := win / 2
-	// The incoming packet number should be greater than (expected - hwin)
-	// and less than or equal to (expected + hwin)
-	candidate := (expected & ^(win - 1)) | truncated
-	if candidate+hwin <= expected {
-		return candidate + win
-	}
-	if candidate > expected+hwin && candidate > win {
-		return candidate - win
-	}
-	return candidate
 }

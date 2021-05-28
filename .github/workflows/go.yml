@@ -22,5 +22,5 @@ jobs:
 
     - name: Build
       run: |
-        go test -v -bench . ./...
+        go test -v -race -bench . ./...
         cd cmd/quiwi && go build -v

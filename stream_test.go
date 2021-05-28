@@ -207,8 +207,12 @@ func TestStreamWriteBlock(t *testing.T) {
 		st.sendWriteResult(errWait)
 		time.Sleep(10 * time.Millisecond)
 
+		writing := st.isWriting()
+		if !writing {
+			t.Errorf("expected writing: %v, actual: %v", true, writing)
+		}
 		st.recvWriteData(ioutil.Discard)
-		st.sendWriteWait(nil)
+		st.sendWriteResult(nil)
 	}()
 
 	n, err := st.Write([]byte(data))
@@ -255,6 +259,7 @@ func TestStreamReadTimeout(t *testing.T) {
 	defer close(conn.cmdCh)
 	st := newStream(conn, 1)
 	done := make(chan struct{})
+	data := make([]byte, 10)
 
 	go func() {
 		c := <-conn.cmdCh
@@ -266,7 +271,7 @@ func TestStreamReadTimeout(t *testing.T) {
 	}()
 
 	st.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-	n, err := st.Read([]byte("read"))
+	n, err := st.Read(data)
 	if n != 0 || err != errDeadlineExceeded {
 		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
 	}
@@ -297,13 +302,17 @@ func TestStreamReadBlock(t *testing.T) {
 		st.sendReadResult(errWait)
 		time.Sleep(10 * time.Millisecond)
 
+		reading := st.isReading()
+		if !reading {
+			t.Errorf("expect reading: %v, actual: %v", true, reading)
+		}
 		st.recvReadData(bytes.NewReader([]byte("read")))
-		st.sendReadWait(io.EOF)
+		st.sendReadResult(io.EOF)
 	}()
 
 	n, err := st.Read(data)
-	if n != 4 || err != io.EOF {
-		t.Fatalf("expect read: %v %v, actual: %v %v", 4, io.EOF, n, err)
+	if err != io.EOF || string(data[:n]) != "read" {
+		t.Fatalf("expect read: %v %v (%s), actual: %v %v (%s)", 4, io.EOF, "data", n, err, data[:n])
 	}
 }
 
@@ -358,6 +367,7 @@ func TestStream(t *testing.T) {
 	go c.Serve()
 
 	recvFn := func(st *Stream) {
+		st.SetDeadline(time.Now().Add(2 * time.Second))
 		n, err := io.Copy(st, st)
 		if n == 0 || err != nil {
 			t.Errorf("server stream copy: %v %v", n, err)
@@ -371,7 +381,7 @@ func TestStream(t *testing.T) {
 		}
 	}
 
-	sendData := make([]byte, 10240)
+	sendData := make([]byte, 10000)
 	for i := range sendData {
 		sendData[i] = uint8(i)
 	}
@@ -379,6 +389,7 @@ func TestStream(t *testing.T) {
 	done := make(chan struct{})
 
 	sendFn := func(st *Stream) {
+		st.SetDeadline(time.Now().Add(2 * time.Second))
 		n, err := st.Write(sendData)
 		if n != len(sendData) || err != nil {
 			t.Errorf("client stream write: %v %v", n, err)
@@ -398,6 +409,7 @@ func TestStream(t *testing.T) {
 	}
 
 	serverHandler := func(conn *Conn, events []transport.Event) {
+		t.Logf("server events: cid=%x %v", conn.scid, events)
 		for _, e := range events {
 			switch e.Type {
 			case transport.EventStreamOpen:
@@ -412,6 +424,7 @@ func TestStream(t *testing.T) {
 		}
 	}
 	clientHandler := func(conn *Conn, events []transport.Event) {
+		t.Logf("client events: cid=%x %v", conn.scid, events)
 		for _, e := range events {
 			switch e.Type {
 			case transport.EventConnOpen:

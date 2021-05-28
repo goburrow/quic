@@ -91,13 +91,14 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 	case s.conn.cmdCh <- cmd:
 		// Wait for result
 		err = <-s.wrData.resultCh
-		if err == errWait {
+		for err == errWait {
 			select {
 			case <-s.closeCh:
 				err = errClosed
 			case <-s.wrData.deadlineCh:
 				err = errDeadlineExceeded
-			case err = <-s.wrData.waitCh:
+			case <-s.wrData.waitCh:
+				err = <-s.wrData.resultCh
 			}
 		}
 	}
@@ -132,20 +133,21 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 	case s.conn.cmdCh <- cmd:
 		// Wait for result
 		err = <-s.rdData.resultCh
-		if err == errWait {
+		for err == errWait {
 			select {
 			case <-s.closeCh:
 				err = errClosed
 			case <-s.rdData.deadlineCh:
 				err = errDeadlineExceeded
-			case err = <-s.rdData.waitCh:
+			case <-s.rdData.waitCh:
+				err = <-s.rdData.resultCh
 			}
 		}
 	}
 	return
 }
 
-// Close closes the stream.
+// Close closes the sending part of the stream.
 func (s *Stream) Close() error {
 	return s.close(cmdStreamClose, 0)
 }
@@ -222,7 +224,7 @@ func (s *Stream) recvWriteData(w io.Writer) (bool, error) {
 }
 
 func (s *Stream) isWriting() bool {
-	return s.wrData.hasBuf()
+	return s.wrData.checkWaiting()
 }
 
 // recvReadData is called from Conn goroutine.
@@ -231,7 +233,7 @@ func (s *Stream) recvReadData(r io.Reader) (bool, error) {
 }
 
 func (s *Stream) isReading() bool {
-	return s.rdData.hasBuf()
+	return s.rdData.checkWaiting()
 }
 
 // sendWriteResult is called from Conn goroutine.
@@ -239,17 +241,9 @@ func (s *Stream) sendWriteResult(err error) {
 	s.wrData.sendResult(err)
 }
 
-func (s *Stream) sendWriteWait(err error) {
-	s.wrData.sendWaitResult(err)
-}
-
 // sendReadResult is called from Conn goroutine.
 func (s *Stream) sendReadResult(err error) {
 	s.rdData.sendResult(err)
-}
-
-func (s *Stream) sendReadWait(err error) {
-	s.rdData.sendWaitResult(err)
 }
 
 // sendCloseResult is called from Conn goroutine.
@@ -263,12 +257,11 @@ func (s *Stream) setClosed() {
 }
 
 type dataBuffer struct {
-	mu  sync.Mutex
 	buf []byte
 	off int
 
-	resultCh chan error // blocking channel
-	waitCh   chan error // non-blocking channel
+	resultCh chan error    // blocking channel
+	waitCh   chan struct{} // non-blocking channel
 
 	deadlineTm *time.Timer
 	deadlineCh chan struct{}
@@ -276,7 +269,7 @@ type dataBuffer struct {
 
 func (s *dataBuffer) init() {
 	s.resultCh = make(chan error)
-	s.waitCh = make(chan error)
+	s.waitCh = make(chan struct{})
 	s.deadlineCh = make(chan struct{})
 }
 
@@ -284,26 +277,20 @@ func (s *dataBuffer) sendResult(err error) {
 	s.resultCh <- err
 }
 
-func (s *dataBuffer) sendWaitResult(err error) {
+func (s *dataBuffer) checkWaiting() bool {
 	select {
-	case s.waitCh <- err:
+	case s.waitCh <- struct{}{}:
+		return true
 	default:
+		return false
 	}
 }
 
 func (s *dataBuffer) setBuf(b []byte) int {
-	s.mu.Lock()
 	s.buf = b
 	n := s.off
 	s.off = 0
-	s.mu.Unlock()
 	return n
-}
-
-func (s *dataBuffer) hasBuf() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf != nil && s.off < len(s.buf)
 }
 
 func (s *dataBuffer) setDeadline(t time.Time) {
@@ -344,9 +331,6 @@ func (s *dataBuffer) setDeadline(t time.Time) {
 
 // writeTo returns true when all data in buf has been written.
 func (s *dataBuffer) writeTo(w io.Writer) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	n, err := w.Write(s.buf[s.off:])
 	s.off += n
 	return s.off >= len(s.buf), err
@@ -354,9 +338,6 @@ func (s *dataBuffer) writeTo(w io.Writer) (bool, error) {
 
 // readFrom returns true when there is any data has been read.
 func (s *dataBuffer) readFrom(r io.Reader) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	n, err := r.Read(s.buf[s.off:])
 	s.off += n
 	return s.off > 0, err

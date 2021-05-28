@@ -1,0 +1,13 @@
+diff --git a/transport/recovery.go b/transport/recovery.go
+index cd3e42e..c12c400 100644
+--- a/transport/recovery.go
++++ b/transport/recovery.go
+@@ -24,7 +24,7 @@ const (
+ 	// When no previous RTT is available, the initial RTT should be set to 333ms,
+ 	// resulting in a 1 second initial timeout
+ 	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.2
+-	initialRTT = 333 * time.Millisecond
++	initialRTT = 100 * time.Millisecond
+ 
+ 	// Endpoints should use an initial congestion window of 10 times the maximum datagram size,
+ 	// limited to the larger of 14720 or twice the maximum datagram size

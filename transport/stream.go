@@ -21,7 +21,7 @@ const (
 )
 
 // Stream is a data stream.
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-streams
+// https://www.rfc-editor.org/rfc/rfc9000#section-2
 type Stream struct {
 	recv recvStream
 	send sendStream
@@ -227,6 +227,11 @@ func (s *Stream) Close() error {
 	return nil
 }
 
+// String returns state of the stream.
+func (s *Stream) String() string {
+	return fmt.Sprintf("recv(%s) send(%s)", &s.recv, &s.send)
+}
+
 // recvStream is buffer for receiving data.
 type recvStream struct {
 	buf rangeBufferList // Chunks of received data, ordered by offset
@@ -417,7 +422,7 @@ func (s *sendStream) ack(offset, length uint64) {
 
 // complete returns true if all data in the stream has been sent and acknowledged.
 func (s *sendStream) complete() bool {
-	return s.fin && s.offset >= s.length && s.acked.equals(0, s.length)
+	return s.fin && s.finSent && s.offset >= s.length && s.acked.equals(0, s.length)
 }
 
 // stop indicates peer no longer reads the data that this stream sends.
@@ -527,7 +532,7 @@ func (s *streamMap) get(id uint64) *Stream {
 // create adds and returns new stream or error if it exceeds limits.
 // Only streams with a stream ID less than (max_stream * 4 + initial_stream_id_for_type)
 // can be opened.
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#name-controlling-concurrency
+// https://www.rfc-editor.org/rfc/rfc9000#section-4.6
 func (s *streamMap) create(id uint64, isClient bool) (*Stream, error) {
 	local := isStreamLocal(id, isClient)
 	bidi := isStreamBidi(id)
@@ -637,7 +642,7 @@ func (s *streamMap) checkClosed(fn func(streamId uint64)) {
 	}
 }
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#stream-id
+// https://www.rfc-editor.org/rfc/rfc9000#section-2.1
 // Bits | Stream           | Type
 // 0b00 | Client-Initiated | Bidirectional
 // 0b01 | Server-Initiated | Bidirectional

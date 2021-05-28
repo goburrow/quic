@@ -2,7 +2,7 @@ package transport
 
 import "fmt"
 
-// https://quicwg.org/base-drafts/draft-ietf-quic-transport.html#flow-control
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-4
 type flowControl struct {
 	totalRecv   uint64 // Total bytes received from peer - updated when data is received.
 	maxRecv     uint64 // Receiving limits - updated when MAX_DATA is sent.

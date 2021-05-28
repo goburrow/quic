@@ -29,6 +29,7 @@ package quic
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -40,7 +41,7 @@ import (
 
 const (
 	maxDatagramSize = transport.MaxIPv6PacketSize
-	cidLength       = transport.MaxCIDLength
+	cidLength       = 16 // or use transport.MaxCIDLength
 	bufferSize      = 1500
 )
 
@@ -76,6 +77,12 @@ type Handler interface {
 type noopHandler struct{}
 
 func (s noopHandler) Serve(*Conn, []transport.Event) {}
+
+// ConnectionState records details about the connection.
+type ConnectionState struct {
+	TLS tls.ConnectionState
+	// TODO: More info
+}
 
 // Conn is a QUIC connection presenting a peer connected to this client or server.
 // Conn is not safe for concurrent use.
@@ -119,6 +126,13 @@ func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn, isClient bo
 		c.nextStreamIDUni++
 	}
 	return c
+}
+
+// ConnectionState returns details about the connection.
+func (s *Conn) ConnectionState() ConnectionState {
+	return ConnectionState{
+		TLS: s.conn.HandshakeState(),
+	}
 }
 
 // StreamWrite adds data to the stream buffer for sending.
@@ -434,18 +448,21 @@ func (s *Conn) cmdDatagramRead() {
 // If any error occurs or all data consumed, it sends result to the Stream caller.
 func (s *Conn) eventStreamWritable(streamID uint64) {
 	ss := s.streams[streamID]
-	if ss == nil || !ss.isWriting() {
+	if ss == nil {
 		return
 	}
-	st, err := s.conn.Stream(streamID)
-	if err != nil {
-		ss.sendWriteWait(err)
-		return
-	}
-	done, err := ss.recvWriteData(st)
-	if done || err != nil {
-		ss.sendWriteWait(err)
-		return
+	if ss.isWriting() {
+		st, err := s.conn.Stream(streamID)
+		if err != nil {
+			ss.sendWriteResult(err)
+			return
+		}
+		done, err := ss.recvWriteData(st)
+		if done || err != nil {
+			ss.sendWriteResult(err)
+			return
+		}
+		ss.sendWriteResult(errWait)
 	}
 }
 
@@ -453,18 +470,21 @@ func (s *Conn) eventStreamWritable(streamID uint64) {
 // It reads stream data and sends result to the Stream caller that is waiting for read result.
 func (s *Conn) eventStreamReadable(streamID uint64) {
 	ss := s.streams[streamID]
-	if ss == nil || !ss.isReading() {
+	if ss == nil {
 		return
 	}
-	st, err := s.conn.Stream(streamID)
-	if err != nil {
-		ss.sendReadWait(err)
-		return
-	}
-	done, err := ss.recvReadData(st)
-	if done || err != nil {
-		ss.sendReadWait(err)
-		return
+	if ss.isReading() {
+		st, err := s.conn.Stream(streamID)
+		if err != nil {
+			ss.sendReadResult(err)
+			return
+		}
+		done, err := ss.recvReadData(st)
+		if done || err != nil {
+			ss.sendReadResult(err)
+			return
+		}
+		ss.sendReadResult(errWait)
 	}
 }
 
@@ -479,13 +499,16 @@ func (s *Conn) eventStreamClosed(streamID uint64) {
 // eventDatagramReadable handles connection event EventDatagramReadable.
 // It reads data and sends result to the Datagram caller that is waiting for read result.
 func (s *Conn) eventDatagramReadable() {
-	if s.datagram == nil || !s.datagram.isReading() {
+	if s.datagram == nil {
 		return
 	}
-	done, err := s.datagram.recvReadData(s.conn.Datagram())
-	if done || err != nil {
-		s.datagram.sendReadWait(err)
-		return
+	if s.datagram.isReading() {
+		done, err := s.datagram.recvReadData(s.conn.Datagram())
+		if done || err != nil {
+			s.datagram.sendReadResult(err)
+			return
+		}
+		s.datagram.sendReadResult(errWait)
 	}
 }
 
@@ -607,7 +630,7 @@ func (s *localConn) pollConnDelay(c *Conn) {
 	// TODO: check whether we only need to send back ACK, then we can delay it.
 	timer := time.NewTimer(2 * time.Millisecond) // FIXME: timer granularity
 	defer timer.Stop()
-	for i := 16; i > 0; i-- {
+	for i := 8; i > 0; i-- {
 		select {
 		case <-timer.C:
 			return
