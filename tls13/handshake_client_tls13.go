@@ -11,7 +11,6 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"hash"
 	"time"
 )
@@ -121,7 +120,8 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		}
 	}
 	if hs.state != clientStateFinished {
-		return fmt.Errorf("tls: unexpected handshake state: %v", hs.state)
+		c.sendAlert(alertInternalError)
+		return errors.New("tls: expect handshake state finished")
 	}
 
 	c.handshakeStatus = 1
@@ -149,7 +149,7 @@ func (hs *clientHandshakeStateTLS13) readServerHello() error {
 		// If we are negotiating a protocol version that's lower than what we
 		// support, check for the server downgrade canaries.
 		// See RFC 8446, Section 4.1.3.
-		maxVers := maxSupportedVersion()
+		maxVers := configMaxSupportedVersion(c.config)
 		tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
 		tls11Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS11
 		if maxVers == tls.VersionTLS13 && c.vers <= tls.VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
@@ -159,6 +159,7 @@ func (hs *clientHandshakeStateTLS13) readServerHello() error {
 		}
 
 		if c.vers != tls.VersionTLS13 {
+			c.sendAlert(alertProtocolVersion)
 			return errors.New("tls: unsupported versions")
 		}
 	}
@@ -396,13 +397,13 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 
 	clientSecret := hs.suite.deriveSecret(handshakeSecret,
 		clientHandshakeTrafficLabel, hs.transcript)
-	if err := c.setOutSecret(EncryptionLevelHandshake, clientSecret); err != nil {
+	if err := c.setOutTrafficSecret(EncryptionLevelHandshake, clientSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
 	serverSecret := hs.suite.deriveSecret(handshakeSecret,
 		serverHandshakeTrafficLabel, hs.transcript)
-	if err := c.setInSecret(EncryptionLevelHandshake, serverSecret); err != nil {
+	if err := c.setInTrafficSecret(EncryptionLevelHandshake, serverSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
@@ -440,17 +441,11 @@ func (hs *clientHandshakeStateTLS13) readServerParameters() error {
 	}
 	hs.transcript.Write(encryptedExtensions.marshal())
 
-	if encryptedExtensions.alpnProtocol != "" {
-		if len(hs.hello.alpnProtocols) == 0 {
-			c.sendAlert(alertUnsupportedExtension)
-			return errors.New("tls: server advertised unrequested ALPN extension")
-		}
-		if mutualProtocol([]string{encryptedExtensions.alpnProtocol}, hs.hello.alpnProtocols) == "" {
-			c.sendAlert(alertUnsupportedExtension)
-			return errors.New("tls: server selected unadvertised ALPN protocol")
-		}
-		c.clientProtocol = encryptedExtensions.alpnProtocol
+	if err := checkALPN(hs.hello.alpnProtocols, encryptedExtensions.alpnProtocol); err != nil {
+		c.sendAlert(alertUnsupportedExtension)
+		return err
 	}
+	c.clientProtocol = encryptedExtensions.alpnProtocol
 
 	c.peerTransportParams = encryptedExtensions.quicTransportParams
 	hs.state = clientStateReadServerCert
@@ -586,7 +581,7 @@ func (hs *clientHandshakeStateTLS13) readServerFinished() error {
 		clientApplicationTrafficLabel, hs.transcript)
 	serverSecret := hs.suite.deriveSecret(hs.masterSecret,
 		serverApplicationTrafficLabel, hs.transcript)
-	if err = c.setInSecret(EncryptionLevelApplication, serverSecret); err != nil {
+	if err = c.setInTrafficSecret(EncryptionLevelApplication, serverSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
@@ -688,7 +683,7 @@ func (hs *clientHandshakeStateTLS13) sendClientFinished() error {
 		return err
 	}
 
-	if err := c.setOutSecret(EncryptionLevelApplication, hs.trafficSecret); err != nil {
+	if err := c.setOutTrafficSecret(EncryptionLevelApplication, hs.trafficSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}

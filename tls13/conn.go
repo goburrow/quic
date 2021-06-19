@@ -87,6 +87,11 @@ type halfConn struct {
 	trafficSecret []byte // current TLS 1.3 traffic secret
 }
 
+func (hc *halfConn) setTrafficSecret(level EncryptionLevel, secret []byte) {
+	hc.encryptionLevel = level
+	hc.trafficSecret = secret
+}
+
 func (c *Conn) readRecord(level EncryptionLevel, n int) error {
 	c.growReadBufCapacity(n)
 	for len(c.rawInput) < n {
@@ -195,6 +200,7 @@ func (c *Conn) readHandshake() (interface{}, error) {
 // handshake is complete. Up to TLS 1.2, it indicates the start of a renegotiation.
 func (c *Conn) handlePostHandshakeMessage() error {
 	if c.vers != tls.VersionTLS13 {
+		c.sendAlert(alertProtocolVersion)
 		return fmt.Errorf("tls: unsupported version %v", c.vers)
 	}
 
@@ -215,59 +221,37 @@ func (c *Conn) handlePostHandshakeMessage() error {
 	switch msg := msg.(type) {
 	case *newSessionTicketMsgTLS13:
 		return c.handleNewSessionTicket(msg)
-	case *keyUpdateMsg:
-		return c.handleKeyUpdate(msg)
+	// QUIC does not use TLS Key Update
 	default:
 		c.sendAlert(alertUnexpectedMessage)
 		return fmt.Errorf("tls: received unexpected handshake message of type %T", msg)
 	}
 }
 
-func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
-	cipherSuite := cipherSuiteTLS13ByID(c.cipherSuite)
-	if cipherSuite == nil {
-		c.sendAlert(alertInternalError)
-		return errors.New("tls: unsupported cipher suite")
-	}
-
-	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
-	c.setInSecret(c.in.encryptionLevel, newSecret)
-
-	if keyUpdate.updateRequested {
-		msg := &keyUpdateMsg{}
-		_, err := c.writeRecord(recordTypeHandshake, msg.marshal())
-		if err != nil {
-			// Surface the error at the next write.
-			return err
-		}
-
-		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
-		c.setOutSecret(c.out.encryptionLevel, newSecret)
-	}
-
-	return nil
-}
-
-func (c *Conn) setInSecret(level EncryptionLevel, inSecret []byte) error {
+func (c *Conn) setInTrafficSecret(level EncryptionLevel, inSecret []byte) error {
 	if err := c.conn.SetReadSecret(level, inSecret); err != nil {
 		return err
 	}
-	c.in.trafficSecret = inSecret
-	c.in.encryptionLevel = level
+	c.in.setTrafficSecret(level, inSecret)
 	return nil
 }
 
-func (c *Conn) setOutSecret(level EncryptionLevel, outSecret []byte) error {
+func (c *Conn) setOutTrafficSecret(level EncryptionLevel, outSecret []byte) error {
 	if err := c.conn.SetWriteSecret(level, outSecret); err != nil {
 		return err
 	}
-	c.out.trafficSecret = outSecret
-	c.out.encryptionLevel = level
+	c.out.setTrafficSecret(level, outSecret)
 	return nil
 }
 
 // Handshake runs the client or server handshake
 // protocol if it has not yet been run.
+//
+// Most uses of this package need not call Handshake explicitly: the
+// first Read or Write will call it automatically.
+//
+// For control over canceling or setting a timeout on a handshake, use
+// HandshakeContext or the Dialer's DialContext method instead.
 func (c *Conn) Handshake() error {
 	if err := c.handshakeErr; err != nil {
 		return err
@@ -289,7 +273,7 @@ func (c *Conn) Handshake() error {
 
 	if c.handshakeComplete() {
 		c.handshakeErr = c.handlePostHandshakeMessage()
-	} else {
+	} else if c.handshakeErr == nil {
 		c.handshakeErr = errors.New("tls: internal error: handshake should have had a result")
 	}
 

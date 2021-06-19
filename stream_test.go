@@ -3,7 +3,6 @@ package quic
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"testing"
 	"time"
 
@@ -211,7 +210,7 @@ func TestStreamWriteBlock(t *testing.T) {
 		if !writing {
 			t.Errorf("expected writing: %v, actual: %v", true, writing)
 		}
-		st.recvWriteData(ioutil.Discard)
+		st.recvWriteData(io.Discard)
 		st.sendWriteResult(nil)
 	}()
 
@@ -400,7 +399,7 @@ func TestStream(t *testing.T) {
 			t.Errorf("client stream close: %v", err)
 			return
 		}
-		recvData, err = ioutil.ReadAll(st)
+		recvData, err = io.ReadAll(st)
 		if err != nil {
 			t.Errorf("client stream read: %v", err)
 			return

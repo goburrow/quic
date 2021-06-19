@@ -92,7 +92,8 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 		}
 	}
 	if hs.state != serverStateFinished {
-		return fmt.Errorf("tls: unexpected handshake state: %v", hs.state)
+		c.sendAlert(alertInternalError)
+		return errors.New("tls: unexpected handshake state finished")
 	}
 
 	c.handshakeStatus = 1
@@ -131,7 +132,7 @@ func (hs *serverHandshakeStateTLS13) readClientHello() error {
 	if len(clientHello.supportedVersions) == 0 {
 		clientVersions = supportedVersionsFromMax(clientHello.vers)
 	}
-	c.vers, ok = mutualVersion(clientVersions)
+	c.vers, ok = configMutualVersion(c.config, clientVersions)
 	if !ok {
 		c.sendAlert(alertProtocolVersion)
 		return fmt.Errorf("tls: client offered only unsupported versions: %x", clientVersions)
@@ -173,7 +174,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		if id == tls.TLS_FALLBACK_SCSV {
 			// Use c.vers instead of max(supported_versions) because an attacker
 			// could defeat this by adding an arbitrary high version otherwise.
-			if c.vers < maxSupportedVersion() {
+			if c.vers < configMaxSupportedVersion(c.config) {
 				c.sendAlert(alertInappropriateFallback)
 				return errors.New("tls: client using inappropriate protocol fallback")
 			}
@@ -212,16 +213,12 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	hs.hello.sessionId = hs.clientHello.sessionId
 	hs.hello.compressionMethod = compressionNone
 
-	var preferenceList, supportedList []uint16
-	if c.config.PreferServerCipherSuites {
-		preferenceList = defaultCipherSuitesTLS13()
-		supportedList = hs.clientHello.cipherSuites
-	} else {
-		preferenceList = hs.clientHello.cipherSuites
-		supportedList = defaultCipherSuitesTLS13()
+	preferenceList := defaultCipherSuitesTLS13
+	if !hasAESGCMHardwareSupport || !aesgcmPreferred(hs.clientHello.cipherSuites) {
+		preferenceList = defaultCipherSuitesTLS13NoAES
 	}
 	for _, suiteID := range preferenceList {
-		hs.suite = mutualCipherSuiteTLS13(supportedList, suiteID)
+		hs.suite = mutualCipherSuiteTLS13(hs.clientHello.cipherSuites, suiteID)
 		if hs.suite != nil {
 			break
 		}
@@ -585,13 +582,13 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 
 	clientSecret := hs.suite.deriveSecret(hs.handshakeSecret,
 		clientHandshakeTrafficLabel, hs.transcript)
-	if err := c.setInSecret(EncryptionLevelHandshake, clientSecret); err != nil {
+	if err := c.setInTrafficSecret(EncryptionLevelHandshake, clientSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
 	serverSecret := hs.suite.deriveSecret(hs.handshakeSecret,
 		serverHandshakeTrafficLabel, hs.transcript)
-	if err := c.setOutSecret(EncryptionLevelHandshake, serverSecret); err != nil {
+	if err := c.setOutTrafficSecret(EncryptionLevelHandshake, serverSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
@@ -609,12 +606,13 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 
 	encryptedExtensions := new(encryptedExtensionsMsg)
 
-	if len(hs.clientHello.alpnProtocols) > 0 {
-		if selectedProto := mutualProtocol(hs.clientHello.alpnProtocols, c.config.NextProtos); selectedProto != "" {
-			encryptedExtensions.alpnProtocol = selectedProto
-			c.clientProtocol = selectedProto
-		}
+	selectedProto, err := negotiateALPN(c.config.NextProtos, hs.clientHello.alpnProtocols)
+	if err != nil {
+		c.sendAlert(alertNoApplicationProtocol)
+		return err
 	}
+	encryptedExtensions.alpnProtocol = selectedProto
+	c.clientProtocol = selectedProto
 	if len(c.quicTransportParams) > 0 {
 		encryptedExtensions.quicTransportParams = c.quicTransportParams
 	}
@@ -723,7 +721,7 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 		clientApplicationTrafficLabel, hs.transcript)
 	serverSecret := hs.suite.deriveSecret(hs.masterSecret,
 		serverApplicationTrafficLabel, hs.transcript)
-	if err := c.setOutSecret(EncryptionLevelApplication, serverSecret); err != nil {
+	if err := c.setOutTrafficSecret(EncryptionLevelApplication, serverSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
@@ -938,7 +936,7 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 		return errors.New("tls: invalid client finished hash")
 	}
 
-	if err := c.setInSecret(EncryptionLevelApplication, hs.trafficSecret); err != nil {
+	if err := c.setInTrafficSecret(EncryptionLevelApplication, hs.trafficSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}

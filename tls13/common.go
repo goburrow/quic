@@ -320,7 +320,7 @@ func configTicketKeys(c *tls.Config, configForClient *tls.Config) []ticketKey {
 	return s.autoSessionTicketKeys
 }
 
-// configRand is a replacement for tls.Config.rand.
+// configRand is the replacement for tls.Config.rand.
 func configRand(c *tls.Config) io.Reader {
 	r := c.Rand
 	if r == nil {
@@ -329,7 +329,7 @@ func configRand(c *tls.Config) io.Reader {
 	return r
 }
 
-// configTime is a replacement for tls.Config.time.
+// configTime is the replacement for tls.Config.time.
 func configTime(c *tls.Config) time.Time {
 	t := c.Time
 	if t == nil {
@@ -338,20 +338,29 @@ func configTime(c *tls.Config) time.Time {
 	return t()
 }
 
-// configCipherSuites is a replacement for tls.Config.cipherSuites.
+// configCipherSuites is the replacement for tls.Config.cipherSuites.
 func configCipherSuites(c *tls.Config) []uint16 {
-	s := c.CipherSuites
-	if s == nil {
-		s = defaultCipherSuitesTLS13()
+	if c.CipherSuites != nil {
+		return c.CipherSuites
 	}
-	return s
+	return defaultCipherSuites
 }
 
 var supportedVersions = []uint16{
 	tls.VersionTLS13,
 }
 
-func maxSupportedVersion() uint16 {
+// configCipherSuites is the replacement for tls.Config.supportedVersions.
+func configSupportedVersions(c *tls.Config) []uint16 {
+	return supportedVersions
+}
+
+// configMaxSupportedVersion is the replacement for tls.Config.maxSupportedVersion.
+func configMaxSupportedVersion(c *tls.Config) uint16 {
+	supportedVersions := configSupportedVersions(c)
+	if len(supportedVersions) == 0 {
+		return 0
+	}
 	return supportedVersions[0]
 }
 
@@ -371,7 +380,7 @@ func supportedVersionsFromMax(maxVersion uint16) []uint16 {
 
 var defaultCurvePreferences = []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}
 
-// configCurvePreferences is a replacement for tls.Config.curvePreferences.
+// configCurvePreferences is the replacement for tls.Config.curvePreferences.
 func configCurvePreferences(c *tls.Config) []tls.CurveID {
 	if c == nil || len(c.CurvePreferences) == 0 {
 		return defaultCurvePreferences
@@ -381,7 +390,8 @@ func configCurvePreferences(c *tls.Config) []tls.CurveID {
 
 // mutualVersion returns the protocol version to use given the advertised
 // versions of the peer. Priority is given to the peer preference order.
-func mutualVersion(peerVersions []uint16) (uint16, bool) {
+func configMutualVersion(c *tls.Config, peerVersions []uint16) (uint16, bool) {
+	supportedVersions := configSupportedVersions(c)
 	for _, peerVersion := range peerVersions {
 		for _, v := range supportedVersions {
 			if v == peerVersion {
@@ -447,7 +457,7 @@ const (
 	keyLogLabelServerTraffic   = "SERVER_TRAFFIC_SECRET_0"
 )
 
-// configWriteKeyLog is a replacement for tls.Config.writeKeyLog.
+// configWriteKeyLog is the replacement for tls.Config.writeKeyLog.
 func configWriteKeyLog(c *tls.Config, label string, clientRandom, secret []byte) error {
 	if c.KeyLogWriter == nil {
 		return nil
@@ -479,8 +489,8 @@ type lruSessionCache struct {
 	m        map[string]*list.Element
 	q        *list.List
 	capacity int
-	// stdTLS is the cache provided by standard tls package.
-	stdTLS tls.ClientSessionCache
+	// stdCache is the cache provided by standard tls package.
+	stdCache tls.ClientSessionCache
 }
 
 type lruSessionCacheEntry struct {
@@ -501,16 +511,25 @@ func NewLRUClientSessionCache(capacity int) tls.ClientSessionCache {
 		m:        make(map[string]*list.Element),
 		q:        list.New(),
 		capacity: capacity,
-		stdTLS:   tls.NewLRUClientSessionCache(capacity),
+		stdCache: tls.NewLRUClientSessionCache(capacity),
 	}
 }
 
 // Put adds the provided (sessionKey, cs) pair to the cache. If cs is nil, the entry
 // corresponding to sessionKey is removed from the cache instead.
 func (c *lruSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
-	if c.stdTLS != nil {
-		c.stdTLS.Put(sessionKey, cs)
+	if c.stdCache != nil {
+		c.stdCache.Put(sessionKey, cs)
 	}
+}
+
+// Get returns the ClientSessionState value associated with a given key. It
+// returns (nil, false) if no value is found.
+func (c *lruSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
+	if c.stdCache != nil {
+		return c.stdCache.Get(sessionKey)
+	}
+	return nil, false
 }
 
 // PutClientSession adds the provided (sessionKey, cs) pair to the cache. If cs is nil, the entry
@@ -546,15 +565,6 @@ func (c *lruSessionCache) PutClientSession(sessionKey string, cs *ClientSessionS
 	c.m[sessionKey] = elem
 }
 
-// Get returns the ClientSessionState value associated with a given key. It
-// returns (nil, false) if no value is found.
-func (c *lruSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
-	if c.stdTLS != nil {
-		return c.stdTLS.Get(sessionKey)
-	}
-	return nil, false
-}
-
 // GetClientSession returns the ClientSessionState value associated with a given key. It
 // returns (nil, false) if no value is found.
 func (c *lruSessionCache) GetClientSession(sessionKey string) (*ClientSessionState, bool) {
@@ -572,18 +582,6 @@ var emptyConfig tls.Config
 
 func defaultConfig() *tls.Config {
 	return &emptyConfig
-}
-
-var (
-	varDefaultCipherSuitesTLS13 = []uint16{
-		tls.TLS_AES_128_GCM_SHA256,
-		tls.TLS_CHACHA20_POLY1305_SHA256,
-		tls.TLS_AES_256_GCM_SHA384,
-	}
-)
-
-func defaultCipherSuitesTLS13() []uint16 {
-	return varDefaultCipherSuitesTLS13
 }
 
 func unexpectedMessageError(wanted, got interface{}) error {

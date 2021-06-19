@@ -28,6 +28,34 @@ func (c *Conn) serverHandshake() error {
 	return c.serverHs.handshake()
 }
 
+// negotiateALPN picks a shared ALPN protocol that both sides support in server
+// preference order. If ALPN is not configured or the peer doesn't support it,
+// it returns "" and no error.
+func negotiateALPN(serverProtos, clientProtos []string) (string, error) {
+	if len(serverProtos) == 0 || len(clientProtos) == 0 {
+		return "", nil
+	}
+	var http11fallback bool
+	for _, s := range serverProtos {
+		for _, c := range clientProtos {
+			if s == c {
+				return s, nil
+			}
+			if s == "h2" && c == "http/1.1" {
+				http11fallback = true
+			}
+		}
+	}
+	// As a special case, let http/1.1 clients connect to h2 servers as if they
+	// didn't support ALPN. We used not to enforce protocol overlap, so over
+	// time a number of HTTP servers were configured with only "h2", but
+	// expected to accept connections from "http/1.1" clients. See Issue 46310.
+	if http11fallback {
+		return "", nil
+	}
+	return "", fmt.Errorf("tls: client requested unsupported application protocols (%s)", clientProtos)
+}
+
 // processCertsFromClient takes a chain of client certificates either from a
 // Certificates message or from a sessionState and verifies them. It returns
 // the public key of the leaf certificate.

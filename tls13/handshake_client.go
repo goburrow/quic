@@ -36,11 +36,12 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		return nil, nil, errors.New("tls: NextProtos values too large")
 	}
 
+	supportedVersions := configSupportedVersions(config)
 	if len(supportedVersions) == 0 {
 		return nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
 	}
 
-	clientHelloVersion := maxSupportedVersion()
+	clientHelloVersion := configMaxSupportedVersion(config)
 	// The version at the beginning of the ClientHello was capped at TLS 1.2
 	// for compatibility reasons. The supported_versions extension is used
 	// to negotiate versions now. See RFC 8446, Section 4.2.1.
@@ -48,11 +49,12 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		clientHelloVersion = tls.VersionTLS12
 	}
 
+	// BoringSSL disallows TLS 1.3 compatibility mode in QUIC,
+	// so sessionId will not be generated and sent.
 	hello := &clientHelloMsg{
 		vers:                         clientHelloVersion,
 		compressionMethods:           []uint8{compressionNone},
 		random:                       make([]byte, 32),
-		sessionId:                    make([]byte, 32),
 		ocspStapling:                 true,
 		scts:                         true,
 		serverName:                   hostnameInSNI(config.ServerName),
@@ -71,17 +73,19 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		}
 	*/
 
-	possibleCipherSuites := configCipherSuites(c.config)
-	hello.cipherSuites = make([]uint16, 0, len(possibleCipherSuites))
+	preferenceOrder := defaultCipherSuitesTLS13
+	if !hasAESGCMHardwareSupport {
+		preferenceOrder = defaultCipherSuitesTLS13NoAES
+	}
+	configCipherSuites := configCipherSuites(config)
+	hello.cipherSuites = make([]uint16, 0, len(configCipherSuites))
 
-	for _, suiteId := range possibleCipherSuites {
-		for _, suite := range cipherSuitesTLS13 {
-			if suite.id != suiteId {
-				continue
-			}
-			hello.cipherSuites = append(hello.cipherSuites, suiteId)
-			break
+	for _, suiteId := range preferenceOrder {
+		suite := mutualCipherSuiteTLS13(configCipherSuites, suiteId)
+		if suite == nil {
+			continue
 		}
+		hello.cipherSuites = append(hello.cipherSuites, suiteId)
 	}
 
 	_, err := io.ReadFull(configRand(c.config), hello.random)
@@ -102,8 +106,6 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 
 	var params ecdheParameters
 	if hello.supportedVersions[0] == tls.VersionTLS13 {
-		hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13()...)
-
 		curveID := configCurvePreferences(c.config)[0]
 		if _, ok := curveForCurveID(curveID); curveID != tls.X25519 && !ok {
 			return nil, nil, errors.New("tls: CurvePreferences includes unsupported curve")
@@ -287,7 +289,7 @@ func (c *Conn) pickTLSVersion(serverHello *serverHelloMsg) error {
 		peerVersion = serverHello.supportedVersion
 	}
 
-	vers, ok := mutualVersion([]uint16{peerVersion})
+	vers, ok := configMutualVersion(c.config, []uint16{peerVersion})
 	if !ok {
 		c.sendAlert(alertProtocolVersion)
 		return fmt.Errorf("tls: server selected unsupported protocol version %x", peerVersion)
@@ -297,6 +299,23 @@ func (c *Conn) pickTLSVersion(serverHello *serverHelloMsg) error {
 	c.haveVers = true
 
 	return nil
+}
+
+// checkALPN ensure that the server's choice of ALPN protocol is compatible with
+// the protocols that we advertised in the Client Hello.
+func checkALPN(clientProtos []string, serverProto string) error {
+	if serverProto == "" {
+		return nil
+	}
+	if len(clientProtos) == 0 {
+		return errors.New("tls: server advertised unrequested ALPN extension")
+	}
+	for _, proto := range clientProtos {
+		if proto == serverProto {
+			return nil
+		}
+	}
+	return errors.New("tls: server selected unadvertised ALPN protocol")
 }
 
 // verifyServerCertificate parses and verifies the provided chain, setting
@@ -377,19 +396,6 @@ func (c *Conn) getClientCertificate(cri *tls.CertificateRequestInfo) (*tls.Certi
 // be used to resume previously negotiated TLS sessions with a server.
 func clientSessionCacheKey(config *tls.Config) string {
 	return config.ServerName
-}
-
-// mutualProtocol finds the mutual ALPN protocol given list of possible
-// protocols and a list of the preference order.
-func mutualProtocol(protos, preferenceProtos []string) string {
-	for _, s := range preferenceProtos {
-		for _, c := range protos {
-			if s == c {
-				return s
-			}
-		}
-	}
-	return ""
 }
 
 // hostnameInSNI converts name into an appropriate hostname for SNI.
