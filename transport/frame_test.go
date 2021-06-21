@@ -407,7 +407,7 @@ func TestFuzzFrame(t *testing.T) {
 		for _, f = range frames {
 			n, err := f.decode(b)
 			if err == nil {
-				n, err = f.encode(out[:n])
+				_, err = f.encode(out[:n])
 				if err != nil {
 					if _, ok := f.(*streamFrame); ok && err == errShortBuffer {
 						// Stream frame always include length, so encoded length may be greater than decoded length.

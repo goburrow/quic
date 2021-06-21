@@ -69,9 +69,9 @@ func TestTransportParamsGreased(t *testing.T) {
 }
 
 func TestTLSHandshakeInitial(t *testing.T) {
-	var pnSpaces [packetSpaceCount]packetNumberSpace
+	var pnSpaces [packetSpaceCount]*packetNumberSpace
 	for i := range pnSpaces {
-		pnSpaces[i].init()
+		pnSpaces[i] = newPacketNumberSpace()
 	}
 	tlsConfig := &tls.Config{
 		ServerName: "localhost",

@@ -59,6 +59,7 @@ func newConfig() *transport.Config {
 	c.Params.InitialMaxStreamsUni = 8
 	c.TLS = &tls.Config{
 		NextProtos: []string{
+			"hq",
 			"hq-interop",
 			"http/0.9",
 		},
@@ -66,6 +67,22 @@ func newConfig() *transport.Config {
 		KeyLogWriter:       newKeyLogWriter(),
 	}
 	return c
+}
+
+func setCipherSuites(config *tls.Config, cipher string) error {
+	switch cipher {
+	case "":
+		// Auto
+	case tls.CipherSuiteName(tls.TLS_AES_128_GCM_SHA256):
+		config.CipherSuites = []uint16{tls.TLS_AES_128_GCM_SHA256}
+	case tls.CipherSuiteName(tls.TLS_AES_256_GCM_SHA384):
+		config.CipherSuites = []uint16{tls.TLS_AES_256_GCM_SHA384}
+	case tls.CipherSuiteName(tls.TLS_CHACHA20_POLY1305_SHA256):
+		config.CipherSuites = []uint16{tls.TLS_CHACHA20_POLY1305_SHA256}
+	default:
+		return fmt.Errorf("unsupported cipher: %v", cipher)
+	}
+	return nil
 }
 
 func newKeyLogWriter() io.Writer {
@@ -91,7 +108,7 @@ func (w *keyLogWriter) Write(b []byte) (int, error) {
 	return w.w.Write(b)
 }
 
-var buffers = newBufferCache(2048, 10)
+var buffers = newBufferCache(8192, 10)
 
 type bufferCache struct {
 	list chan []byte

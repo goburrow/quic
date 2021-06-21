@@ -160,7 +160,7 @@ func TestConnStream(t *testing.T) {
 	if n != 0 || err != io.EOF {
 		t.Fatalf("server stream read %v %v, expect %v", n, err, io.EOF)
 	}
-	n, err = st.WriteString("hi!")
+	_, err = st.WriteString("hi!")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestConnSendMaxData(t *testing.T) {
 	if err == nil || err.Error() != "flow_control_error stream: connection data exceeded 200" {
 		t.Fatalf("expect error %v, actual %v", errorCodeString(FlowControlError), err)
 	}
-	stream.data = b[:100]
+	stream.data = b[:140]
 	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
 	if err != nil {
 		t.Fatal(err)
@@ -216,17 +216,17 @@ func TestConnSendMaxData(t *testing.T) {
 	if maxData != nil {
 		t.Fatalf("expect no max data frame, actual %v", maxData)
 	}
-	// max 1024, read 1000
+	// max 200, read 100, next 300
 	st, _ := s.Stream(4)
 	st.Read(b)
 	t.Logf("flow: %+v", s.flow)
 	maxData = s.sendFrameMaxData()
-	if maxData == nil || maxData.maximumData != 300 {
+	if maxData == nil || maxData.maximumData != 340 {
 		t.Fatalf("expect max data frame, actual %v", maxData)
 	}
 	t.Logf("stream flow: %+v", st.flow)
 	maxStreamData := s.sendFrameMaxStreamData(4, st)
-	if maxStreamData == nil || maxStreamData.streamID != 4 || maxStreamData.maximumData != 250 {
+	if maxStreamData == nil || maxStreamData.streamID != 4 || maxStreamData.maximumData != 290 {
 		t.Fatalf("expect max stream data frame, actual %v", maxStreamData)
 	}
 }
@@ -299,7 +299,7 @@ func TestConnRecvResetStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conn.flow.totalRecv != f.finalSize {
+	if conn.flow.recvTotal != f.finalSize {
 		t.Fatalf("expect flow recv %v, actual %+v", 10, conn.flow)
 	}
 	events := conn.Events(nil)
@@ -386,16 +386,16 @@ func TestConnClose(t *testing.T) {
 	}
 	conn.deriveInitialKeyMaterial([]byte("client"))
 	conn.Close(false, 1, "failure")
-	if conn.ConnectionState() != StateAttempted {
-		t.Fatalf("expect connection state not changed, got %v", conn.ConnectionState())
+	if conn.state != stateAttempted {
+		t.Fatalf("expect connection state not changed, got %v", conn.state)
 	}
 	b := make([]byte, 100)
 	n, err := conn.Read(b)
 	if err != nil || n == 0 {
 		t.Fatalf("expect read has data, got %v %v", n, err)
 	}
-	if conn.ConnectionState() != StateClosed {
-		t.Fatalf("expect connection state %v, got %v", StateClosed, conn.ConnectionState())
+	if conn.state != stateClosed {
+		t.Fatalf("expect connection state %v, got %v", stateClosed, conn.state)
 	}
 }
 
@@ -455,10 +455,10 @@ func TestConnHandshakeLoss(t *testing.T) {
 	p.assertClientSend() // CH1: crypto
 	p.assertServerSend() // SH4: ack + SA0: done
 
-	if p.client.ConnectionState() != StateActive {
+	if p.client.state != stateActive {
 		t.Fatal("client has not handshaked")
 	}
-	if p.server.ConnectionState() != StateActive {
+	if p.server.state != stateActive {
 		t.Fatal("server has not handshaked")
 	}
 	t.Logf("server tx: %d, client tx: %d", p.serverTx, p.clientTx)
@@ -502,7 +502,7 @@ func TestConnHandshakeTimeout(t *testing.T) {
 
 	now = now.Add(10 * time.Second)
 	p.server.Write(nil)
-	if p.server.ConnectionState() != StateClosed {
+	if p.server.state != stateClosed {
 		t.Fatal("server has not closed")
 	}
 }
@@ -532,6 +532,46 @@ func TestConnResumption(t *testing.T) {
 	t.Logf("resume handshake: %d bytes", tx2)
 	if tx1 <= tx2 {
 		t.Fatalf("expect less roundtrip than %d, actual %d", tx1, tx2)
+	}
+}
+
+func TestConnDataBlocked(t *testing.T) {
+	conn, err := Accept([]byte("server"), nil, NewConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.flow.setSendMax(100)
+	conn.flow.setSendBlocked(true)
+	dataBlocked := conn.sendFrameDataBlocked()
+	if dataBlocked == nil || dataBlocked.dataLimit != 100 {
+		t.Fatalf("expect data blocked frame, actual: %+v", dataBlocked)
+	}
+}
+
+func TestConnAmplificationLimit(t *testing.T) {
+	client := newTestClient(nil)
+	server := newTestServer(nil)
+	b := make([]byte, MinInitialPacketSize)
+	n, _ := client.Read(b)
+	if n != MinInitialPacketSize || client.sentBytes != uint64(n) {
+		t.Fatalf("expect sent: %v, actual: %v", MinInitialPacketSize, client.sentBytes)
+	}
+	n, _ = server.Write(b[:n])
+	if server.recvBytes != uint64(n) {
+		t.Fatalf("expect recv: %v, actual: %v", n, server.recvBytes)
+	}
+	server.sentBytes = 3000
+	n = server.maxPacketSize()
+	if n != 600 {
+		t.Fatalf("expect max packet size: %v, actual: %v", 600, n)
+	}
+	n, _ = server.Read(b)
+	if n > 600 {
+		t.Fatalf("expect sent: %v, actual: %v", 600, n)
+	}
+	n, _ = server.Read(b)
+	if n != 0 {
+		t.Fatalf("expect sent: %v, actual: %v", 0, n)
 	}
 }
 
@@ -685,7 +725,7 @@ func (t *testEndpoint) negotiateVersion() error {
 		return err
 	}
 	t.serverTx += n
-	n, err = t.client.Write(b[:n])
+	_, err = t.client.Write(b[:n])
 	if err != nil {
 		return err
 	}
@@ -717,7 +757,7 @@ func (t *testEndpoint) retry() error {
 		return err
 	}
 	t.serverTx += n
-	n, err = t.client.Write(b[:n])
+	_, err = t.client.Write(b[:n])
 	if err != nil {
 		return err
 	}
@@ -734,14 +774,14 @@ func (t *testEndpoint) assertHandshake() {
 
 func (t *testEndpoint) handshake() error {
 	i := 0
-	for t.client.ConnectionState() != StateActive || t.server.ConnectionState() != StateActive {
+	for !t.client.HandshakeComplete() || !t.server.HandshakeComplete() {
 		n, err := t.client.Read(t.buf[:])
 		if err != nil {
 			return err
 		}
 		if n > 0 {
 			t.clientTx += n
-			n, err = t.server.Write(t.buf[:n])
+			_, err = t.server.Write(t.buf[:n])
 			if err != nil {
 				return err
 			}
@@ -752,7 +792,7 @@ func (t *testEndpoint) handshake() error {
 		}
 		if n > 0 {
 			t.serverTx += n
-			n, err = t.client.Write(t.buf[:n])
+			_, err = t.client.Write(t.buf[:n])
 			if err != nil {
 				return err
 			}

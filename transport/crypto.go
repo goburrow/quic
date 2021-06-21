@@ -12,8 +12,19 @@ import (
 )
 
 const (
+	labelTrafficKey           = "quic key"
+	labelInitializationVector = "quic iv"
+	labelHeaderProtection     = "quic hp"
+	labelKeyUpdate            = "quic ku"
+
 	// Crypto is not under flow control, but we still enforce a hard limit.
 	cryptoMaxData = 1 << 20
+
+	// Maximum number of encrypted packets for each set of keys.
+	// AEAD_AES_128_CCM integrity limit is used.
+	// https://www.rfc-editor.org/rfc/rfc9001#section-6.6
+	maxEncryptedPackets = 1 << 21
+	maxInvalidPackets   = 1 << 21
 )
 
 // version 1
@@ -40,26 +51,40 @@ func deriveSecret(suite tls13.CipherSuite, secret []byte, label string) []byte {
 	return suite.ExpandLabel(secret, label, suite.Hash().Size())
 }
 
-func quicTrafficKey(suite tls13.CipherSuite, secret []byte) (key, iv, hp []byte) {
+func nextTrafficSecret(suite tls13.CipherSuite, secret []byte) []byte {
+	return deriveSecret(suite, secret, labelKeyUpdate)
+}
+
+func packetProtectionKey(suite tls13.CipherSuite, secret []byte) (key, iv []byte) {
 	const aeadNonceLength = 12
-	key = suite.ExpandLabel(secret, "quic key", suite.KeyLen())
-	iv = suite.ExpandLabel(secret, "quic iv", aeadNonceLength)
-	hp = suite.ExpandLabel(secret, "quic hp", suite.KeyLen())
+	key = suite.ExpandLabel(secret, labelTrafficKey, suite.KeyLen())
+	iv = suite.ExpandLabel(secret, labelInitializationVector, aeadNonceLength)
 	return
+}
+
+func headerProtectionKey(suite tls13.CipherSuite, secret []byte) []byte {
+	return suite.ExpandLabel(secret, labelHeaderProtection, suite.KeyLen())
 }
 
 // https://www.rfc-editor.org/rfc/rfc9001#section-5
 type packetProtection struct {
+	secret      []byte
+	cipherSuite uint16
+
 	aead  cipher.AEAD
 	hp    headerProtection
 	nonce [8]byte // packet number
 }
 
 func (s *packetProtection) init(suite tls13.CipherSuite, secret []byte) {
-	key, iv, hpKey := quicTrafficKey(suite, secret)
+	s.secret = secret
+	s.cipherSuite = suite.ID()
+
+	key, iv := packetProtectionKey(suite, secret)
 	s.aead = suite.AEAD(key, iv)
 
-	if suite.ID() == tls.TLS_CHACHA20_POLY1305_SHA256 {
+	hpKey := headerProtectionKey(suite, secret)
+	if s.cipherSuite == tls.TLS_CHACHA20_POLY1305_SHA256 {
 		s.hp.chaCha20Init(hpKey)
 	} else {
 		s.hp.aesInit(hpKey)
@@ -167,6 +192,17 @@ func (s *packetProtection) decryptHeader(b []byte, pnOffset int) error {
 		b[pnOffset+i] ^= mask[1+i]
 	}
 	return nil
+}
+
+// updateKey returns a new packetProtection using the new traffic key derived from current secret.
+// https://www.rfc-editor.org/rfc/rfc9001.html#section-6
+func (s *packetProtection) updateKey() {
+	suite := tls13.CipherSuiteByID(s.cipherSuite)
+	s.secret = nextTrafficSecret(suite, s.secret)
+
+	// The header protection key is not updated during key update.
+	key, iv := packetProtectionKey(suite, s.secret)
+	s.aead = suite.AEAD(key, iv)
 }
 
 const (

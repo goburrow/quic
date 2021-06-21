@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -38,6 +37,7 @@ func (clientCommand) Run(args []string) error {
 	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
 	useAsync := cmd.Bool("async", false, "use asynchronous Stream APIs")
+	keyUpdate := cmd.Int("keyupdate", 0, "key update interval")
 	cmd.Usage = func() {
 		fmt.Fprintln(cmd.Output(), "Usage: quiwi client [arguments] <url>")
 		cmd.PrintDefaults()
@@ -67,17 +67,11 @@ func (clientCommand) Run(args []string) error {
 	}
 	config.TLS.ServerName = urls[len(urls)-1].Hostname()
 	config.TLS.InsecureSkipVerify = *insecure
-	switch *cipher {
-	case "":
-		// Auto
-	case "TLS_AES_128_GCM_SHA256":
-		config.TLS.CipherSuites = []uint16{tls.TLS_AES_128_GCM_SHA256}
-	case "TLS_AES_256_GCM_SHA384":
-		config.TLS.CipherSuites = []uint16{tls.TLS_AES_256_GCM_SHA384}
-	case "TLS_CHACHA20_POLY1305_SHA256":
-		config.TLS.CipherSuites = []uint16{tls.TLS_CHACHA20_POLY1305_SHA256}
-	default:
-		return fmt.Errorf("unsupported cipher: %v", *cipher)
+	if err := setCipherSuites(config.TLS, *cipher); err != nil {
+		return err
+	}
+	if *keyUpdate > 0 {
+		config.MaxPacketsPerKey = uint64(*keyUpdate)
 	}
 	handler := clientHandler{
 		root:  *root,

@@ -1,0 +1,57 @@
+2021/06/18 23:09:31.227968 connection_started cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 addr=193.167.100.100:443
+2021/06/18 23:09:31.228111   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=300
+2021/06/18 23:09:31.228111   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=initial version=1 dcid=8bca929419ecfdc26bde041408cf258754bb7612 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=0 packet_size=1200 payload_length=1149
+2021/06/18 23:09:31.228111   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=crypto offset=0 length=332
+2021/06/18 23:09:31.228111   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=padding
+2021/06/18 23:09:31.276750   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=initial version=1 dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 scid=075acfb1 packet_number=0 packet_size=183 payload_length=147
+2021/06/18 23:09:31.276750   metrics_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 min_rtt=48 smoothed_rtt=48 latest_rtt=48 rtt_variance=24 pto_count=0 congestion_window=14720 bytes_in_flight=1200
+2021/06/18 23:09:31.276750   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=145
+2021/06/18 23:09:31.276750   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=0 acked_ranges=[[0,0]]
+2021/06/18 23:09:31.276750   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=crypto offset=0 length=122
+2021/06/18 23:09:31.276750   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=handshake version=1 dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 scid=075acfb1 packet_number=0 packet_size=1049 payload_length=1014
+2021/06/18 23:09:31.276750   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=crypto offset=0 length=994
+2021/06/18 23:09:31.276750   connection_state_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 old=attempted new=handshake
+2021/06/18 23:09:31.279679   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=94
+2021/06/18 23:09:31.279679   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=initial version=1 dcid=075acfb1 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=1 packet_size=1200 payload_length=1165
+2021/06/18 23:09:31.279679   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=2925 acked_ranges=[[0,0]]
+2021/06/18 23:09:31.279679   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=padding
+2021/06/18 23:09:31.280202   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=handshake version=1 dcid=075acfb1 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=0 packet_size=55 payload_length=22
+2021/06/18 23:09:31.280202   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=3447 acked_ranges=[[0,0]]
+2021/06/18 23:09:31.280202   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=145
+2021/06/18 23:09:31.280751   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=handshake version=1 dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 scid=075acfb1 packet_number=1 packet_size=287 payload_length=252
+2021/06/18 23:09:31.280751   parameters_set cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 owner=remote original_connection_id=8bca929419ecfdc26bde041408cf258754bb7612 max_idle_timeout=30000 stateless_reset_token=5d7fae2fbae118004c6307fb1f4d7e47 max_udp_payload_size=1452 initial_max_data=786432 initial_max_stream_data_bidi_local=524288 initial_max_stream_data_bidi_remote=524288 initial_max_stream_data_uni=524288 initial_max_streams_bidi=100 initial_max_streams_uni=100 max_ack_delay=26 disable_active_migration=true active_connection_id_limit=4 initial_source_connection_id=075acfb1
+2021/06/18 23:09:31.280751   connection_state_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 old=handshake new=active
+2021/06/18 23:09:31.280751   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=crypto offset=994 length=231
+2021/06/18 23:09:31.280751   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=0 packet_size=63 payload_length=40
+2021/06/18 23:09:31.280751   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=new_connection_id sequence_number=1 retire_prior_to=0 connection_id=6e4d78a2 stateless_reset_token=bcf99fce602b19b1adb32f9596684c17
+2021/06/18 23:09:31.284953 debug cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 message=events: [conn_open:0]
+2021/06/18 23:09:31.287149   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=170
+2021/06/18 23:09:31.287149   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=handshake version=1 dcid=075acfb1 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=1 packet_size=94 payload_length=61
+2021/06/18 23:09:31.287149   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=6396 acked_ranges=[[0,1]]
+2021/06/18 23:09:31.287149   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=crypto offset=0 length=36
+2021/06/18 23:09:31.287149   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=170
+2021/06/18 23:09:31.287149   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt version=1 dcid=075acfb1 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=0 packet_size=48 payload_length=42
+2021/06/18 23:09:31.287149   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=6396 acked_ranges=[[0,0]]
+2021/06/18 23:09:31.287149   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=stream stream_id=0 offset=0 length=17 fin=true
+2021/06/18 23:09:31.322426   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=1 packet_size=45 payload_length=22
+2021/06/18 23:09:31.322426   metrics_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 min_rtt=35 smoothed_rtt=46 latest_rtt=35 rtt_variance=21 pto_count=0 congestion_window=14520 bytes_in_flight=142
+2021/06/18 23:09:31.322426   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=123
+2021/06/18 23:09:31.322426   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=201 acked_ranges=[[0,0]]
+2021/06/18 23:09:31.323389   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=2 packet_size=329 payload_length=306
+2021/06/18 23:09:31.323389   loss_timer_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 event_type=set delta=158
+2021/06/18 23:09:31.323389   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=handshake_done
+2021/06/18 23:09:31.323389   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=new_token token=639d3a34f746fd852a70c01aaac0bea2fe6788789b78d514a29f4407986b9ff743154e6ab53dd41aaa9614397514b17a21538f18ab5b0e7e242c3a2a7b67617a4c2107161fcbbb524e041fe3dfe9fe072ee8b84fe77c
+2021/06/18 23:09:31.323389   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=crypto offset=0 length=196
+2021/06/18 23:09:31.325702 debug cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 message=events: [stream_complete:0]
+2021/06/18 23:09:31.325762   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt version=1 dcid=075acfb1 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=1 packet_size=28 payload_length=22
+2021/06/18 23:09:31.325762   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=2372 acked_ranges=[[1,2]]
+2021/06/18 23:09:31.326945   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=3 packet_size=1065 payload_length=1042
+2021/06/18 23:09:31.326945   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=stream stream_id=0 offset=0 length=1024 fin=false
+2021/06/18 23:09:31.327726   packet_received cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt dcid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=4 packet_size=43 payload_length=20
+2021/06/18 23:09:31.327726   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=stream stream_id=0 offset=1024 length=0 fin=true
+2021/06/18 23:09:31.330266 debug cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 message=events: [stream_readable:0]
+2021/06/18 23:09:31.331469   connection_state_updated cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 old=active new=closed
+2021/06/18 23:09:31.331469   packet_sent cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_type=1rtt version=1 dcid=075acfb1 scid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 packet_number=2 packet_size=35 payload_length=29
+2021/06/18 23:09:31.331469   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=ack ack_delay=3741 acked_ranges=[[1,4]]
+2021/06/18 23:09:31.331469   frames_processed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 frame_type=connection_close error_space=transport error_code=no_error raw_error_code=0 reason=bye
+2021/06/18 23:09:31.331659 connection_closed cid=f93fccb848e3d9a8cab8ec99518d477f1d64c119 addr=193.167.100.100:443

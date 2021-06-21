@@ -78,7 +78,43 @@ func TestCodecEncode(t *testing.T) {
 	}
 }
 
-func TestVarint(t *testing.T) {
+func TestVarintDecode(t *testing.T) {
+	b := []byte{0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c}
+	var v uint64
+	n := getVarint(b, &v)
+	if n != 8 || v != 151288809941952652 {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 8, 151288809941952652, n, v)
+	}
+	n = getVarint(b[:len(b)-1], &v)
+	if n != 0 {
+		t.Fatalf("expect decode: %v, actual: %v", 0, n)
+	}
+	b = []byte{0x9d, 0x7f, 0x3e, 0x7d}
+	n = getVarint(b, &v)
+	if n != 4 || v != 494878333 {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 4, 494878333, n, v)
+	}
+	n = getVarint(b[:len(b)-1], &v)
+	if n != 0 {
+		t.Fatalf("expect decode: %v, actual: %v", 0, n)
+	}
+	b = []byte{0x40, 0x25}
+	n = getVarint(b, &v)
+	if n != 2 || v != 37 {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 2, 37, n, v)
+	}
+	n = getVarint(b[:len(b)-1], &v)
+	if n != 0 {
+		t.Fatalf("expect decode: %v, actual: %v", 0, n)
+	}
+	b = []byte{0x25}
+	n = getVarint(b, &v)
+	if n != 1 || v != 37 {
+		t.Fatalf("expect decode: %v %v, actual: %v %v", 1, 37, n, v)
+	}
+}
+
+func TestVarintCodec(t *testing.T) {
 	data := []struct {
 		v uint64
 		o int

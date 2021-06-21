@@ -29,11 +29,11 @@ const (
 	// Endpoints should use an initial congestion window of 10 times the maximum datagram size,
 	// limited to the larger of 14720 or twice the maximum datagram size
 	// https://www.rfc-editor.org/rfc/rfc9002.html#section-7.2
-	initialMaxDatagramSize  = 1472
-	initialCongestionWindow = 10 * initialMaxDatagramSize
+	initialMaxDatagramSize = 1472
+	initialWindowPackets   = 10
 	// The minimum congestion window is the smallest value the congestion window can decrease
 	// to as a response to loss. The recommended value is 2 * max_datagram_size.
-	minimumCongestionWindow = 2 * initialMaxDatagramSize
+	minimumWindowPackets = 2
 
 	// Reduction in congestion window when a new loss event is detected.
 	// NOTE: The value in spec is 0.5, but used as "x/2" here to avoid casting to float.
@@ -50,6 +50,7 @@ const (
 	// as many bytes as the number of bytes they have received.
 	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.2.1
 	maxAmplificationFactor = 3
+
 	// maxUint64 indicates infinity
 	maxUint64 = ^uint64(0)
 )
@@ -66,6 +67,7 @@ type sentPacket struct {
 	// containing it by up to the MaxAckDelay.
 	ackEliciting bool
 	// inFlight indicates whether the packet counts towards bytes in flight.
+	// Packets containing frames besides ACK or CONNECTION_CLOSE frames are considered to be in flight.
 	inFlight bool
 }
 
@@ -136,7 +138,8 @@ type lossRecovery struct {
 	acked [packetSpaceCount][]*sentPacket
 
 	// Metrics
-	lostCount uint64
+	lostPackets uint64
+	lostBytes   uint64
 
 	// Control PTO calculation.
 	hasHandshakeKeys               bool
@@ -177,27 +180,26 @@ func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, space packetSpace, now time.Time) {
 	largestAcked := ranges.largest()
 	if largestAcked > s.largestSentPacket[space] {
-		debug("invalid largest acknowledged packet number: %v %v", s.largestSentPacket, ranges)
+		debug("invalid largest acknowledged packet number: largestAcked=%v largestSent=%v %v",
+			largestAcked, s.largestSentPacket[space], ranges)
 		return
 	}
 	if s.largestAckedPacket[space] == maxUint64 || s.largestAckedPacket[space] < largestAcked {
 		s.largestAckedPacket[space] = largestAcked
 	}
 	// Finds packets that are newly acknowledged and removes them from sent packets.
-	var ackedPackets []*sentPacket
+	ackedPackets := make([]*sentPacket, 0, len(s.sent[space]))
 	hasAckEliciting := false
-	for _, r := range ranges {
-		s.filterSent(space, func(p *sentPacket) bool {
-			if p.packetNumber < r.start || p.packetNumber > r.end {
-				return false
-			}
+	s.filterSent(space, func(p *sentPacket) bool {
+		if ranges.contains(p.packetNumber) {
 			if p.ackEliciting {
 				hasAckEliciting = true
 			}
 			ackedPackets = append(ackedPackets, p)
 			return true
-		})
-	}
+		}
+		return false
+	})
 	if len(ackedPackets) == 0 {
 		// Nothing to do if there are no newly acked packets.
 		return
@@ -221,9 +223,10 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 	s.onPacketsAcked(ackedPackets, space)
 	// Reset pto_count unless the client is unsure if
 	// the server has validated the client's address.
-	// TODO: PeerCompletedAddressValidation()
-	s.ptoCount = 0
-	s.lossProbes[space] = 0
+	if s.peerCompletedAddressValidation {
+		s.ptoCount = 0
+		s.lossProbes[space] = 0
+	}
 	s.setLossDetectionTimer(now)
 }
 
@@ -249,7 +252,7 @@ func (s *lossRecovery) updateRTT(latestRTT time.Duration, ackDelay time.Duration
 	}
 	// Adjust for ack delay if plausible.
 	adjustedRTT := latestRTT
-	if adjustedRTT > s.minRTT+ackDelay {
+	if adjustedRTT >= s.minRTT+ackDelay {
 		adjustedRTT -= ackDelay
 	}
 	// rttvar = 3/4 * rttvar + 1/4 * abs(smoothed_rtt - adjusted_rtt)
@@ -289,6 +292,7 @@ func (s *lossRecovery) setLossDetectionTimer(now time.Time) {
 	// Determine which PN space to arm PTO for.
 	timeout, _ := s.earliestProbeTime(now)
 	s.lossDetectionTimer = timeout
+	debug("set loss_timer=%v", timeout)
 }
 
 // onLossDetectionTimeout checks lossDetectionTimer to detect whether a packet was lost.
@@ -504,13 +508,14 @@ func (s *lossRecovery) inPersistentCongestion(largestLostPacket *sentPacket) boo
 // onPacketsLost is invoked when detectAndRemoveLostPackets deems packets lost.
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.8
 func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, now time.Time) {
-	s.lostCount += uint64(len(packets))
+	s.lostPackets += uint64(len(packets))
 	for _, p := range packets {
 		if p.ackEliciting {
 			s.lost[space] = append(s.lost[space], p)
 		}
 		if p.inFlight {
 			s.congestion.onPacketLost(p.sentBytes)
+			s.lostBytes += p.sentBytes
 		}
 	}
 	largestLostPacket := packets[len(packets)-1]
@@ -521,6 +526,7 @@ func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, n
 	}
 }
 
+// filterSent removes packet from sent[space] when the filter function returns true.
 func (s *lossRecovery) filterSent(space packetSpace, filter func(*sentPacket) bool) {
 	sent := s.sent[space]
 	if len(sent) > 0 {
@@ -564,7 +570,7 @@ func (s *lossRecovery) setMaxAckDelay(maxAckDelay time.Duration) {
 	if s.maxAckDelay > 0 {
 		s.maxAckDelay = maxAckDelay
 	} else {
-		s.maxAckDelay = 25 * time.Millisecond
+		s.maxAckDelay = defaultMaxAckDelay
 	}
 }
 
@@ -580,16 +586,24 @@ func (s *lossRecovery) setHandshakeConfirmed() {
 	s.handshakeConfirmed = true
 }
 
-func (s *lossRecovery) canSend() uint64 {
+func (s *lossRecovery) setMaxDatagramSize(n uint64) {
+	s.congestion.setMaxDatagramSize(n)
+}
+
+// availSend returns number of bytes that are allowed to send.
+func (s *lossRecovery) availSend() uint64 {
 	if s.ptoCount > 0 {
+		// https://www.rfc-editor.org/rfc/rfc9002.html#section-7.5
 		// Ignore congestion window if packet is sent on PTO timer expiration.
-		return minimumCongestionWindow
+		return initialWindowPackets * initialMaxDatagramSize
 	}
-	return s.congestion.canSend()
+	return s.congestion.available()
 }
 
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.2
 type congestionControl struct {
+	// maxDatagramSize is the sender's current maximum payload size.
+	maxDatagramSize uint64
 	// bytesInFlight is the sum of the size in bytes of all sent packets that contain at least
 	// one ack-eliciting or PADDING frame, and have not been acked or declared lost.
 	bytesInFlight uint64
@@ -603,15 +617,16 @@ type congestionControl struct {
 	// When the congestion window is below slowStartThreshold, the mode is slow start
 	// and the window grows by the number of bytes acknowledged.
 	slowStartThreshold uint64
-
-	appOrFlowControlLimited bool // TODO
 }
 
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.3
 func (s *congestionControl) init() {
-	s.congestionWindow = initialCongestionWindow
+	s.maxDatagramSize = initialMaxDatagramSize
+	s.congestionWindow = initialWindowPackets * initialMaxDatagramSize
 	s.slowStartThreshold = maxUint64
 }
 
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.4
 func (s *congestionControl) onPacketSent(sentBytes uint64) {
 	s.bytesInFlight += sentBytes
 }
@@ -620,12 +635,15 @@ func (s *congestionControl) onPacketSent(sentBytes uint64) {
 // is supplied with the newly acked_packets from sent_packets.
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.5
 func (s *congestionControl) onPacketAcked(sentBytes uint64, sentTime time.Time) {
-	if s.bytesInFlight < sentBytes {
-		s.bytesInFlight = 0
-	} else {
+	// Remove from in flight.
+	if s.bytesInFlight > sentBytes {
 		s.bytesInFlight -= sentBytes
+	} else {
+		s.bytesInFlight = 0
 	}
-	if s.appOrFlowControlLimited || s.inRecovery(sentTime) {
+	if s.isAppLimited() || s.inRecovery(sentTime) {
+		// Do not increase congestion_window if application limited or
+		// in recovery period.
 		return
 	}
 	if s.congestionWindow < s.slowStartThreshold {
@@ -633,15 +651,16 @@ func (s *congestionControl) onPacketAcked(sentBytes uint64, sentTime time.Time) 
 		s.congestionWindow += sentBytes
 	} else {
 		// Congestion avoidance.
-		s.congestionWindow += initialMaxDatagramSize * sentBytes / s.congestionWindow
+		s.congestionWindow += s.maxDatagramSize * sentBytes / s.congestionWindow
 	}
 }
 
+// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.9
 func (s *congestionControl) onPacketLost(sentBytes uint64) {
-	if s.bytesInFlight < sentBytes {
-		s.bytesInFlight = 0
-	} else {
+	if s.bytesInFlight > sentBytes {
 		s.bytesInFlight -= sentBytes
+	} else {
+		s.bytesInFlight = 0
 	}
 }
 
@@ -651,27 +670,54 @@ func (s *congestionControl) onPacketLost(sentBytes uint64) {
 func (s *congestionControl) onNewCongestionEvent(sentTime, now time.Time) {
 	// Start a new congestion event if packet was sent after the
 	// start of the previous congestion recovery period.
-	if !s.inRecovery(sentTime) {
-		s.recoveryStartTime = now
-		s.congestionWindow = s.congestionWindow / lossReductionFactor
-		if s.congestionWindow < minimumCongestionWindow {
-			s.congestionWindow = minimumCongestionWindow
-		}
-		s.slowStartThreshold = s.congestionWindow
+	if s.inRecovery(sentTime) {
+		return
 	}
+	s.recoveryStartTime = now
+	s.slowStartThreshold = s.congestionWindow / lossReductionFactor
+	// congestion_window = max(ssthresh, kMinimumWindow)
+	minimumWindow := minimumWindowPackets * s.maxDatagramSize
+	if s.slowStartThreshold > minimumWindow {
+		s.congestionWindow = s.slowStartThreshold
+	} else {
+		s.congestionWindow = minimumWindow
+	}
+	debug("congestion event: bytes_in_flight=%v congestion_window=%v ssthresh=%v",
+		s.bytesInFlight, s.congestionWindow, s.slowStartThreshold)
 }
 
 func (s *congestionControl) inRecovery(sentTime time.Time) bool {
-	return !s.recoveryStartTime.IsZero() && s.recoveryStartTime.After(sentTime)
+	return !s.recoveryStartTime.IsZero() && !sentTime.After(s.recoveryStartTime)
 }
 
 func (s *congestionControl) collapseWindow() {
-	s.congestionWindow = minimumCongestionWindow
+	s.congestionWindow = minimumWindowPackets * s.maxDatagramSize
 }
 
-func (s *congestionControl) canSend() uint64 {
-	if s.congestionWindow < s.bytesInFlight {
-		return 0
+func (s *congestionControl) available() uint64 {
+	if s.congestionWindow > s.bytesInFlight {
+		return s.congestionWindow - s.bytesInFlight
 	}
-	return s.congestionWindow - s.bytesInFlight
+	return 0
+}
+
+func (s *congestionControl) setMaxDatagramSize(maxDatagramSize uint64) {
+	if s.congestionWindow == initialWindowPackets*s.maxDatagramSize {
+		// Only update congestion window when it has not been updated.
+		s.congestionWindow = initialWindowPackets * maxDatagramSize
+	}
+	s.maxDatagramSize = maxDatagramSize
+}
+
+// isAppLimited indicates application limited or flow control limited.
+func (s *congestionControl) isAppLimited() bool {
+	if s.bytesInFlight >= s.congestionWindow {
+		return false
+	}
+	if s.congestionWindow < s.slowStartThreshold {
+		// Slow start
+		return s.bytesInFlight < s.congestionWindow/lossReductionFactor
+	}
+	// Alow a burst of 2 packets
+	return s.bytesInFlight+minimumWindowPackets*s.maxDatagramSize < s.congestionWindow
 }

@@ -8,7 +8,7 @@ package transport
 // This method is only available when compiling with build tag "quicfuzz".
 // See https://github.com/goburrow/quic-fuzz
 func (s *Conn) BuildPacket(payload []byte) []byte {
-	pnSpace := &s.packetNumberSpaces[packetSpaceApplication]
+	pnSpace := s.packetNumberSpaces[packetSpaceApplication]
 	if !pnSpace.canEncrypt() {
 		return nil
 	}

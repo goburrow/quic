@@ -7,7 +7,7 @@ import (
 
 func TestLogConnectionState(t *testing.T) {
 	e := newTestLogEvent(logEventStateUpdated)
-	logConnectionState(&e, StateHandshake, StateActive)
+	logConnectionState(&e, stateHandshake, stateActive)
 	expect := "2020-01-05T00:00:00Z connection_state_updated old=handshake new=active"
 	assertLogEvent(t, e, expect)
 }

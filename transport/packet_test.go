@@ -12,7 +12,6 @@ func TestPacketInitial(t *testing.T) {
 	scid := randomBytes(MaxCIDLength)
 	token := randomBytes(32)
 	p := packet{
-		typ: packetTypeInitial,
 		header: packetHeader{
 			version: supportedVersions[0],
 			dcid:    dcid,
@@ -21,6 +20,7 @@ func TestPacketInitial(t *testing.T) {
 		token:      token,
 		payloadLen: minPacketPayloadLength,
 	}
+	p.setType(packetTypeInitial)
 	n, err := p.encode(b)
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestPacketInitial(t *testing.T) {
 	b = b[:n]
 
 	h := Header{}
-	n, err = h.Decode(b, 0)
+	_, err = h.Decode(b, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestPacketVersionNegotiation(t *testing.T) {
 	}
 	b = b[:n]
 	p := packet{}
-	n, err = decodeUnencryptedPacket(b, &p)
+	_, err = decodeUnencryptedPacket(b, &p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestPacketVersionNegotiation(t *testing.T) {
 	}
 
 	h := Header{}
-	n, err = h.Decode(b, 0)
+	_, err = h.Decode(b, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestPacketRetry(t *testing.T) {
 	}
 
 	h := Header{}
-	n, err = h.Decode(b, 0)
+	_, err = h.Decode(b, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,6 +158,71 @@ func TestPacketRetry(t *testing.T) {
 	}
 }
 
+func TestPacketNumberSpace(t *testing.T) {
+	server := newPacketNumberSpace()
+	server.opener, server.sealer = newInitialSecrets(nil)
+	client := newPacketNumberSpace()
+	client.opener, client.sealer = server.sealer, server.opener
+	payload := []byte{0, 0, 0, 0}
+	// Send packet
+	p := &packet{}
+	p.setType(packetTypeOneRTT)
+	p.setPacketNumber(1)
+	p.payloadLen = len(payload)
+	b, err := encodeAndEncryptPacket(client, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Receive packet
+	pl, err := decodeAndDecryptPacket(server, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pl, payload) {
+		t.Fatalf("expect payload: %x, actual: %x", payload, pl)
+	}
+	// Force changing key phase
+	server.setKeyUpdatePermitted()
+	server.encryptedPackets = maxEncryptedPackets
+	encodeAndEncryptPacket(server, p)
+	if server.keyPhase != 1 {
+		t.Fatalf("expect keyphase: 1, actual: %v", server.keyPhase)
+	}
+	// Should still decrypt packets from previous phase
+	p.setPacketNumber(2)
+	p.payloadLen = len(payload)
+	b, _ = encodeAndEncryptPacket(client, p)
+	_, err = decodeAndDecryptPacket(server, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.setKeyPhase(1)
+	p.payloadLen = len(payload)
+	b, err = encodeAndEncryptPacket(server, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl, err = decodeAndDecryptPacket(client, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pl, payload) {
+		t.Fatalf("expect payload: %x, actual: %x", payload, pl)
+	}
+	p.payloadLen = len(payload)
+	b, err = encodeAndEncryptPacket(client, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = decodeAndDecryptPacket(server, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.prevOpener != nil || server.prevOpener != nil {
+		t.Fatalf("expect prev key phases removed, actual: %v %v", client.prevOpener, server.prevOpener)
+	}
+}
+
 func randomBytes(maxLength int) []byte {
 	n := rand.Intn(maxLength + 1)
 	b := make([]byte, n)
@@ -178,6 +243,34 @@ func decodeUnencryptedPacket(b []byte, p *packet) (int, error) {
 		return 0, err
 	}
 	return hLen + bLen, nil
+}
+
+func encodeAndEncryptPacket(pnSpace *packetNumberSpace, p *packet) ([]byte, error) {
+	p.payloadLen += pnSpace.sealer.aead.Overhead()
+	buf := make([]byte, p.encodedLen())
+	n, err := p.encode(buf)
+	if err != nil {
+		return nil, err
+	}
+	p.packetSize = n + p.payloadLen
+	pnSpace.encryptPacket(buf[:p.packetSize], p)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:p.packetSize], nil
+}
+
+func decodeAndDecryptPacket(pnSpace *packetNumberSpace, b []byte) ([]byte, error) {
+	p := packet{}
+	_, err := p.decodeHeader(b)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := pnSpace.decryptPacket(b, &p)
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func TestPacketNumberWindow(t *testing.T) {

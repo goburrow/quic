@@ -110,6 +110,7 @@ func (s *Server) recv(p *packet) {
 		}
 		if !transport.IsVersionSupported(p.header.Version) {
 			// Negotiate version
+			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=unsupported_version", p.addr, &p.header)
 			s.negotiate(p.addr, &p.header)
 			freePacket(p)
 			return
@@ -175,6 +176,7 @@ func (s *Server) handleNewConn(p *packet) {
 	if s.addrValid != nil {
 		// Retry token
 		if len(p.header.Token) == 0 {
+			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=retry_required", p.addr, &p.header)
 			s.retry(p.addr, &p.header)
 			freePacket(p)
 			return

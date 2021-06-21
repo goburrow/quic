@@ -30,19 +30,33 @@ const (
 	paramMaxDatagramPayloadSize = 0x20
 )
 
+const (
+	// defaultUDPPayloadSize is the maximum permitted UDP payload.
+	defaultMaxUDPPayloadSize = 65527
+	// defaultAckDelayExponent is used when transport parameter AckDelayExponent does not present.
+	defaultAckDelayExponent = 3
+	// defaultMaxAckDelay is used when transport parameter MaxAckDelay does not present.
+	defaultMaxAckDelay = 25 * time.Millisecond
+)
+
 // Parameters is QUIC transport parameters.
 // https://www.rfc-editor.org/rfc/rfc9000#section-7.4
 type Parameters struct {
 	// OriginalDestinationCID is the DCID from the first Initial packet.
-	OriginalDestinationCID []byte // Only sent by server
-	// InitialSourceCID is the SCID of the frist Initial packet.
+	// This parameter is only sent by server.
+	OriginalDestinationCID []byte
+	// InitialSourceCID is the SCID of the first Initial packet.
 	InitialSourceCID []byte
 	// RetrySourceCID is the SCID of Retry packet.
-	RetrySourceCID []byte // Only sent by server
-	// StatelessResetToken must be 16 bytes
-	StatelessResetToken []byte // Only sent by server
+	// This parameter is only sent by server.
+	RetrySourceCID []byte
+	// StatelessResetToken is used in verifying a stateless reset and must be 16 bytes.
+	// This parameter is only sent by server.
+	StatelessResetToken []byte
 
-	MaxIdleTimeout    time.Duration
+	// MaxIdleTimeout is the duration that if the connection remains idle, it will be closed.
+	MaxIdleTimeout time.Duration
+	// MaxUDPPayloadSize is the maximum size of UDP payloads that the endpoint is willing to receive.
 	MaxUDPPayloadSize uint64
 
 	InitialMaxData                 uint64
@@ -52,15 +66,20 @@ type Parameters struct {
 	InitialMaxStreamsBidi          uint64
 	InitialMaxStreamsUni           uint64
 
+	// AckDelayExponent is the exponent used to decode ACK Delay field.
+	// A default value of 3 will be used if this value is zero. Values above 20 are invalid.
 	AckDelayExponent uint64
-	MaxAckDelay      time.Duration
+	// MaxAckDelay is the maximum time the endpoint will delay sending acknowledgement.
+	MaxAckDelay time.Duration
 
 	// ActiveConnectionIDLimit is the maximum number of connection IDs from the peer that
 	// an endpoint is willing to store.
 	ActiveConnectionIDLimit uint64
-	// Maximum size of payload in a DATAGRAM frame the endpoint is willing to receive.
+	// MaxDatagramPayloadSize is the maximum size of payload in a DATAGRAM frame the endpoint
+	// is willing to receive. DATAGRAM is disabled when the value is zero.
+	// See https://quicwg.org/datagram/draft-ietf-quic-datagram.html#section-3
 	MaxDatagramPayloadSize uint64
-
+	// DisableActiveMigration indicates the endpoint does not support active connection migration.
 	DisableActiveMigration bool
 }
 
@@ -229,7 +248,7 @@ func (s *Parameters) unmarshal(data []byte) bool {
 		default:
 			// Unsupported parameter
 			debug("skip unsupported transport parameter 0x%x", param)
-			if !b.readVarint(&param) || !b.skip(int(param)) {
+			if !(b.readVarint(&param) && b.skip(int(param))) {
 				return false
 			}
 		}
@@ -362,11 +381,13 @@ func (s tlsExtension) empty() bool {
 type tlsHandshake struct {
 	tlsConfig *tls.Config
 	tlsConn   *tls13.Conn
-
-	packetNumberSpaces *[packetSpaceCount]packetNumberSpace
+	// packetNumberSpaces links to Conn.packetNumberSpaces.
+	packetNumberSpaces *[packetSpaceCount]*packetNumberSpace
+	// Keep track of current TLS level for sending.
+	writeLevel tls13.EncryptionLevel
 }
 
-func (s *tlsHandshake) init(config *tls.Config, packetNumberSpaces *[packetSpaceCount]packetNumberSpace, isClient bool) {
+func (s *tlsHandshake) init(config *tls.Config, packetNumberSpaces *[packetSpaceCount]*packetNumberSpace, isClient bool) {
 	s.tlsConfig = config
 	if isClient {
 		s.tlsConn = tls13.Client(s, s.tlsConfig)
@@ -390,8 +411,7 @@ func (s *tlsHandshake) HandshakeComplete() bool {
 }
 
 func (s *tlsHandshake) writeSpace() packetSpace {
-	level := s.tlsConn.WriteLevel()
-	switch level {
+	switch s.writeLevel {
 	case tls13.EncryptionLevelInitial:
 		return packetSpaceInitial
 	case tls13.EncryptionLevelHandshake:
@@ -403,7 +423,7 @@ func (s *tlsHandshake) writeSpace() packetSpace {
 		}
 		return packetSpaceApplication
 	default:
-		panic(sprint("unsupported tls encryption level ", level))
+		panic(sprint("unsupported tls encryption level ", s.writeLevel))
 	}
 }
 
@@ -418,12 +438,20 @@ func (s *tlsHandshake) reset(isClient bool) {
 
 func (s *tlsHandshake) ReadRecord(level tls13.EncryptionLevel, b []byte) (int, error) {
 	space := packetSpaceFromEncryptionLevel(level)
-	return s.packetNumberSpaces[space].cryptoStream.Read(b)
+	pnSpace := s.packetNumberSpaces[space]
+	if pnSpace == nil {
+		return 0, errInvalidPacket
+	}
+	return pnSpace.cryptoStream.Read(b)
 }
 
 func (s *tlsHandshake) WriteRecord(level tls13.EncryptionLevel, b []byte) (int, error) {
 	space := packetSpaceFromEncryptionLevel(level)
-	return s.packetNumberSpaces[space].cryptoStream.Write(b)
+	pnSpace := s.packetNumberSpaces[space]
+	if pnSpace == nil {
+		return 0, errInvalidPacket
+	}
+	return pnSpace.cryptoStream.Write(b)
 }
 
 func (s *tlsHandshake) SetReadSecret(level tls13.EncryptionLevel, readSecret []byte) error {
@@ -447,6 +475,7 @@ func (s *tlsHandshake) SetWriteSecret(level tls13.EncryptionLevel, writeSecret [
 	}
 	space := packetSpaceFromEncryptionLevel(level)
 	s.packetNumberSpaces[space].sealer.init(cipher, writeSecret)
+	s.writeLevel = level
 	return nil
 }
 

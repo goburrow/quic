@@ -79,6 +79,33 @@ func TestRecoveryLossOnReordering(t *testing.T) {
 	x.assertInFlight(0)
 }
 
+func TestRecoveryCongestion(t *testing.T) {
+	now := time.Now()
+	x := newLossRecoveryTest(t)
+	x.assertCongestionWindow(10 * initialMaxDatagramSize)
+
+	x.r.setMaxDatagramSize(1000)
+	x.assertCongestionWindow(10 * 1000)
+
+	x.r.congestion.onPacketSent(1000)
+	x.assertAppLimited(true)
+	x.assertSendAvail(9000)
+
+	for i := 1; i < initialWindowPackets; i++ {
+		x.r.congestion.onPacketSent(1000)
+	}
+	x.assertCongestionWindow(10000)
+	x.assertAppLimited(false)
+	x.r.congestion.onPacketAcked(2000, now)
+	x.assertCongestionWindow(12000)
+
+	x.r.congestion.onNewCongestionEvent(now, now)
+	x.assertCongestionWindow(6000)
+	x.r.congestion.onNewCongestionEvent(now, now)
+	x.assertCongestionWindow(6000)
+	x.assertSendAvail(0)
+}
+
 type lossRecoveryTest struct {
 	t *testing.T
 	r lossRecovery
@@ -126,6 +153,14 @@ func (x *lossRecoveryTest) assertInFlight(n uint64) {
 	}
 }
 
+func (x *lossRecoveryTest) assertSendAvail(n uint64) {
+	avail := x.r.availSend()
+	if avail != n {
+		x.t.Helper()
+		x.t.Fatalf("expect send available: %v, actual: %v", n, avail)
+	}
+}
+
 func (x *lossRecoveryTest) assertTimer(n time.Time) {
 	if !x.r.lossDetectionTimer.Equal(n) {
 		x.t.Helper()
@@ -149,5 +184,20 @@ func (x *lossRecoveryTest) assertRTT(latestRTT, smoothedRTT, rttVar, minRTT time
 	if x.r.minRTT != minRTT {
 		x.t.Helper()
 		x.t.Fatalf("expect min rtt: %v, actual: %v", minRTT, x.r.minRTT)
+	}
+}
+
+func (x *lossRecoveryTest) assertCongestionWindow(cwnd uint64) {
+	if x.r.congestion.congestionWindow != cwnd {
+		x.t.Helper()
+		x.t.Fatalf("expect congestion window: %v, actual: %v", cwnd, x.r.congestion.congestionWindow)
+	}
+}
+
+func (x *lossRecoveryTest) assertAppLimited(limited bool) {
+	appLimited := x.r.congestion.isAppLimited()
+	if appLimited != limited {
+		x.t.Helper()
+		x.t.Fatalf("expect app limited: %v, actual: %v", limited, appLimited)
 	}
 }

@@ -8,7 +8,7 @@ import (
 )
 
 // Supported log events
-// https://quiclog.github.io/internet-drafts/draft-marx-qlog-event-definitions-quic-h3.html
+// https://quicwg.org/qlog/draft-ietf-quic-qlog-quic-events.html
 const (
 	// Packet
 	logEventPacketReceived  = "packet_received"
@@ -155,7 +155,7 @@ func (s LogField) String() string {
 
 // Log connection state
 
-func logConnectionState(e *LogEvent, old, new ConnectionState) {
+func logConnectionState(e *LogEvent, old, new connectionState) {
 	e.addField("old", old.String())
 	e.addField("new", new.String())
 }

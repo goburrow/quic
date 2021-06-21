@@ -44,7 +44,7 @@ func TestStreamRecv(t *testing.T) {
 		t.Fatalf("expect not readable: %v", &s)
 	}
 	// Receive wrong offset
-	s.flow.maxRecv++
+	s.flow.recvMax++
 	err = s.pushRecv(b[:1], 10, true)
 	if err != errFinalSize {
 		t.Fatalf("expect error %v, actual %v", errFinalSize, err)
@@ -132,7 +132,7 @@ func TestStreamSend(t *testing.T) {
 		t.Fatalf("expect flushable %v, actual %v", false, s.isFlushable())
 	}
 	// Cannot send more data
-	s.flow.maxSend++
+	s.flow.sendMax++
 	n, err = s.Write(b[:1])
 	if n != 0 || err != errFinalSize {
 		t.Fatalf("expect write %v %v, actual %v %v", 0, errFinalSize, n, err)
@@ -315,31 +315,31 @@ func TestStreamLocalBidi(t *testing.T) {
 	if err != nil || n != 10 {
 		t.Fatalf("expect write %v %v, actual %v %v", 10, nil, n, err)
 	}
-	if s.flow.totalSend != 10 {
-		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.totalSend)
+	if s.flow.sendTotal != 10 {
+		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.sendTotal)
 	}
 	// Send too much data
 	n, err = s.Write(b[:1])
 	if err != nil || n != 0 {
 		t.Fatalf("expect nothing written, actual %v %v", n, err)
 	}
-	if s.flow.totalSend != 10 {
-		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.totalSend)
+	if s.flow.sendTotal != 10 {
+		t.Fatalf("expect flow send %v, actual %v", 10, s.flow.sendTotal)
 	}
 	// Receive data
 	err = s.pushRecv(b[:4], 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.flow.totalRecv != 4 {
-		t.Fatalf("expect flow recv %d, actual %v", 4, s.flow.totalRecv)
+	if s.flow.recvTotal != 4 {
+		t.Fatalf("expect flow recv %d, actual %v", 4, s.flow.recvTotal)
 	}
 	n, err = s.Read(b)
 	if n != 4 || err != nil {
 		t.Fatalf("expect read %v %v, actual %v %v", 4, nil, n, err)
 	}
-	if s.flow.maxRecvNext != 14 {
-		t.Fatalf("expect flow recv next %v, actual %v", 14, s.flow.maxRecvNext)
+	if s.flow.recvMaxNext != 14 {
+		t.Fatalf("expect flow recv next %v, actual %v", 14, s.flow.recvMaxNext)
 	}
 }
 
@@ -389,15 +389,15 @@ func TestStreamRemoteUni(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.flow.totalRecv != 15 {
-		t.Fatalf("expect flow recv %v, actual %v", 15, s.flow.totalRecv)
+	if s.flow.recvTotal != 15 {
+		t.Fatalf("expect flow recv %v, actual %v", 15, s.flow.recvTotal)
 	}
 	err = s.pushRecv(b, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.flow.totalRecv != 15 {
-		t.Fatalf("expect flow recv %v, actual %v", 15, s.flow.totalRecv)
+	if s.flow.recvTotal != 15 {
+		t.Fatalf("expect flow recv %v, actual %v", 15, s.flow.recvTotal)
 	}
 	// Exceeds limits
 	err = s.pushRecv(b, 11, false)

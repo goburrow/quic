@@ -29,7 +29,6 @@ package quic
 
 import (
 	"crypto/rand"
-	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -41,7 +40,7 @@ import (
 
 const (
 	maxDatagramSize = transport.MaxIPv6PacketSize
-	cidLength       = 16 // or use transport.MaxCIDLength
+	cidLength       = transport.MaxCIDLength
 	bufferSize      = 1500
 )
 
@@ -77,12 +76,6 @@ type Handler interface {
 type noopHandler struct{}
 
 func (s noopHandler) Serve(*Conn, []transport.Event) {}
-
-// ConnectionState records details about the connection.
-type ConnectionState struct {
-	TLS tls.ConnectionState
-	// TODO: More info
-}
 
 // Conn is a QUIC connection presenting a peer connected to this client or server.
 // Conn is not safe for concurrent use.
@@ -129,10 +122,8 @@ func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn, isClient bo
 }
 
 // ConnectionState returns details about the connection.
-func (s *Conn) ConnectionState() ConnectionState {
-	return ConnectionState{
-		TLS: s.conn.HandshakeState(),
-	}
+func (s *Conn) ConnectionState() transport.ConnectionState {
+	return s.conn.ConnectionState()
 }
 
 // StreamWrite adds data to the stream buffer for sending.
@@ -566,13 +557,13 @@ func (s *localConn) LocalAddr() net.Addr {
 func (s *localConn) handleConn(c *Conn) {
 	defer s.connClosed(c)
 	established := false
-	for c.conn.ConnectionState() != transport.StateClosed {
+	for !c.conn.IsClosed() {
 		s.pollConn(c)
 		if established {
 			s.serveConn(c)
 		} else {
 			// First time state switched to active
-			if c.conn.ConnectionState() == transport.StateActive {
+			if c.conn.HandshakeComplete() {
 				// Handshake done, remove the attempt key
 				if c.attemptKey != nil {
 					s.peersMu.Lock()
@@ -619,14 +610,13 @@ func (s *localConn) pollConn(c *Conn) {
 		return
 	}
 	// Maybe another packets arrived too while we processed the first one.
-	s.pollConnDelay(c)
+	if c.conn.HandshakeComplete() {
+		// Only for application space
+		s.pollConnDelay(c)
+	}
 }
 
 func (s *localConn) pollConnDelay(c *Conn) {
-	if c.conn.ConnectionState() != transport.StateActive {
-		// Only for application space
-		return
-	}
 	// TODO: check whether we only need to send back ACK, then we can delay it.
 	timer := time.NewTimer(2 * time.Millisecond) // FIXME: timer granularity
 	defer timer.Stop()

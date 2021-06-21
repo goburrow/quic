@@ -22,6 +22,8 @@ const (
 	InvalidToken            uint64 = 0xb
 	ApplicationError        uint64 = 0xc
 	CryptoBufferExceeded    uint64 = 0xd
+	KeyUpdateError          uint64 = 0xe
+	AEADLimitReached        uint64 = 0xf
 	CryptoError             uint64 = 0x100
 )
 
@@ -40,6 +42,8 @@ var errorText = map[uint64]string{
 	InvalidToken:            "invalid_token",
 	ApplicationError:        "application_error",
 	CryptoBufferExceeded:    "crypto_buffer_exceeded",
+	KeyUpdateError:          "key_update_error",
+	AEADLimitReached:        "aead_limit_reached",
 	CryptoError:             "crypto_error",
 }
 
@@ -78,14 +82,16 @@ func newError(code uint64, msg string) *Error {
 
 // packetDroppedError is the error returned when received packet is dropped
 // due to invalid or corrupted.
-type packetDroppedError string
+type packetDroppedError struct {
+	trigger string
+}
 
 func (s packetDroppedError) Error() string {
-	return "packet_dropped: " + string(s)
+	return "packet_dropped: " + s.trigger
 }
 
 func newPacketDroppedError(trigger string) packetDroppedError {
-	return packetDroppedError(trigger)
+	return packetDroppedError{trigger}
 }
 
 // IsPacketDropped returns true (and reason) if err is a packet dropped so
@@ -93,7 +99,7 @@ func newPacketDroppedError(trigger string) packetDroppedError {
 // This function should only be used for error returned by Conn.Write.
 func IsPacketDropped(err error) (string, bool) {
 	if err, ok := err.(packetDroppedError); ok {
-		return string(err), true
+		return err.trigger, true
 	}
 	return "", false
 }

@@ -100,8 +100,8 @@ func (serverCommand) Run(args []string) error {
 		server.SetLogger(*logLevel, logFd)
 	}
 
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGQUIT)
+	sigCh := make(chan os.Signal, 3)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		<-sigCh
 		server.Close()

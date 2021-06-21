@@ -86,6 +86,26 @@ func packetTypeFromSpace(space packetSpace) packetType {
 	}
 }
 
+func packetTypeHeaderFlag(typ packetType) uint8 {
+	switch typ {
+	case packetTypeInitial:
+		return 0xc0
+	case packetTypeZeroRTT:
+		return 0xd0
+	case packetTypeHandshake:
+		return 0xe0
+	case packetTypeRetry:
+		// XXX: Unused bits are suggested being random
+		return 0xf0
+	case packetTypeVersionNegotiation:
+		return 0xc0
+	case packetTypeOneRTT:
+		return 0x40
+	default:
+		return 0
+	}
+}
+
 // Packet number length bits are same position in both short and long header packet.
 func packetNumberLenFromHeader(b uint8) int {
 	return int(b&0x03) + 1
@@ -93,6 +113,21 @@ func packetNumberLenFromHeader(b uint8) int {
 
 func packetNumberLenHeaderFlag(n int) uint8 {
 	return uint8(n - 1)
+}
+
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3.1
+func keyPhaseFromHeader(b uint8) uint8 {
+	if b&0x04 == 0 {
+		return 0
+	}
+	return 1
+}
+
+func keyPhaseHeaderFlag(n uint8) uint8 {
+	if n == 0 {
+		return 0
+	}
+	return 0x04
 }
 
 // packetHeader is the version-independent header of QUIC packets.
@@ -226,6 +261,45 @@ type packet struct {
 	payloadLen   int
 }
 
+// setType resets type of the packet. It would be called before all other setters.
+func (s *packet) setType(typ packetType) {
+	s.typ = typ
+	s.header.flags = packetTypeHeaderFlag(typ)
+}
+
+// setPacketNumber sets packet number and header flag for the length of that packet number.
+func (s *packet) setPacketNumber(packetNumber uint64) {
+	s.packetNumber = packetNumber
+	switch s.typ {
+	case packetTypeInitial:
+		s.header.flags |= packetNumberLenHeaderFlag(packetNumberLen(packetNumber))
+	case packetTypeZeroRTT:
+		s.header.flags |= packetNumberLenHeaderFlag(packetNumberLen(packetNumber))
+	case packetTypeHandshake:
+		s.header.flags |= packetNumberLenHeaderFlag(packetNumberLen(packetNumber))
+	case packetTypeOneRTT:
+		s.header.flags |= packetNumberLenHeaderFlag(packetNumberLen(packetNumber))
+	}
+}
+
+// setKeyPhase sets key phase bit.
+func (s *packet) setKeyPhase(n uint8) {
+	switch s.typ {
+	case packetTypeOneRTT:
+		s.header.flags |= keyPhaseHeaderFlag(n)
+	}
+}
+
+// keyPhase returns key phase bit from short header packet.
+func (s *packet) keyPhase() uint8 {
+	switch s.typ {
+	case packetTypeOneRTT:
+		return keyPhaseFromHeader(s.header.flags)
+	default:
+		return 0
+	}
+}
+
 func (s *packet) encodedLen() int {
 	switch s.typ {
 	case packetTypeInitial:
@@ -245,21 +319,6 @@ func (s *packet) encodedLen() int {
 
 func (s *packet) encode(b []byte) (int, error) {
 	// Header
-	switch s.typ {
-	case packetTypeInitial:
-		s.header.flags = 0xc0 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
-	case packetTypeZeroRTT:
-		s.header.flags = 0xd0 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
-	case packetTypeHandshake:
-		s.header.flags = 0xe0 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
-	case packetTypeRetry:
-		// XXX: Unused bits are suggested being random
-		s.header.flags = 0xf0
-	case packetTypeVersionNegotiation:
-		s.header.flags = 0xc0
-	case packetTypeOneRTT:
-		s.header.flags = 0x40 | packetNumberLenHeaderFlag(packetNumberLen(s.packetNumber))
-	}
 	n, err := s.header.encode(b)
 	if err != nil {
 		return 0, err
@@ -472,13 +531,13 @@ func NegotiateVersion(b, dcid, scid []byte) (int, error) {
 		return 0, newError(ProtocolViolation, "cid too long")
 	}
 	p := packet{
-		typ: packetTypeVersionNegotiation,
 		header: packetHeader{
 			dcid: dcid,
 			scid: scid,
 		},
 		supportedVersions: supportedVersions[:],
 	}
+	p.setType(packetTypeVersionNegotiation)
 	return p.encode(b)
 }
 
@@ -716,7 +775,6 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 	}
 	offset := enc.offset()
 	p := packet{
-		typ: packetTypeRetry,
 		header: packetHeader{
 			version: supportedVersions[0],
 			dcid:    dcid,
@@ -724,6 +782,7 @@ func Retry(b, dcid, scid, odcid, token []byte) (int, error) {
 		},
 		token: token,
 	}
+	p.setType(packetTypeRetry)
 	n, err := p.encode(b[offset:])
 	if err != nil {
 		return 0, err
@@ -825,26 +884,38 @@ type packetNumberSpace struct {
 
 	opener packetProtection
 	sealer packetProtection
+	// Opener from the previous key phase
+	prevOpener *packetProtection
+	// AEAD confidentiality limit
+	encryptedPackets    uint64 // Number of encrypted packets for current key.
+	maxEncryptedPackets uint64 // Maximum number of encrypted packets for each key.
 
 	cryptoStream Stream
+	// keyPhase is the current key phase for application packet number space, either 0 or 1.
+	keyPhase           uint8
+	keyUpdatePermitted bool
 
 	// ackElicited indicates received packets need to be acknowledged.
 	ackElicited bool
 }
 
+func newPacketNumberSpace() *packetNumberSpace {
+	s := &packetNumberSpace{}
+	s.init()
+	return s
+}
+
 func (s *packetNumberSpace) init() {
 	s.cryptoStream.init(true, true)
 	s.cryptoStream.flow.init(cryptoMaxData, cryptoMaxData)
+	s.maxEncryptedPackets = maxEncryptedPackets
 }
 
+// reset is only used for packet space Initial.
 func (s *packetNumberSpace) reset() {
 	s.cryptoStream = Stream{}
 	s.init()
 	s.ackElicited = false
-}
-
-func (s *packetNumberSpace) drop() {
-	*s = packetNumberSpace{}
 }
 
 func (s *packetNumberSpace) canEncrypt() bool {
@@ -859,6 +930,10 @@ func (s *packetNumberSpace) encryptPacket(b []byte, p *packet) {
 	}
 	pnOffset := len(b) - p.payloadLen - packetNumberLen(p.packetNumber)
 	s.sealer.encryptHeader(b, pnOffset)
+	s.encryptedPackets++
+	if s.encryptedPackets > s.maxEncryptedPackets && s.keyUpdatePermitted {
+		s.updateKey()
+	}
 }
 
 func (s *packetNumberSpace) canDecrypt() bool {
@@ -876,6 +951,7 @@ func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Header is now decrypted to b, reset its flags and other values.
 	p.header.flags = b[0]
 	n, err := p.decodeBody(b)
 	if err != nil {
@@ -884,9 +960,36 @@ func (s *packetNumberSpace) decryptPacket(b []byte, p *packet) ([]byte, error) {
 	pnLen := packetNumberLenFromHeader(p.header.flags)
 	p.packetNumber = decodePacketNumber(s.largestRecvPacketNumber, p.packetNumber, pnLen)
 	p.packetSize = p.headerLen + n + p.payloadLen
-	payload, err := s.opener.decryptPayload(b[:p.packetSize], p.packetNumber, p.payloadLen)
+	// Key phase bit is only available in OneRTT packet. For other packets,
+	// this value is always 0 so the result is false.
+	newKeyPhase := p.keyPhase() != s.keyPhase
+	opener := &s.opener
+	if newKeyPhase {
+		if s.prevOpener == nil {
+			// Peer initiated key update.
+			newOpener := s.opener
+			newOpener.updateKey()
+			opener = &newOpener
+		} else {
+			// The packet is received before the connection updated key.
+			opener = s.prevOpener
+		}
+	}
+	payload, err := opener.decryptPayload(b[:p.packetSize], p.packetNumber, p.payloadLen)
 	if err != nil {
 		return nil, err
+	}
+	if newKeyPhase {
+		if s.prevOpener == nil {
+			// Successfully decrypted, update key phase
+			s.replaceReadKey(opener)
+			s.updateWriteKey()
+		}
+	} else {
+		if s.prevOpener != nil {
+			// Got peer packet in current phase, remove previous key.
+			s.prevOpener = nil
+		}
 	}
 	return payload, nil
 }
@@ -904,6 +1007,44 @@ func (s *packetNumberSpace) onPacketReceived(pn uint64, now time.Time) {
 	if pn > s.largestRecvPacketNumber {
 		s.largestRecvPacketNumber = pn
 	}
+}
+
+// updateKey initiates a Key Update. This must be called only in Application space.
+// https://www.rfc-editor.org/rfc/rfc9001.html#section-6
+func (s *packetNumberSpace) updateKey() {
+	if s.prevOpener != nil {
+		// Previous key phase has not finished.
+		return
+	}
+	s.updateReadKey()
+	s.updateWriteKey()
+}
+
+func (s *packetNumberSpace) replaceReadKey(newOpener *packetProtection) {
+	s.opener = *newOpener
+}
+
+func (s *packetNumberSpace) updateReadKey() {
+	// Retain old keys for some time.
+	prevOpener := s.opener
+	s.opener.updateKey()
+	s.prevOpener = &prevOpener
+}
+
+func (s *packetNumberSpace) updateWriteKey() {
+	s.sealer.updateKey()
+	// Toggle key phase when write key is updated
+	if s.keyPhase == 0 {
+		s.keyPhase = 1
+	} else {
+		s.keyPhase = 0
+	}
+	// Reset counter
+	s.encryptedPackets = 0
+}
+
+func (s *packetNumberSpace) setKeyUpdatePermitted() {
+	s.keyUpdatePermitted = true
 }
 
 func (s *packetNumberSpace) ready() bool {

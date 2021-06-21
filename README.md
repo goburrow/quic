@@ -22,7 +22,7 @@ licensed under the 3-clause BSD license.
 - [X] Anti-amplification
 - [X] Unreliable datagram
 - [X] qlog
-- [ ] Key update
+- [X] Key update
 - [ ] Connection migration
 - [ ] Path MTU discovery
 - [ ] Zero RTT
@@ -65,7 +65,7 @@ config := transport.NewConfig()
 client, err := transport.Connect(scid, config)
 ```
 ```go
-for { // Loop until the connection is closed
+for !conn.IsClosed() { // Loop until the connection is closed
 	timeout := conn.Timeout()
 	// (A negative timeout means that the timer should be disarmed)
 	select {
@@ -116,6 +116,7 @@ func (handler) Serve(conn *quic.Conn, events []transport.Event) {
 ```
 
 ### Server
+See [cmd/quiwi/server.go](cmd/quiwi/server.go)
 
 ```
 Usage: quiwi server [arguments]
@@ -152,6 +153,7 @@ Examples:
 Add `SSLKEYLOGFILE=key.log` to have TLS keys logged to file.
 
 ### Client
+See [cmd/quiwi/client.go](cmd/quiwi/client.go)
 
 ```
 Usage: quiwi client [arguments] <url>
@@ -177,6 +179,7 @@ Examples
 ```
 
 ### Datagram
+See [cmd/quiwi/datagram.go](cmd/quiwi/datagram.go)
 
 ```
 Usage: quiwi datagram [arguments] [url]

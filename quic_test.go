@@ -146,6 +146,7 @@ func TestClientCloseHandshake(t *testing.T) {
 	defer c.Close()
 	go c.Serve()
 
+	// TODO: Check cert error and smaller server draining timeout
 	err := c.Connect(s.LocalAddr().String())
 	if err != nil {
 		t.Fatal(err)

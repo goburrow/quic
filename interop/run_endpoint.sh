@@ -14,13 +14,12 @@ DLDIR="/downloads"
 if [ -z "$QLOGDIR" ]; then
     QLOGDIR="$LOGDIR"
 fi
-#MULTIPROCESS=1
 
 case "$TESTCASE" in
-    handshake | transfer | multiconnect | retry | chacha20 | resumption)
+    handshake | transfer | multiconnect | retry | chacha20 | resumption | keyupdate)
         echo "test case supported:" "$TESTCASE"
         ;;
-    zerortt | http3 | keyupdate)
+    zerortt | http3)
         echo "test case not supported:" "$TESTCASE"
         exit 127
         ;;
@@ -31,32 +30,16 @@ case "$TESTCASE" in
 esac
 
 run_client() {
-    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3"
+    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3 -qlog $QLOGDIR/client.qlog"
     case "$TESTCASE" in
-    multiconnect)
-        if [ "$MULTIPROCESS" = 1 ]; then
-            # Fork a new process for each connection.
-            for REQ in $REQUESTS; do
-                NAME="$(basename $REQ)"
-                PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client-$NAME.qlog"
-                echo "# CLIENT_PARAMS: $PARAMS"
-                "$APPDIR/quiwi" client $PARAMS "$REQ" 2>>"$LOGDIR/client.txt" &
-                sleep 2
-            done
-            wait
-            return
-        else
-            CLIENT_PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client.qlog"
-        fi
-        ;;
-    resumption)
-        CLIENT_PARAMS="$CLIENT_PARAMS -qlog $QLOGDIR/client.qlog"
-        ;;
     chacha20)
-        CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256 -multi -qlog $QLOGDIR/client.qlog"
+        CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256"
         ;;
-    *)
-        CLIENT_PARAMS="$CLIENT_PARAMS -multi -qlog $QLOGDIR/client.qlog"
+    keyupdate)
+        CLIENT_PARAMS="$CLIENT_PARAMS -keyupdate 100"
+        ;;
+    transfer)
+        CLIENT_PARAMS="$CLIENT_PARAMS -multi"
         ;;
     esac
     echo "# CLIENT_PARAMS:" "$CLIENT_PARAMS"
@@ -64,7 +47,7 @@ run_client() {
 }
 
 run_server() {
-    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert /certs/cert.pem -key /certs/priv.key -root $WWWDIR -qlog $QLOGDIR/server.qlog -v 3"
+    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert /certs/cert.pem -key /certs/priv.key -root $WWWDIR -v 3 -qlog $QLOGDIR/server.qlog"
     case "$TESTCASE" in
     retry)
         SERVER_PARAMS="$SERVER_PARAMS -retry"

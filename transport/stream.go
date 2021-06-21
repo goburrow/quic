@@ -45,8 +45,8 @@ func (s *Stream) init(local, bidi bool) {
 
 // pushRecv checks for maximum data can be received and pushes data to recv stream.
 func (s *Stream) pushRecv(data []byte, offset uint64, fin bool) error {
-	if offset+uint64(len(data)) > s.flow.maxRecv {
-		return newError(FlowControlError, sprint("stream: data exceeded ", s.flow.maxRecv))
+	if offset+uint64(len(data)) > s.flow.recvMax {
+		return newError(FlowControlError, sprint("stream: data exceeded ", s.flow.recvMax))
 	}
 	err := s.recv.push(data, offset, fin)
 	if err == nil {
@@ -62,12 +62,12 @@ func (s *Stream) Read(b []byte) (int, error) {
 	if n > 0 {
 		// A receiver could use the current offset of data consumed to determine the
 		// flow control offset to be advertised.
-		s.flow.addMaxRecvNext(uint64(n))
+		s.flow.addRecvMaxNext(uint64(n))
 		if s.connFlow != nil {
-			s.connFlow.addMaxRecvNext(uint64(n))
+			s.connFlow.addRecvMaxNext(uint64(n))
 		}
 		// Only tell peer to update max data when the stream is consumed.
-		if !s.recv.fin && s.flow.shouldUpdateMaxRecv() {
+		if !s.recv.fin && s.flow.shouldUpdateRecvMax() {
 			s.updateMaxData = true
 		}
 	}
@@ -82,7 +82,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 	if s.send.stopReceived || s.send.resetStream != deliveryNone {
 		return 0, newError(StreamStateError, sprint("sending terminated: ", s.send.resetError))
 	}
-	n := int(s.flow.canSend())
+	n := int(s.flow.availSend())
 	if n == 0 {
 		return 0, nil
 	}
@@ -93,6 +93,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 	if n > 0 {
 		// Keep flow sent bytes in sync with read offset of the stream
 		s.flow.setSend(s.send.length)
+		// TODO: Send stream blocked frame
 	}
 	return n, err
 }
@@ -132,14 +133,14 @@ func (s *Stream) resetRecv(finalSize uint64) error {
 func (s *Stream) isWritable() bool {
 	// XXX: To avoid over buffer, we only tell application to fill the send buffer
 	// when there is only some data left (8KB) to send.
-	return s.flow.canSend() > 0 && s.send.buf.size() < minStreamBufferWritable &&
+	return s.flow.availSend() > 0 && s.send.buf.size() < minStreamBufferWritable &&
 		!s.send.fin && s.send.resetStream == deliveryNone && !s.send.stopReceived
 }
 
 // isFlushable returns true if the stream has data and is allowed to send.
 func (s *Stream) isFlushable() bool {
 	// flow maxSend is controlled by peer via MAX_STREAM_DATA.
-	return !s.send.stopReceived && (s.send.ready(s.flow.maxSend) || (s.send.fin && !s.send.finSent))
+	return !s.send.stopReceived && (s.send.ready(s.flow.sendMax) || (s.send.fin && !s.send.finSent))
 }
 
 // popSend returns continuous data from send buffer that size less than max bytes.
@@ -166,7 +167,7 @@ func (s *Stream) ackSend(offset, length uint64) bool {
 	return s.send.complete()
 }
 
-// ackMaxData acknowledges that the MAX_STREAM_DATA frame delivery is confirmed.
+// setUpdateMaxData sets whether the MAX_STREAM_DATA should be sent.
 func (s *Stream) setUpdateMaxData(update bool) {
 	s.updateMaxData = update
 }
@@ -193,8 +194,8 @@ func (s *Stream) stopSend(errorCode uint64) {
 
 // isClosed returns true if both receiving and sending are closed and the stream is no longer needed.
 func (s *Stream) isClosed() bool {
-	return (s.flow.maxRecv == 0 || s.recv.isClosed()) &&
-		(s.flow.maxSend == 0 || s.send.isClosed())
+	return (s.flow.recvMax == 0 || s.recv.isClosed()) &&
+		(s.flow.sendMax == 0 || s.send.isClosed())
 }
 
 // CloseWrite resets the stream (abrupt termination) the sending part of the stream.
@@ -610,7 +611,8 @@ func (s *streamMap) hasUpdate() bool {
 		return true
 	}
 	for _, st := range s.streams {
-		if st.isFlushable() {
+		if st.isFlushable() || st.updateMaxData ||
+			st.flow.shouldUpdateRecvMax() || st.flow.sendBlocked {
 			return true
 		}
 	}

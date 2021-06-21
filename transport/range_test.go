@@ -32,6 +32,8 @@ func TestRangeSetPush(t *testing.T) {
 		x.assertSnapshot(d.s)
 		x.assertContain(d.m)
 		x.assertContain(d.n)
+		x.assertNotContain(14)
+		x.assertNotContain(31)
 	}
 }
 
@@ -52,6 +54,7 @@ func TestRangeSetRemoveUntil(t *testing.T) {
 		x.ls.removeUntil(d.n)
 		x.assertSnapshot(d.s)
 		x.assertNotContain(d.n)
+		x.assertNotContain(11)
 	}
 }
 

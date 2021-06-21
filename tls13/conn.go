@@ -301,14 +301,6 @@ func (c *Conn) connectionStateLocked() tls.ConnectionState {
 	return state
 }
 
-func (c *Conn) ReadLevel() EncryptionLevel {
-	return c.in.encryptionLevel
-}
-
-func (c *Conn) WriteLevel() EncryptionLevel {
-	return c.out.encryptionLevel
-}
-
 func (c *Conn) Alert() uint8 {
 	return uint8(c.alert)
 }
