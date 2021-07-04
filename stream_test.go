@@ -3,6 +3,8 @@ package quic
 import (
 	"bytes"
 	"io"
+	"math/rand"
+	"net"
 	"testing"
 	"time"
 
@@ -179,10 +181,10 @@ func TestStreamWriteTimeout(t *testing.T) {
 		t.Fatalf("expect write error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
 	}
 
-	st.setClosed()
+	st.setClosed(io.ErrUnexpectedEOF, nil)
 	n, err = st.Write(nil)
-	if n != 0 || err != errClosed {
-		t.Fatalf("expect write error: %v, actual %v", errClosed, err)
+	if n != 0 || err != io.ErrUnexpectedEOF {
+		t.Fatalf("expect write error: %v, actual %v", io.ErrUnexpectedEOF, err)
 	}
 
 	select {
@@ -275,10 +277,10 @@ func TestStreamReadTimeout(t *testing.T) {
 		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
 	}
 
-	st.setClosed()
+	st.setClosed(io.ErrUnexpectedEOF, nil)
 	n, err = st.Read(nil)
-	if n != 0 || err != errClosed {
-		t.Fatalf("expect read error: %v, actual %v", errClosed, err)
+	if n != 0 || err != io.ErrUnexpectedEOF {
+		t.Fatalf("expect read error: %v, actual %v", io.ErrUnexpectedEOF, err)
 	}
 	select {
 	case <-done:
@@ -350,10 +352,80 @@ func TestStreamClose(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	st.setClosed()
+	st.setClosed(io.EOF, nil)
 	err = st.Close()
-	if err != errClosed {
-		t.Fatalf("expect close error: %v, actual %v", errClosed, err)
+	if err != io.EOF {
+		t.Fatalf("expect close error: %v, actual %v", io.EOF, err)
+	}
+}
+
+func TestStreamConnectionClose(t *testing.T) {
+	conn := newRemoteConn(nil, nil, nil, false)
+	defer close(conn.cmdCh)
+	st := newStream(conn, 1)
+
+	go func() {
+		c := <-conn.cmdCh
+		if c.cmd != cmdStreamRead || c.id != 1 {
+			t.Errorf("unexpected command: %+v", c)
+		}
+		r := bytes.NewReader([]byte("readclose"))
+		st.recvReadData(r)
+		st.sendReadResult(nil)
+		st.setClosed(net.ErrClosed, r)
+	}()
+
+	data := make([]byte, 4)
+	n, err := st.Read(data)
+	if n != 4 || err != nil || string(data[:n]) != "read" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 4, nil, "read", n, err, string(data[:n]))
+	}
+	n, err = st.Read(data)
+	if n != 4 || err != nil || string(data[:n]) != "clos" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 4, nil, "clos", n, err, string(data[:n]))
+	}
+	n, err = st.Read(data)
+	if n != 1 || err != nil || string(data[:n]) != "e" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 1, nil, "e", n, err, string(data[:n]))
+	}
+	n, err = st.Read(data)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 0, io.EOF, n, err)
+	}
+	n, err = st.Read(data)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 0, io.EOF, n, err)
+	}
+	n, err = st.Write(nil)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expect write: %v %v, actual: %v %v", 0, net.ErrClosed, n, err)
+	}
+}
+
+func TestStreamConnectionTerminate(t *testing.T) {
+	conn := newRemoteConn(nil, nil, nil, false)
+	defer close(conn.cmdCh)
+	st := newStream(conn, 1)
+
+	go func() {
+		c := <-conn.cmdCh
+		if c.cmd != cmdStreamRead || c.id != 1 {
+			t.Errorf("unexpected command: %+v", c)
+		}
+		r := bytes.NewReader([]byte("read"))
+		st.recvReadData(r)
+		st.sendReadResult(nil)
+		st.setClosed(net.ErrClosed, nopReader{})
+	}()
+
+	data := make([]byte, 4)
+	n, err := st.Read(data)
+	if n != 4 || err != nil || string(data[:n]) != "read" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 4, nil, "read", n, err, string(data[:n]))
+	}
+	n, err = st.Read(data)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 0, net.ErrClosed, n, err)
 	}
 }
 
@@ -380,10 +452,8 @@ func TestStream(t *testing.T) {
 		}
 	}
 
-	sendData := make([]byte, 10000)
-	for i := range sendData {
-		sendData[i] = uint8(i)
-	}
+	sendData := make([]byte, 100000)
+	rand.Read(sendData)
 	var recvData []byte
 	done := make(chan struct{})
 
@@ -408,13 +478,13 @@ func TestStream(t *testing.T) {
 	}
 
 	serverHandler := func(conn *Conn, events []transport.Event) {
-		t.Logf("server events: cid=%x %v", conn.scid, events)
+		// t.Logf("server events: cid=%x %v", conn.scid, events)
 		for _, e := range events {
 			switch e.Type {
 			case transport.EventStreamOpen:
-				st, err := conn.Stream(e.ID)
+				st, err := conn.Stream(e.Data)
 				if err != nil {
-					t.Errorf("server stream %v: %v", e.ID, err)
+					t.Errorf("server stream %v: %v", e.Data, err)
 					conn.Close()
 					return
 				}
@@ -423,7 +493,7 @@ func TestStream(t *testing.T) {
 		}
 	}
 	clientHandler := func(conn *Conn, events []transport.Event) {
-		t.Logf("client events: cid=%x %v", conn.scid, events)
+		// t.Logf("client events: cid=%x %v", conn.scid, events)
 		for _, e := range events {
 			switch e.Type {
 			case transport.EventConnOpen:
@@ -460,4 +530,118 @@ func TestStream(t *testing.T) {
 	if !bytes.Equal(recvData, sendData) {
 		t.Fatalf("received data different: send=%v recv=%v", len(sendData), len(recvData))
 	}
+}
+
+func BenchmarkStream(b *testing.B) {
+	streams := b.N
+	size := 1000000
+
+	serverConfig := newServerConfig()
+	serverConfig.Params.InitialMaxStreamsBidi = 0
+	serverConfig.Params.InitialMaxStreamsUni = uint64(streams)
+	serverConfig.Params.InitialMaxStreamDataUni = uint64(size)
+	serverConfig.Params.InitialMaxData = uint64(size * streams)
+	s, c := newPipe(serverConfig, nil)
+	defer s.Close()
+	go s.Serve()
+
+	defer c.Close()
+	go c.Serve()
+
+	done := make(chan struct{}, streams)
+
+	recvFn := func(st *Stream) {
+		n, err := io.Copy(io.Discard, st)
+		if int(n) != size || err != nil {
+			b.Errorf("expect server write to: %v %v, actual: %v %v", size, nil, n, err)
+			st.CloseRead(1)
+			return
+		}
+		st.Close()
+	}
+	sendFn := func(st *Stream) {
+		data := stubReader{size: size}
+		n, err := io.Copy(st, &data)
+		if int(n) != size || err != nil {
+			b.Errorf("expect client read from: %v %v, actual: %v %v", size, nil, n, err)
+			return
+		}
+		st.Close()
+	}
+
+	s.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
+		for _, e := range events {
+			switch e.Type {
+			case transport.EventStreamOpen:
+				st, _ := conn.Stream(e.Data)
+				go recvFn(st)
+			}
+		}
+	}))
+
+	c.SetHandler(handlerFunc(func(conn *Conn, events []transport.Event) {
+		for _, e := range events {
+			switch e.Type {
+			case transport.EventStreamOpen:
+				b.ResetTimer()
+			case transport.EventStreamCreatable:
+				if e.Data != 0 { // uni stream
+					count := 0
+					if conn.UserData() != nil {
+						count = conn.UserData().(int)
+					}
+					if count < streams {
+						id, ok := conn.NewStream(false)
+						if ok {
+							st, _ := conn.Stream(id)
+							go sendFn(st)
+							count++
+							conn.SetUserData(count)
+						}
+					}
+				}
+			case transport.EventStreamComplete:
+				done <- struct{}{}
+			}
+		}
+	}))
+
+	//c.SetLogger(int(levelDebug), os.Stdout)
+	err := c.Connect(s.LocalAddr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for i := streams; i > 0; i-- {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			b.Fatal("timed out")
+			return
+		}
+	}
+	b.StopTimer()
+}
+
+type stubReader struct {
+	size int
+	read int
+}
+
+func (s *stubReader) Read(b []byte) (int, error) {
+	n := len(b)
+	if n > s.size-s.read {
+		n = s.size - s.read
+	}
+	s.read += n
+	if s.read == s.size {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+type nopReader struct{}
+
+func (s nopReader) Read(b []byte) (int, error) {
+	return 0, nil
 }

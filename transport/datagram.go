@@ -24,22 +24,10 @@ type Datagram struct {
 // This value is specified in the connection event EventDatagramWritable.
 func (s *Datagram) Write(b []byte) (int, error) {
 	if len(b) > s.maxSend {
-		return 0, newError(ApplicationError, sprint("max_datagram_payload_size ", s.maxSend))
+		return 0, newError(ApplicationError, sprint("datagram: payload size exceeded limit ", s.maxSend))
 	}
-	data := make([]byte, len(b))
-	copy(data, b)
-	s.send.push(data)
+	s.send.write(b)
 	return len(b), nil
-}
-
-// Push is similar to Write but does not create a copy of the data provided.
-// NOTE: Application must ensure b not being changed until this datagram is acknowledged or lost.
-func (s *Datagram) Push(b []byte) error {
-	if len(b) > s.maxSend {
-		return newError(ApplicationError, sprint("max_datagram_payload_size ", s.maxSend))
-	}
-	s.send.push(b)
-	return nil
 }
 
 // Read reads received datagrams.
@@ -49,25 +37,15 @@ func (s *Datagram) Read(b []byte) (int, error) {
 	if s.recv.avail() > len(b) {
 		return 0, io.ErrShortBuffer
 	}
-	data := s.recv.pop()
-	n := copy(b, data)
+	n := s.recv.read(b)
 	return n, nil
-}
-
-// Pop returns received data or nil if it is empty.
-// Currently, only 32 datagrams is saved in the buffer.
-// If the application does not read the data, the oldest one will be discarded.
-func (s *Datagram) Pop() []byte {
-	return s.recv.pop()
 }
 
 func (s *Datagram) pushRecv(b []byte) error {
 	if len(b) > s.maxRecv {
-		return newError(ProtocolViolation, sprint("max_datagram_payload_size ", s.maxRecv))
+		return newError(ProtocolViolation, sprint("datagram: payload size exceeded limit ", s.maxRecv))
 	}
-	data := make([]byte, len(b))
-	copy(data, b)
-	s.recv.push(data)
+	s.recv.write(b)
 	return nil
 }
 
@@ -97,53 +75,64 @@ func (s *Datagram) setMaxRecv(max uint64) {
 }
 
 type datagramBuffer struct {
-	data [][]byte
+	data [maxDatagramBufferLen][]byte
 
 	w int // Writing index, data at w is always nil.
 	r int // Reading index, data at r is nil if there is nothing to read.
 }
 
-func (s *datagramBuffer) push(b []byte) {
-	// Can either extend the buffer or start over
-	if s.w < len(s.data) {
-		s.data[s.w] = b
-	} else {
-		s.data = append(s.data, b)
-	}
+func (s *datagramBuffer) write(b []byte) {
+	data := newDataBuffer(len(b))
+	copy(data, b)
+	s.data[s.w] = data
 	s.w++
-	if s.w >= maxDatagramBufferLen {
+	if s.w >= len(s.data) {
 		s.w = 0
 	}
 	if s.w == s.r {
 		// Slow read
-		s.data[s.r] = nil
+		if s.data[s.r] != nil {
+			freeDataBuffer(s.data[s.r])
+			s.data[s.r] = nil
+		}
 		s.r++
-		if s.r >= maxDatagramBufferLen {
+		if s.r >= len(s.data) {
 			s.r = 0
 		}
 	}
 }
 
+func (s *datagramBuffer) read(b []byte) int {
+	data := s.pop()
+	if data == nil {
+		return 0
+	}
+	n := copy(b, data)
+	freeDataBuffer(data)
+	return n
+}
+
 func (s *datagramBuffer) pop() []byte {
-	if s.r >= len(s.data) || s.data[s.r] == nil {
+	if s.data[s.r] == nil {
 		return nil
 	}
 	b := s.data[s.r]
 	s.data[s.r] = nil
 	s.r++
-	if s.r >= maxDatagramBufferLen {
+	if s.r >= len(s.data) {
 		s.r = 0
 	}
 	return b
 }
 
 func (s *datagramBuffer) avail() int {
-	if s.r < len(s.data) {
-		return len(s.data[s.r])
-	}
-	return 0
+	return len(s.data[s.r])
 }
 
 func (s *datagramBuffer) String() string {
-	return fmt.Sprintf("length=%d read=%d write=%d", len(s.data), s.r, s.w)
+	n := s.w - s.r
+	if n < 0 {
+		n += len(s.data)
+	}
+	return fmt.Sprintf("length=%d write=%d read=%d", n, s.w, s.r)
 }

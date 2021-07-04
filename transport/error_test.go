@@ -11,11 +11,11 @@ func TestErrorFormat(t *testing.T) {
 		msg  string
 		err  string
 	}{
-		{1, "no idea", "internal_error no idea"},
-		{12, "", "application_error"},
-		{0x100, "general", "crypto_error general"},
-		{0x1ff, "", "crypto_error_255"},
-		{0xffff, "unknown", "65535 unknown"},
+		{1, "no idea", "error_code=internal_error reason=no idea"},
+		{12, "", "error_code=application_error"},
+		{0x100, "general", "error_code=crypto_error reason=general"},
+		{0x1ff, "", "error_code=crypto_error_255"},
+		{0xffff, "unknown", "error_code=65535 reason=unknown"},
 	}
 	for _, d := range data {
 		err := newError(d.code, d.msg)

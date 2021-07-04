@@ -61,7 +61,7 @@ func TestFramePadding(t *testing.T) {
 	if n != 3 || err != nil {
 		t.Fatalf("expect decode: %v %v, actual: %v %v", 3, nil, n, err)
 	}
-	if int(*f) != 3 {
+	if f.length != 3 {
 		t.Fatalf("expect padding length: %v, actual: %v", 3, f)
 	}
 }
@@ -295,13 +295,13 @@ func TestFrameNewConnectionID(t *testing.T) {
 	b := make([]byte, 100)
 	f.connectionID = b[:MaxCIDLength+1]
 	n, err := f.encode(b)
-	if err == nil || err.Error() != "frame_encoding_error new_connection_id" {
+	if err == nil || err.Error() != "error_code=frame_encoding_error reason=new_connection_id" {
 		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
 	}
 	f.connectionID = b[:1]
 	f.statelessResetToken = b[:15]
 	n, err = f.encode(b)
-	if err == nil || err.Error() != "frame_encoding_error new_connection_id" {
+	if err == nil || err.Error() != "error_code=frame_encoding_error reason=new_connection_id" {
 		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
 	}
 }
@@ -321,7 +321,7 @@ func TestFramePathChallenge(t *testing.T) {
 	b := make([]byte, 100)
 	f.data = b[:7]
 	n, err := f.encode(b)
-	if err == nil || err.Error() != "frame_encoding_error path_challenge" {
+	if err == nil || err.Error() != "error_code=frame_encoding_error reason=path_challenge" {
 		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
 	}
 }
@@ -334,7 +334,7 @@ func TestFramePathResponse(t *testing.T) {
 	b := make([]byte, 100)
 	f.data = b[:9]
 	n, err := f.encode(b)
-	if err == nil || err.Error() != "frame_encoding_error path_response" {
+	if err == nil || err.Error() != "error_code=frame_encoding_error reason=path_response" {
 		t.Fatalf("expect error %v, actual %v %v", "frame_encoding_error", n, err)
 	}
 }

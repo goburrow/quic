@@ -126,12 +126,12 @@ func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 	defer freePacket(p)
 	n, err := transport.NegotiateVersion(p.buf[:], h.SCID, h.DCID)
 	if err != nil {
-		s.logger.log(levelError, "internal_error addr=%s %s description=version_negotiation_failed: %v", addr, h, err)
+		s.logger.log(levelError, "error addr=%s %s message=version_negotiation_failed: %v", addr, h, err)
 		return
 	}
 	n, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.log(levelError, "internal_error addr=%s %s description=version_negotiation_failed: %v", addr, h, err)
+		s.logger.log(levelError, "error addr=%s %s message=version_negotiation_failed: %v", addr, h, err)
 		return
 	}
 	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=version_negotiation dcid=%x scid=%x", addr, h.SCID, h.DCID)
@@ -144,19 +144,19 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	// newCID is a new DCID client should send in next Initial packet
 	var newCID [cidLength]byte
 	if err := s.rand(newCID[:]); err != nil {
-		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
+		s.logger.log(levelError, "error addr=%s %s message=retry_failed: %v", addr, h, err)
 		return
 	}
 	token := s.addrValid.GenerateToken(addr, h.DCID)
 	// Header => Retry: DCID => ODCID, SCID => DCID, newCID => SCID
 	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
 	if err != nil {
-		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
+		s.logger.log(levelError, "error addr=%s %s message=retry_failed: %v", addr, h, err)
 		return
 	}
 	n, err = s.socket.WriteTo(p.buf[:n], addr)
 	if err != nil {
-		s.logger.log(levelError, "internal_error addr=%s %s description=retry_failed: %v", addr, h, err)
+		s.logger.log(levelError, "error addr=%s %s message=retry_failed: %v", addr, h, err)
 		return
 	}
 	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=retry dcid=%x scid=%x odcid=%x token=%x", addr, h.SCID, newCID, h.DCID, token)
@@ -207,7 +207,7 @@ func (s *Server) handleNewConn(p *packet) {
 		freePacket(p)
 		return
 	}
-	if ec := s.peers[string(c.scid[:])]; ec != nil {
+	if ec := s.peers[string(c.scid)]; ec != nil {
 		// scid is randomly generated, but possible clash. Drop packet for now.
 		s.peersMu.Unlock()
 		s.logger.log(levelError, "packet_dropped addr=%s %s trigger=create_connection_failed message=generated cid conflict", p.addr, &p.header)
@@ -222,19 +222,21 @@ func (s *Server) handleNewConn(p *packet) {
 		ec.recvCh <- p
 		return
 	}
-	s.peers[string(c.scid[:])] = c
+	s.peers[string(c.scid)] = c
 	s.peers[string(c.attemptKey)] = c
 	s.peersMu.Unlock()
-	s.logger.log(levelInfo, "connection_started addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
+	s.logger.log(levelInfo, "connection_started vantage_point=server addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
 	c.recvCh <- p // Buffered channel
 	s.handleConn(c)
 }
 
-func (s *Server) newConn(addr net.Addr, scid, odcid []byte) (*Conn, error) {
+func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
 	// Generate id for new connection since short packets don't include CID length so
 	// we use a fixed length for all connections
-	if len(scid) != cidLength {
-		scid = make([]byte, cidLength)
+	scid := make([]byte, cidLength)
+	if len(oscid) == cidLength {
+		copy(scid, oscid)
+	} else {
 		if err := s.rand(scid); err != nil {
 			return nil, err
 		}

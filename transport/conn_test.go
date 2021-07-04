@@ -19,8 +19,9 @@ func TestClientConnInitialState(t *testing.T) {
 	config.Params.RetrySourceCID = []byte("abcdef")
 	config.Params.StatelessResetToken = []byte("xyz")
 	scid := []byte{1, 2, 3}
+	dcid := []byte{3, 2, 1}
 
-	c, err := Connect(scid, config)
+	c, err := Connect(scid, dcid, config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,8 +31,8 @@ func TestClientConnInitialState(t *testing.T) {
 	if !bytes.Equal(scid, c.localParams.InitialSourceCID) {
 		t.Fatalf("expect initial source cid %x, actual %#v", scid, c.localParams)
 	}
-	if len(c.dcid) != MaxCIDLength {
-		t.Fatalf("expect dcid generated, actual %x", c.dcid)
+	if !bytes.Equal(dcid, c.dcid) {
+		t.Fatalf("expect dcid %x, actual %x", dcid, c.dcid)
 	}
 	if c.localParams.OriginalDestinationCID != nil || c.localParams.RetrySourceCID != nil ||
 		c.localParams.StatelessResetToken != nil {
@@ -75,7 +76,7 @@ func TestHandshake(t *testing.T) {
 	clientConfig.TLS = &tls.Config{
 		InsecureSkipVerify: true,
 	}
-	client, err := Connect([]byte("client"), clientConfig)
+	client, err := Connect([]byte("client"), []byte("peer"), clientConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,14 +138,15 @@ func TestConnStream(t *testing.T) {
 	}
 	p.assertClientSend()
 	events := p.server.Events(nil)
-	if len(events) != 4 ||
+	if len(events) != 5 ||
 		events[0].Type != EventConnOpen ||
-		events[1].Type != EventStreamOpen || events[1].ID != 4 || events[1].Data != 1 ||
-		events[2].Type != EventStreamReadable || events[2].ID != 4 ||
-		events[3].Type != EventStreamWritable || events[3].ID != 4 {
+		events[1].Type != EventStreamOpen || events[1].Data != 4 ||
+		events[2].Type != EventStreamReadable || events[2].Data != 4 ||
+		events[3].Type != EventStreamWritable || events[3].Data != 4 ||
+		events[4].Type != EventStreamCreatable || events[4].Data != 3 {
 		t.Fatalf("events %+v", events)
 	}
-	streamID := events[1].ID
+	streamID := events[1].Data
 	st, err := p.server.Stream(streamID)
 	if err != nil {
 		t.Fatal(err)
@@ -170,10 +172,11 @@ func TestConnStream(t *testing.T) {
 	}
 	p.assertServerSend()
 	events = p.client.Events(nil)
-	if len(events) != 3 ||
+	if len(events) != 4 ||
 		events[0].Type != EventConnOpen ||
-		events[1].Type != EventStreamComplete || events[1].ID != 4 ||
-		events[2].Type != EventStreamReadable || events[2].ID != 4 {
+		events[1].Type != EventStreamComplete || events[1].Data != 4 ||
+		events[2].Type != EventStreamReadable || events[2].Data != 4 ||
+		events[3].Type != EventStreamCreatable || events[3].Data != 2 {
 		t.Fatalf("events %+v", events)
 	}
 	n, err = ct.Read(p.buf[:])
@@ -204,8 +207,8 @@ func TestConnSendMaxData(t *testing.T) {
 		data:     b,
 	}
 	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
-	if err == nil || err.Error() != "flow_control_error stream: connection data exceeded 200" {
-		t.Fatalf("expect error %v, actual %v", errorCodeString(FlowControlError), err)
+	if err == nil || err.Error() != "error_code=flow_control_error reason=stream: connection data exceeded limit 200" {
+		t.Fatalf("expect error %v, actual %v", "flow_control_error", err)
 	}
 	stream.data = b[:140]
 	_, err = s.recvFrameStream(encodeFrame(stream), testTime())
@@ -236,16 +239,20 @@ func TestInvalidConn(t *testing.T) {
 	validCID := invalidCID[:MaxCIDLength]
 	config := NewConfig()
 
-	_, err := Connect(validCID, nil)
-	if err == nil || err.Error() != "internal_error config required" {
+	_, err := Connect(validCID, nil, nil)
+	if err == nil || err.Error() != "error_code=internal_error reason=config required" {
+		t.Errorf("expect error, actual %+v", err)
+	}
+	_, err = Connect(validCID, invalidCID, config)
+	if err == nil || err.Error() != "error_code=protocol_violation reason=cid length exceeded 20" {
 		t.Errorf("expect error, actual %+v", err)
 	}
 	_, err = Accept(invalidCID, nil, config)
-	if err == nil || err.Error() != "protocol_violation cid too long" {
+	if err == nil || err.Error() != "error_code=protocol_violation reason=cid length exceeded 20" {
 		t.Errorf("expect error, actual %+v", err)
 	}
 	_, err = Accept(validCID, invalidCID, config)
-	if err == nil || err.Error() != "protocol_violation cid too long" {
+	if err == nil || err.Error() != "error_code=protocol_violation reason=cid length exceeded 20" {
 		t.Errorf("expect error, actual %+v", err)
 	}
 }
@@ -257,7 +264,7 @@ func TestConnRecvResetStream(t *testing.T) {
 	config.Params.InitialMaxStreamDataBidiLocal = 200
 	config.Params.InitialMaxStreamDataUni = 100
 	config.Params.InitialMaxStreamsBidi = 2
-	conn, err := Connect([]byte("client"), config)
+	conn, err := Connect([]byte("client"), []byte("server"), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +273,8 @@ func TestConnRecvResetStream(t *testing.T) {
 		streamID: 2,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
-	if err == nil || err.Error() != "stream_state_error reset_stream: invalid id 2" {
-		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
+	if err == nil || err.Error() != "error_code=stream_state_error reason=reset_stream: stream send-only 2" {
+		t.Fatalf("expect error %v, actual %v", "stream_state_error", err)
 	}
 	// Too much connection data
 	f = resetStreamFrame{
@@ -275,11 +282,14 @@ func TestConnRecvResetStream(t *testing.T) {
 		finalSize: config.Params.InitialMaxData + 1,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
-	if err == nil || err.Error() != "flow_control_error reset_stream: connection data exceeded 1000" {
-		t.Fatalf("expect error %v, actual %v", errorCodeString(FlowControlError), err)
+	if err == nil || err.Error() != "error_code=flow_control_error reason=reset_stream: connection data exceeded limit 1000" {
+		t.Fatalf("expect error %v, actual %v", "flow_control_error", err)
 	}
 	// Reset different size
-	st := conn.streams.get(3)
+	st, err := conn.Stream(3)
+	if err != nil {
+		t.Fatal(err)
+	}
 	st.pushRecv(make([]byte, 10), 0, true)
 	f = resetStreamFrame{
 		streamID:  3,
@@ -292,7 +302,7 @@ func TestConnRecvResetStream(t *testing.T) {
 	// Succeed
 	f = resetStreamFrame{
 		streamID:  5,
-		errorCode: 5,
+		errorCode: 7,
 		finalSize: 10,
 	}
 	_, err = conn.recvFrameResetStream(encodeFrame(&f), testTime())
@@ -302,12 +312,13 @@ func TestConnRecvResetStream(t *testing.T) {
 	if conn.flow.recvTotal != f.finalSize {
 		t.Fatalf("expect flow recv %v, actual %+v", 10, conn.flow)
 	}
-	events := conn.Events(nil)
-	if len(events) != 3 ||
-		events[0].Type != EventStreamOpen || events[0].ID != 3 || events[0].Data != 0 ||
-		events[1].Type != EventStreamOpen || events[1].ID != 5 || events[1].Data != 1 ||
-		events[2].Type != EventStreamReset || events[2].ID != 5 || events[2].Data != 5 {
-		t.Fatalf("events %+v", events)
+	st, err = conn.Stream(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.Read(nil)
+	if err == nil || err.Error() != "error_code=7 reason=reset_stream" {
+		t.Fatalf("expect read error: %v, actual: %v", "reset_stream", err)
 	}
 }
 
@@ -323,13 +334,13 @@ func TestConnRecvStopSending(t *testing.T) {
 		streamID: 1,
 	}
 	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
-	if err == nil || err.Error() != "stream_state_error stop_sending: stream not existed 1" {
-		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
+	if err == nil || err.Error() != "error_code=stream_state_error reason=stop_sending: stream not existed 1" {
+		t.Fatalf("expect error %v, actual %v", "stream_state_error", err)
 	}
 	f.streamID = 2
 	_, err = conn.recvFrameStopSending(encodeFrame(&f), testTime())
-	if err == nil || err.Error() != "stream_state_error stop_sending: stream readonly 2" {
-		t.Fatalf("expect error %v, actual %v", errorText[StreamStateError], err)
+	if err == nil || err.Error() != "error_code=stream_state_error reason=stop_sending: stream receive-only 2" {
+		t.Fatalf("expect error %v, actual %v", "stream_state_error", err)
 	}
 	st, err := conn.Stream(3)
 	if err != nil {
@@ -348,13 +359,18 @@ func TestConnRecvStopSending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events := conn.Events(nil)
-	if len(events) != 1 || events[0].Type != EventStreamStop || events[0].ID != f.streamID || events[0].Data != 9 {
-		t.Fatalf("event %+v", events)
-	}
+	// Respond RESET_STREAM
 	resetFrame := conn.sendFrameResetStream(f.streamID, st)
 	if resetFrame == nil || resetFrame.streamID != f.streamID || resetFrame.errorCode != 9 || resetFrame.finalSize != 4 {
 		t.Fatalf("expect reset frame %v %v %v, actual %+v", f.streamID, 9, 4, resetFrame)
+	}
+	st, err = conn.Stream(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.Write(nil)
+	if err == nil || err.Error() != "error_code=9 reason=stop_sending" {
+		t.Fatalf("expect error: %v, actual: %v", "stop_sending", err)
 	}
 }
 
@@ -385,7 +401,10 @@ func TestConnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.deriveInitialKeyMaterial([]byte("client"))
-	conn.Close(false, 1, "failure")
+	err = conn.Close(1, "failure", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if conn.state != stateAttempted {
 		t.Fatalf("expect connection state not changed, got %v", conn.state)
 	}
@@ -521,10 +540,13 @@ func TestConnResumption(t *testing.T) {
 	tx1 := p.clientTx + p.serverTx
 	t.Logf("first handshake: %d bytes", tx1)
 
-	p.client.Close(true, 0, "")
+	err := p.client.Close(0, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	p.assertClientSend()
 
-	client, _ := Connect([]byte("new-client"), clientConfig)
+	client, _ := Connect([]byte("new-client"), []byte("server"), clientConfig)
 	server, _ := Accept([]byte("new-server"), nil, serverConfig)
 	p = newTestEndpoint(t, client, server)
 	p.assertHandshake()
@@ -581,8 +603,9 @@ func newTestClient(config *Config) *Conn {
 		config.TLS.ServerName = "localhost"
 		config.TLS.RootCAs = testCA
 	}
-	cid := []byte("client-cid")
-	conn, err := Connect(cid, config)
+	scid := []byte("client")
+	dcid := []byte("server")
+	conn, err := Connect(scid, dcid, config)
 	if err != nil {
 		panic(err)
 	}
@@ -594,7 +617,7 @@ func newTestServer(config *Config) *Conn {
 		config = newTestConfig()
 		config.TLS.Certificates = testCerts
 	}
-	cid := []byte("server-cid")
+	cid := []byte("server")
 	conn, err := Accept(cid, nil, config)
 	if err != nil {
 		panic(err)

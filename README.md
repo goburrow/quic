@@ -45,6 +45,8 @@ go build -tags quicdebug
 
 # Check heap allocations
 go build -gcflags '-m' 2>&1 | sort -V > debug.txt
+go test -bench BenchmarkStream -run NONE -benchmem -memprofile mem.out -cpuprofile cpu.out
+go tool pprof mem.out
 
 # Raspberry Pi Zero
 GOOS=linux GOARCH=arm GOARM=6 CGO_ENABLED=0 go build
@@ -62,7 +64,7 @@ server, err := transport.Accept(scid, odcid, config)
 ```
 ```go
 config := transport.NewConfig()
-client, err := transport.Connect(scid, config)
+client, err := transport.Connect(scid, dcid, config)
 ```
 ```go
 for !conn.IsClosed() { // Loop until the connection is closed

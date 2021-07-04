@@ -399,6 +399,41 @@ func (s *packet) packetNumberOffset(b []byte) (int, error) {
 	return s.headerLen + dec.offset(), nil
 }
 
+func (s *packet) log(b []byte) []byte {
+	b = appendField(b, "packet_type", s.typ.String())
+	// Header
+	if s.typ == packetTypeOneRTT {
+		if len(s.header.dcid) > 0 {
+			b = appendField(b, "dcid", s.header.dcid)
+		}
+	} else {
+		if s.header.version > 0 {
+			b = appendField(b, "version", s.header.version)
+		}
+		if len(s.header.dcid) > 0 {
+			b = appendField(b, "dcid", s.header.dcid)
+		}
+		if len(s.header.scid) > 0 {
+			b = appendField(b, "scid", s.header.scid)
+		}
+		// Additional info
+		if len(s.supportedVersions) > 0 {
+			b = appendField(b, "supported_versions", s.supportedVersions)
+		}
+		if len(s.token) > 0 {
+			b = appendField(b, "stateless_reset_token", s.token)
+		}
+	}
+	b = appendField(b, "packet_number", s.packetNumber)
+	if s.packetSize > 0 {
+		b = appendField(b, "packet_size", s.packetSize)
+	}
+	if s.payloadLen > 0 {
+		b = appendField(b, "payload_length", s.payloadLen)
+	}
+	return b
+}
+
 func (s *packet) String() string {
 	switch s.typ {
 	case packetTypeInitial, packetTypeRetry:
@@ -417,11 +452,10 @@ func (s *packet) String() string {
 // This data allows to process packet prior to decryption.
 type Header struct {
 	Type    string
-	Flags   byte
-	Version uint32
 	DCID    []byte
-	SCID    []byte
+	SCID    []byte // Not applicable in 1RTT packet
 	Token   []byte // Only in Initial and Retry packet
+	Version uint32 // Not applicable in 1RTT packet
 }
 
 // Decode decodes public information from a QUIC packet.
@@ -438,7 +472,6 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 	}
 	typ := h.packetType()
 	s.Type = typ.String()
-	s.Flags = h.flags
 	s.Version = h.version
 	s.DCID = h.dcid
 	s.SCID = h.scid
@@ -463,8 +496,16 @@ func (s *Header) Decode(b []byte, dcil int) (int, error) {
 }
 
 func (s *Header) String() string {
-	return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x token=%x",
-		s.Type, s.Version, s.DCID, s.SCID, s.Token)
+	switch s.Type {
+	case packetTypeNames[packetTypeInitial], packetTypeNames[packetTypeRetry]:
+		return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x token=%x",
+			s.Type, s.Version, s.DCID, s.SCID, s.Token)
+	case packetTypeNames[packetTypeOneRTT]:
+		return fmt.Sprintf("packet_type=%s dcid=%x", s.Type, s.DCID)
+	default:
+		return fmt.Sprintf("packet_type=%s version=%d dcid=%x scid=%x",
+			s.Type, s.Version, s.DCID, s.SCID)
+	}
 }
 
 // Version Negotiation Packet:

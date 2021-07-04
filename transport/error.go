@@ -60,24 +60,47 @@ func errorCodeString(code uint64) string {
 }
 
 // Error is the QUIC transport error.
+// https://www.rfc-editor.org/rfc/rfc9000#section-20.1
 type Error struct {
-	Code    uint64
-	Message string
+	Code   uint64
+	Reason string
+	// App indicates whether this error is an application error.
+	// Application error is returned when reading from or writing to a terminated stream.
+	// https://www.rfc-editor.org/rfc/rfc9000#section-20.2
+	App bool
 }
 
 func (e *Error) Error() string {
-	code := errorCodeString(e.Code)
-	if e.Message == "" {
-		return code
+	var code string
+	if e.App {
+		code = sprint(e.Code)
+	} else {
+		code = errorCodeString(e.Code)
 	}
-	return code + " " + e.Message
+	if e.Reason == "" {
+		return "error_code=" + code
+	}
+	return "error_code=" + code + " reason=" + e.Reason
 }
 
 func newError(code uint64, msg string) *Error {
 	return &Error{
-		Code:    code,
-		Message: msg,
+		Code:   code,
+		Reason: msg,
 	}
+}
+
+func newAppError(code uint64, msg string) *Error {
+	return &Error{
+		Code:   code,
+		Reason: msg,
+		App:    true,
+	}
+}
+
+// isNoError returns true if the error is not a transport error with code NoError.
+func isNoError(err *Error) bool {
+	return err == nil || (!err.App && err.Code == NoError)
 }
 
 // packetDroppedError is the error returned when received packet is dropped
@@ -86,22 +109,23 @@ type packetDroppedError struct {
 	trigger string
 }
 
-func (s packetDroppedError) Error() string {
+func (s *packetDroppedError) Error() string {
 	return "packet_dropped: " + s.trigger
 }
 
-func newPacketDroppedError(trigger string) packetDroppedError {
-	return packetDroppedError{trigger}
+func newPacketDroppedError(trigger string) *packetDroppedError {
+	return &packetDroppedError{trigger}
 }
 
-// IsPacketDropped returns true (and reason) if err is a packet dropped so
-// the packet can either be discarded or bufferred for later use.
+// IsPacketDropped returns a reason (non empty string) if err is a packet dropped,
+// so the packet can either be discarded or bufferred for later use.
 // This function should only be used for error returned by Conn.Write.
-func IsPacketDropped(err error) (string, bool) {
-	if err, ok := err.(packetDroppedError); ok {
-		return err.trigger, true
+// See triggers at https://quicwg.org/qlog/draft-ietf-quic-qlog-quic-events.html#section-3.3.7
+func IsPacketDropped(err error) string {
+	if err, ok := err.(*packetDroppedError); ok {
+		return err.trigger
 	}
-	return "", false
+	return ""
 }
 
 var (

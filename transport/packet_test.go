@@ -86,9 +86,6 @@ func TestPacketVersionNegotiation(t *testing.T) {
 	if h.Type != "version_negotiation" {
 		t.Errorf("expect type %s, actual %s", packetTypeVersionNegotiation, h.Type)
 	}
-	if h.Flags != 0xc0 {
-		t.Errorf("expect flags 0x%x, actual 0x%x", 0xc0, h.Flags)
-	}
 	if !bytes.Equal(dcid, h.DCID) {
 		t.Errorf("expect dcid %x, actual %x", dcid, h.DCID)
 	}
@@ -140,9 +137,6 @@ func TestPacketRetry(t *testing.T) {
 	}
 	if h.Type != "retry" {
 		t.Errorf("expect type %s, actual %s", packetTypeRetry, h.Type)
-	}
-	if h.Flags != 0xf0 {
-		t.Errorf("expect flags 0x%x, actual 0x%x", 0xf0, h.Flags)
 	}
 	if h.Version != supportedVersions[0] {
 		t.Errorf("expect version %d, actual %d", supportedVersions[0], h.Version)

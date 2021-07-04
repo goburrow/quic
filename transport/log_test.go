@@ -47,7 +47,7 @@ func TestLogParameters(t *testing.T) {
 }
 
 func TestLogFramePadding(t *testing.T) {
-	testLogFrame(t, newPaddingFrame(1), "frame_type=padding")
+	testLogFrame(t, newPaddingFrame(1), "frame_type=padding length=1")
 }
 
 func TestLogFramePing(t *testing.T) {
@@ -162,6 +162,8 @@ func TestLogFramePathResponse(t *testing.T) {
 func TestLogFrameConnectionClose(t *testing.T) {
 	f := newConnectionCloseFrame(0x122, 99, []byte("reason"), false)
 	testLogFrame(t, f, "frame_type=connection_close error_space=transport error_code=crypto_error_34 raw_error_code=290 trigger_frame_type=99 reason=reason")
+	f = newConnectionCloseFrame(12, 0, nil, true)
+	testLogFrame(t, f, "frame_type=connection_close error_space=application error_code=12")
 }
 
 func TestLogFrameHandshakeDone(t *testing.T) {
@@ -200,10 +202,11 @@ func TestLogPacket(t *testing.T) {
 
 func TestLogRecovery(t *testing.T) {
 	r := &lossRecovery{}
+	r.init()
 	e := newTestLogEvent(logEventMetricsUpdated)
 	logRecovery(&e, r)
-	expect := "2020-01-05T00:00:00Z metrics_updated min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=0 " +
-		"pto_count=0 congestion_window=0 bytes_in_flight=0"
+	expect := "2020-01-05T00:00:00Z metrics_updated min_rtt=0 smoothed_rtt=333 latest_rtt=0 rtt_variance=166 " +
+		"pto_count=0 congestion_window=14720 bytes_in_flight=0"
 	assertLogEvent(t, e, expect)
 }
 
@@ -215,7 +218,7 @@ func TestLogLossTimer(t *testing.T) {
 	assertLogEvent(t, e, expect)
 
 	r.lossDetectionTimer = e.Time.Add(100 * time.Millisecond)
-	e.resetFields()
+	e.resetMessage()
 	logLossTimer(&e, r)
 	expect = "2020-01-05T00:00:00Z loss_timer_updated event_type=set delta=100"
 	assertLogEvent(t, e, expect)

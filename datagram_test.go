@@ -3,6 +3,7 @@ package quic
 import (
 	"bytes"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -65,10 +66,10 @@ func TestDatagramWriteTimeout(t *testing.T) {
 		t.Fatalf("expect write error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
 	}
 
-	dg.setClosed()
+	dg.setClosed(net.ErrClosed, nil)
 	n, err = dg.Write(nil)
-	if n != 0 || err != errClosed {
-		t.Fatalf("expect write error: %v, actual %v", errClosed, err)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expect write error: %v, actual %v", net.ErrClosed, err)
 	}
 
 	select {
@@ -133,10 +134,10 @@ func TestDatagramReadTimeout(t *testing.T) {
 		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
 	}
 
-	dg.setClosed()
+	dg.setClosed(net.ErrClosed, nil)
 	n, err = dg.Read(nil)
-	if n != 0 || err != errClosed {
-		t.Fatalf("expect read error: %v, actual %v", errClosed, err)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expect read error: %v, actual %v", net.ErrClosed, err)
 	}
 	select {
 	case <-done:
@@ -172,11 +173,77 @@ func TestDatagramReadBlock(t *testing.T) {
 	}
 }
 
+func TestDatagramConnectionClose(t *testing.T) {
+	conn := newRemoteConn(nil, nil, nil, false)
+	defer close(conn.cmdCh)
+	dg := newDatagram(conn)
+
+	go func() {
+		c := <-conn.cmdCh
+		if c.cmd != cmdDatagramRead {
+			t.Errorf("unexpected command: %+v", c)
+		}
+		b := bytes.NewReader([]byte("datagramdatagram"))
+		dg.recvReadData(b)
+		dg.sendReadResult(nil)
+		dg.setClosed(net.ErrClosed, b)
+	}()
+
+	data := make([]byte, 8)
+	n, err := dg.Read(data)
+	if n != 8 || err != nil || string(data[:n]) != "datagram" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 8, nil, "datagram", n, err, string(data[:n]))
+	}
+	n, err = dg.Read(data)
+	if n != 8 || err != nil || string(data[:n]) != "datagram" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 8, nil, "datagram", n, err, string(data[:n]))
+	}
+	n, err = dg.Read(data)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 0, io.EOF, n, err)
+	}
+	n, err = dg.Write(nil)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expect write: %v %v, actual: %v %v", 0, net.ErrClosed, n, err)
+	}
+}
+
+func TestDatagramConnectionTerminate(t *testing.T) {
+	conn := newRemoteConn(nil, nil, nil, false)
+	defer close(conn.cmdCh)
+	dg := newDatagram(conn)
+
+	go func() {
+		c := <-conn.cmdCh
+		if c.cmd != cmdDatagramRead {
+			t.Errorf("unexpected command: %+v", c)
+		}
+		b := bytes.NewReader([]byte("datagram"))
+		dg.recvReadData(b)
+		dg.sendReadResult(nil)
+		dg.setClosed(net.ErrClosed, nopReader{})
+	}()
+
+	data := make([]byte, 8)
+	n, err := dg.Read(data)
+	if n != 8 || err != nil || string(data[:n]) != "datagram" {
+		t.Fatalf("expect read: %v %v %q, actual: %v %v %q", 8, nil, "datagram", n, err, string(data[:n]))
+	}
+	n, err = dg.Read(data)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expect read: %v %v, actual: %v %v", 0, net.ErrClosed, n, err)
+	}
+}
+
 func TestDatagram(t *testing.T) {
 	sc := newServerConfig()
-	sc.Params.MaxDatagramPayloadSize = 100
+	sc.Params.MaxDatagramFramePayloadSize = 100
+	sc.Params.InitialMaxStreamsBidi = 0
+	sc.Params.InitialMaxStreamsUni = 0
 	cc := newClientConfig()
-	cc.Params.MaxDatagramPayloadSize = 100
+	cc.Params.MaxDatagramFramePayloadSize = 100
+	cc.Params.InitialMaxStreamsBidi = 0
+	cc.Params.InitialMaxStreamsUni = 0
 
 	s, c := newPipe(sc, cc)
 	defer s.Close()
@@ -185,10 +252,15 @@ func TestDatagram(t *testing.T) {
 	defer c.Close()
 	go c.Serve()
 
+	done := make(chan struct{}, 2)
+
 	recvFn := func(dg *Datagram) {
+		defer func() {
+			done <- struct{}{}
+		}()
 		n, err := io.Copy(dg, dg)
-		if n == 0 || (err != nil && err != errClosed) {
-			t.Errorf("server datagram copy: %v %v", n, err)
+		if n == 0 || err != net.ErrClosed {
+			t.Errorf("server datagram copy: %v %#v", n, err)
 			return
 		}
 	}
@@ -196,9 +268,11 @@ func TestDatagram(t *testing.T) {
 	sendData := []string{
 		"datagram1", "datagram2",
 	}
-	done := make(chan struct{})
 
 	sendFn := func(dg *Datagram) {
+		defer func() {
+			done <- struct{}{}
+		}()
 		buf := make([]byte, 10)
 		for _, d := range sendData {
 			n, err := dg.Write([]byte(d))
@@ -212,7 +286,6 @@ func TestDatagram(t *testing.T) {
 				return
 			}
 		}
-		done <- struct{}{}
 	}
 
 	serverHandler := func(conn *Conn, events []transport.Event) {
@@ -243,10 +316,15 @@ func TestDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out")
-		return
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+			if i == 0 { // Initiate closing client
+				c.Close()
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out")
+			return
+		}
 	}
 }

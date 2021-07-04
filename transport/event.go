@@ -8,14 +8,11 @@ const (
 	EventConnClosed = "conn_closed" // Connection closed.
 
 	EventStreamOpen      = "stream_open"      // A new stream has been opened by peer.
-	EventStreamReadable  = "stream_readable"  // Received stream data and readable
-	EventStreamWritable  = "stream_writable"  // Stream is unblocked and can add more data
+	EventStreamReadable  = "stream_readable"  // Received stream data and readable or reset by peer.
+	EventStreamWritable  = "stream_writable"  // Stream is unblocked and can add more data or stopped by peer.
 	EventStreamCreatable = "stream_creatable" // Maximum streams increased by peer.
-
-	EventStreamStop     = "stream_stop"     // Received stream stop sending from peer.
-	EventStreamReset    = "stream_reset"    // Received stream reset from peer.
-	EventStreamComplete = "stream_complete" // All sending data has been acked.
-	EventStreamClosed   = "stream_closed"   // Stream is fully closed and no longer available.
+	EventStreamComplete  = "stream_complete"  // All sending data has been acked.
+	EventStreamClosed    = "stream_closed"    // Stream is fully closed and no longer available.
 
 	EventDatagramWritable = "datagram_writable" // Datagram is supported by peer.
 	EventDatagramReadable = "datagram_readable" // Received datagram.
@@ -24,15 +21,11 @@ const (
 // Event is a union structure of all events.
 type Event struct {
 	Type string // Type of event
-	ID   uint64 // ID associated with the event. For stream events, this is Stream ID.
-	Data uint64 // Additional event data, like ErrorCode.
+	Data uint64 // Data associated with the event. For stream events, this is Stream ID.
 }
 
 func (s Event) String() string {
-	if s.Data == 0 {
-		return fmt.Sprintf("%s:%d", s.Type, s.ID)
-	}
-	return fmt.Sprintf("%s:%d(%d)", s.Type, s.ID, s.Data)
+	return fmt.Sprintf("%s:%d", s.Type, s.Data)
 }
 
 // newEventStreamOpen creates an event where a connection state is set to Active.
@@ -50,22 +43,18 @@ func newEventConnectionClosed() Event {
 }
 
 // newEventStreamOpen creates an event where a stream is opened by peer.
-func newEventStreamOpen(id uint64, bidi bool) Event {
-	e := Event{
+func newEventStreamOpen(id uint64) Event {
+	return Event{
 		Type: EventStreamOpen,
-		ID:   id,
+		Data: id,
 	}
-	if bidi {
-		e.Data = 1
-	}
-	return e
 }
 
 // newEventStreamReadable creates an event where a STREAM frame was received and data is readable.
 func newEventStreamReadable(id uint64) Event {
 	return Event{
 		Type: EventStreamReadable,
-		ID:   id,
+		Data: id,
 	}
 }
 
@@ -73,36 +62,23 @@ func newEventStreamReadable(id uint64) Event {
 func newEventStreamWritable(id uint64) Event {
 	return Event{
 		Type: EventStreamWritable,
-		ID:   id,
+		Data: id,
 	}
 }
 
 // newEventStreamWritable creates an event where the stream is available to add more data.
-func newEventStreamCreatable(bidi bool) Event {
-	e := Event{
+func newEventStreamCreatable(bidi bool, uni bool) Event {
+	var directional uint64
+	if bidi && uni {
+		directional = 3
+	} else if uni {
+		directional = 2
+	} else if bidi {
+		directional = 1
+	}
+	return Event{
 		Type: EventStreamCreatable,
-	}
-	if bidi {
-		e.ID = 1
-	}
-	return e
-}
-
-// newEventStreamStop creates an event where a STOP_SENDING frame was received.
-func newEventStreamStop(id, code uint64) Event {
-	return Event{
-		Type: EventStreamStop,
-		ID:   id,
-		Data: code,
-	}
-}
-
-// newEventStreamReset creates an event where a RESET_STREAM frame was received.
-func newEventStreamReset(id, code uint64) Event {
-	return Event{
-		Type: EventStreamReset,
-		ID:   id,
-		Data: code,
+		Data: directional,
 	}
 }
 
@@ -110,7 +86,7 @@ func newEventStreamReset(id, code uint64) Event {
 func newEventStreamComplete(id uint64) Event {
 	return Event{
 		Type: EventStreamComplete,
-		ID:   id,
+		Data: id,
 	}
 }
 
@@ -118,7 +94,7 @@ func newEventStreamComplete(id uint64) Event {
 func newEventStreamClosed(id uint64) Event {
 	return Event{
 		Type: EventStreamClosed,
-		ID:   id,
+		Data: id,
 	}
 }
 

@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"fmt"
+	"sync"
 )
 
 // numberRange is an inclusive range.
@@ -160,11 +161,8 @@ func (s *rangeBuffer) String() string {
 
 // newRangeBuffer creates a new buffer with a copy of data.
 func newRangeBuffer(data []byte, offset uint64) rangeBuffer {
-	var d []byte
-	if len(data) > 0 {
-		d = make([]byte, len(data))
-		copy(d, data)
-	}
+	d := newDataBuffer(len(data))
+	copy(d, data)
 	return rangeBuffer{
 		data:   d,
 		offset: offset,
@@ -172,7 +170,9 @@ func newRangeBuffer(data []byte, offset uint64) rangeBuffer {
 }
 
 // rangeBufferList is a sorted list of data buffer by offset.
-type rangeBufferList []rangeBuffer
+type rangeBufferList struct {
+	ls []rangeBuffer
+}
 
 func (s *rangeBufferList) write(data []byte, offset uint64) {
 	if len(data) == 0 {
@@ -185,8 +185,8 @@ func (s *rangeBufferList) write(data []byte, offset uint64) {
 	if i < 0 {
 		i = 0
 	}
-	for ; i < len(*s); i++ {
-		b := (*s)[i]
+	for ; i < len(s.ls); i++ {
+		b := s.ls[i]
 		bStart := b.offset
 		bEnd := b.offset + uint64(len(b.data))
 		if bStart <= offset {
@@ -238,24 +238,26 @@ func (s *rangeBufferList) write(data []byte, offset uint64) {
 
 func (s *rangeBufferList) read(data []byte, offset uint64) int {
 	var i, n int
-	for i = 0; i < len(*s); i++ {
-		b := (*s)[i]
+	for i = 0; i < len(s.ls); i++ {
+		b := s.ls[i]
 		if b.offset != offset {
+			// Data have gaps
 			break
 		}
 		k := copy(data[n:], b.data)
 		if k == 0 {
+			// Read buffer is full
 			break
 		}
 		n += k
 		if k < len(b.data) {
-			(*s)[i] = rangeBuffer{
-				data:   b.data[k:],
-				offset: b.offset + uint64(k),
-			}
+			// Read partial data
+			s.ls[i] = newRangeBuffer(b.data[k:], b.offset+uint64(k))
+			freeDataBuffer(b.data)
 			break
 		}
 		offset += uint64(k)
+		freeDataBuffer(b.data)
 	}
 	if i > 0 {
 		s.shift(i)
@@ -265,15 +267,15 @@ func (s *rangeBufferList) read(data []byte, offset uint64) int {
 
 // Return first continuous range
 func (s *rangeBufferList) pop(max int) ([]byte, uint64) {
-	if len(*s) == 0 || max <= 0 {
+	if len(s.ls) == 0 || max <= 0 {
 		return nil, 0
 	}
 	// Use offset from the first segment
-	first := (*s)[0]
-	offset := first.offset
+	data := s.ls[0].data
+	offset := s.ls[0].offset
 	n := 0
 	// Peek available bytes
-	for _, b := range *s {
+	for _, b := range s.ls {
 		if b.offset != offset+uint64(n) {
 			break
 		}
@@ -284,46 +286,42 @@ func (s *rangeBufferList) pop(max int) ([]byte, uint64) {
 		}
 	}
 	// No allocation needed if data is the whole first buffer
-	if n == len(first.data) {
-		b := first.data
+	if n == len(data) {
 		s.shift(1)
-		return b, offset
+		return data, offset
 	}
-	if n < len(first.data) {
-		b := first.data[:n]
-		(*s)[0] = rangeBuffer{
-			data:   first.data[n:],
-			offset: offset + uint64(n),
-		}
-		return b, offset
+	if n < len(data) {
+		// Replace the first buffer with the remaining data
+		s.ls[0] = newRangeBuffer(data[n:], offset+uint64(n))
+		return data[:n], offset
 	}
-	b := make([]byte, n)
+	b := newDataBuffer(n)
 	n = s.read(b, offset)
 	return b[:n], offset
 }
 
 func (s *rangeBufferList) insert(idx int, r rangeBuffer) {
-	ls := append(*s, rangeBuffer{})
+	ls := append(s.ls, rangeBuffer{})
 	copy(ls[idx+1:], ls[idx:])
 	ls[idx] = r
-	*s = ls
+	s.ls = ls
 }
 
 func (s *rangeBufferList) shift(idx int) {
-	ls := *s
+	ls := s.ls
 	n := copy(ls, ls[idx:])
 	for i := n; i < len(ls); i++ {
 		ls[i] = rangeBuffer{}
 	}
-	*s = ls[:n]
+	s.ls = ls[:n]
 }
 
-func (s rangeBufferList) insertPos(offset uint64) int {
+func (s *rangeBufferList) insertPos(offset uint64) int {
 	left := 0
-	right := len(s)
+	right := len(s.ls)
 	for left < right {
 		mid := left + (right-left)/2
-		if offset < s[mid].offset {
+		if offset < s.ls[mid].offset {
 			right = mid
 		} else {
 			left = mid + 1
@@ -332,21 +330,92 @@ func (s rangeBufferList) insertPos(offset uint64) int {
 	return left
 }
 
-// size returns current maximum size of the buffer.
-func (s rangeBufferList) size() uint64 {
-	if len(s) > 0 {
-		left := s[0]
-		right := s[len(s)-1]
+// size returns the size of actual data hold by the buffer.
+func (s *rangeBufferList) size() int {
+	sz := 0
+	for _, b := range s.ls {
+		sz += len(b.data)
+	}
+	return sz
+}
+
+// length returns the maximum length of the data, ignoring the gaps.
+func (s *rangeBufferList) length() uint64 {
+	ls := s.ls
+	if len(ls) > 0 {
+		left := ls[0]
+		right := ls[len(ls)-1]
 		return right.offset - left.offset + uint64(len(right.data))
 	}
 	return 0
 }
 
-func (s rangeBufferList) String() string {
+func (s *rangeBufferList) isEmpty() bool {
+	return len(s.ls) == 0
+}
+
+// firstOffset returns the first range if available.
+func (s *rangeBufferList) first() *rangeBuffer {
+	if len(s.ls) > 0 {
+		return &s.ls[0]
+	}
+	return nil
+}
+
+func (s *rangeBufferList) String() string {
 	buf := bytes.Buffer{}
-	fmt.Fprintf(&buf, "ranges=%d", len(s))
-	for _, b := range s {
-		fmt.Fprintf(&buf, " %s", &b)
+	fmt.Fprintf(&buf, "ranges=%d", len(s.ls))
+	for i := range s.ls {
+		fmt.Fprintf(&buf, " %s", &s.ls[i])
 	}
 	return buf.String()
+}
+
+// newDataBuffer returns a slice from buffer pools if its size is eligible.
+// This buffer is used in stream data and datagram.
+func newDataBuffer(size int) []byte {
+	for i, n := range dataBufferSizes {
+		if size <= n {
+			b := dataBufferPools[i].Get().([]byte)
+			return b[:size]
+		}
+	}
+	// TODO: Split the data to still use buffer pool
+	debug("data is too large for buffer pools: %v", size)
+	return make([]byte, size)
+}
+
+// freeDataBuffer puts the slice to buffer pools if its size is eligible.
+// This is used when stream or datagram frame is acknowledged or lost.
+func freeDataBuffer(b []byte) {
+	size := cap(b)
+	for i, n := range dataBufferSizes {
+		if size == n {
+			dataBufferPools[i].Put(b[:size])
+			return
+		}
+	}
+	debug("data is not eligible for buffer pools: %v", size)
+}
+
+var dataBufferSizes = [...]int{
+	1 << 10,
+	2 << 10,
+	4 << 10,
+	8 << 10,
+}
+
+var dataBufferPools = [...]sync.Pool{
+	{
+		New: func() interface{} { return make([]byte, 1<<10) },
+	},
+	{
+		New: func() interface{} { return make([]byte, 2<<10) },
+	},
+	{
+		New: func() interface{} { return make([]byte, 4<<10) },
+	},
+	{
+		New: func() interface{} { return make([]byte, 8<<10) },
+	},
 }

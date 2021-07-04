@@ -82,7 +82,7 @@ func (s *decoder) parseLine(line string) (eventGroup, error) {
 	}
 	delete(e.data, "cid")
 	switch e.event {
-	case "packet_received", "packet_sent":
+	case "packet_received", "packet_sent", "packet_lost", "packet_dropped":
 		// Move packet headers to sub property
 		header := make(map[string]interface{})
 		for k, v := range e.data {

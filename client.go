@@ -94,19 +94,17 @@ func (s *Client) Connect(addr string) error {
 		s.peersMu.Unlock()
 		return fmt.Errorf("client is already closed")
 	}
-	if _, ok := s.peers[string(c.scid[:])]; ok {
+	if _, ok := s.peers[string(c.scid)]; ok {
 		s.peersMu.Unlock()
 		return fmt.Errorf("connection id conflict cid=%x", c.scid)
 	}
-	s.peers[string(c.scid[:])] = c
+	s.peers[string(c.scid)] = c
 	s.peersMu.Unlock()
 	// Send initial packet
-	s.logger.log(levelInfo, "connection_started cid=%x addr=%v", c.scid, c.addr)
-	p := newPacket()
-	defer freePacket(p)
-	if err = s.sendConn(c, p.buf[:maxDatagramSize]); err != nil {
+	s.logger.log(levelInfo, "connection_started vantage_point=client cid=%x addr=%v", c.scid, c.addr)
+	if _, err = s.sendConn(c); err != nil {
 		s.peersMu.Lock()
-		delete(s.peers, string(c.scid[:]))
+		delete(s.peers, string(c.scid))
 		s.peersMu.Unlock()
 		return fmt.Errorf("send %s: %v", c.addr, err)
 	}
@@ -128,7 +126,11 @@ func (s *Client) newConn(addr net.Addr) (*Conn, error) {
 	if err := s.rand(scid); err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
-	conn, err := transport.Connect(scid, s.config)
+	dcid := make([]byte, cidLength)
+	if err := s.rand(dcid); err != nil {
+		return nil, fmt.Errorf("generate connection id: %v", err)
+	}
+	conn, err := transport.Connect(scid, dcid, s.config)
 	if err != nil {
 		return nil, err
 	}

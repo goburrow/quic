@@ -75,10 +75,10 @@ type Parameters struct {
 	// ActiveConnectionIDLimit is the maximum number of connection IDs from the peer that
 	// an endpoint is willing to store.
 	ActiveConnectionIDLimit uint64
-	// MaxDatagramPayloadSize is the maximum size of payload in a DATAGRAM frame the endpoint
+	// MaxDatagramFramePayloadSize is the maximum size of payload in a DATAGRAM frame the endpoint
 	// is willing to receive. DATAGRAM is disabled when the value is zero.
 	// See https://quicwg.org/datagram/draft-ietf-quic-datagram.html#section-3
-	MaxDatagramPayloadSize uint64
+	MaxDatagramFramePayloadSize uint64
 	// DisableActiveMigration indicates the endpoint does not support active connection migration.
 	DisableActiveMigration bool
 }
@@ -159,9 +159,9 @@ func (s *Parameters) marshal() []byte {
 		b.writeVarint(paramRetrySourceCID)
 		b.writeBytes(s.RetrySourceCID)
 	}
-	if s.MaxDatagramPayloadSize > 0 {
+	if s.MaxDatagramFramePayloadSize > 0 {
 		b.writeVarint(paramMaxDatagramPayloadSize)
-		b.writeUint(s.MaxDatagramPayloadSize)
+		b.writeUint(s.MaxDatagramFramePayloadSize)
 	}
 	return b
 }
@@ -242,7 +242,7 @@ func (s *Parameters) unmarshal(data []byte) bool {
 				return false
 			}
 		case paramMaxDatagramPayloadSize:
-			if !b.readUint(&s.MaxDatagramPayloadSize) {
+			if !b.readUint(&s.MaxDatagramFramePayloadSize) {
 				return false
 			}
 		default:
@@ -285,6 +285,71 @@ func (s *Parameters) validate(isClient bool) error {
 		return newError(StreamLimitError, "initial_max_streams_uni")
 	}
 	return nil
+}
+
+func (s *Parameters) log(b []byte) []byte {
+	if len(s.OriginalDestinationCID) > 0 {
+		b = appendField(b, "original_connection_id", s.OriginalDestinationCID)
+	}
+	if s.MaxIdleTimeout > 0 {
+		b = appendField(b, "max_idle_timeout", s.MaxIdleTimeout)
+	}
+	if len(s.StatelessResetToken) > 0 {
+		b = appendField(b, "stateless_reset_token", s.StatelessResetToken)
+	}
+	if s.MaxUDPPayloadSize > 0 {
+		b = appendField(b, "max_udp_payload_size", s.MaxUDPPayloadSize)
+	}
+	if s.InitialMaxData > 0 {
+		b = appendField(b, "initial_max_data", s.InitialMaxData)
+	}
+	if s.InitialMaxStreamDataBidiLocal > 0 {
+		b = appendField(b, "initial_max_stream_data_bidi_local", s.InitialMaxStreamDataBidiLocal)
+	}
+	if s.InitialMaxStreamDataBidiRemote > 0 {
+		b = appendField(b, "initial_max_stream_data_bidi_remote", s.InitialMaxStreamDataBidiRemote)
+	}
+	if s.InitialMaxStreamDataUni > 0 {
+		b = appendField(b, "initial_max_stream_data_uni", s.InitialMaxStreamDataUni)
+	}
+	if s.InitialMaxStreamsBidi > 0 {
+		b = appendField(b, "initial_max_streams_bidi", s.InitialMaxStreamsBidi)
+	}
+	if s.InitialMaxStreamsUni > 0 {
+		b = appendField(b, "initial_max_streams_uni", s.InitialMaxStreamsUni)
+	}
+	if s.AckDelayExponent > 0 {
+		b = appendField(b, "ack_delay_exponent", s.AckDelayExponent)
+	}
+	if s.MaxAckDelay > 0 {
+		b = appendField(b, "max_ack_delay", s.MaxAckDelay)
+	}
+	if s.DisableActiveMigration {
+		b = appendField(b, "disable_active_migration", s.DisableActiveMigration)
+	}
+	if s.ActiveConnectionIDLimit > 0 {
+		b = appendField(b, "active_connection_id_limit", s.ActiveConnectionIDLimit)
+	}
+	if len(s.InitialSourceCID) > 0 {
+		b = appendField(b, "initial_source_connection_id", s.InitialSourceCID)
+	}
+	if len(s.RetrySourceCID) > 0 {
+		b = appendField(b, "retry_source_connection_id", s.RetrySourceCID)
+	}
+	return b
+}
+
+func (s *Parameters) String() string {
+	return fmt.Sprintf("original_destination_connection_id=%x initial_source_connection_id=%x retry_source_connection_id=%x stateless_reset_token=%x "+
+		"max_udp_payload_size=%v max_datagram_frame_payload_size=%v disable_active_migration=%v active_connection_id_limit=%v "+
+		"max_idle_timeout=%v max_ack_delay=%v ack_delay_exponent=%v "+
+		"initial_max_data=%v initial_max_stream_data_bidi_local=%v initial_max_stream_data_bidi_remote=%v initial_max_stream_data_uni=%v "+
+		"initial_max_streams_bidi=%v initial_max_streams_uni=%v",
+		s.OriginalDestinationCID, s.InitialSourceCID, s.RetrySourceCID, s.StatelessResetToken,
+		s.MaxUDPPayloadSize, s.MaxDatagramFramePayloadSize, s.DisableActiveMigration, s.ActiveConnectionIDLimit,
+		s.MaxIdleTimeout, s.MaxAckDelay, s.AckDelayExponent,
+		s.InitialMaxData, s.InitialMaxStreamDataBidiLocal, s.InitialMaxStreamDataBidiRemote, s.InitialMaxStreamDataUni,
+		s.InitialMaxStreamsBidi, s.InitialMaxStreamsUni)
 }
 
 // Each transport parameter is encoded as an (identifier, length, value) tuple.

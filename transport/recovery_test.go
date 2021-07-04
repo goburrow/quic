@@ -79,6 +79,31 @@ func TestRecoveryLossOnReordering(t *testing.T) {
 	x.assertInFlight(0)
 }
 
+func TestRecoveryPacing(t *testing.T) {
+	if !enablePacing {
+		t.Skip("Pacing is not enabled")
+	}
+	x := newLossRecoveryTest(t)
+	now := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	x.send(packetSpaceApplication, 0, 6500, now, &streamFrame{streamID: 1})
+	x.assertInFlight(6500)
+	x.assertPacketSchedule(time.Time{})
+
+	rtt := 50 * time.Millisecond
+	now = now.Add(rtt)
+	x.ack(packetSpaceApplication, 0, 0, rtt, now)
+	x.assertInFlight(0)
+	x.assertRTT(rtt, rtt, rtt/2, rtt)
+
+	x.send(packetSpaceApplication, 1, 6500, now, &streamFrame{streamID: 1})
+	x.assertPacketSchedule(now)
+
+	x.send(packetSpaceApplication, 2, 6500, now, &streamFrame{streamID: 1})
+	x.assertInFlight(13000)
+	x.assertPacketSchedule(now.Add(6500 * rtt / 14720 / 3 * 2))
+}
+
 func TestRecoveryCongestion(t *testing.T) {
 	now := time.Now()
 	x := newLossRecoveryTest(t)
@@ -104,6 +129,49 @@ func TestRecoveryCongestion(t *testing.T) {
 	x.r.congestion.onNewCongestionEvent(now, now)
 	x.assertCongestionWindow(6000)
 	x.assertSendAvail(0)
+}
+
+func TestCongestionPRR(t *testing.T) {
+	if !enablePRR {
+		t.Skip("Proportional rate reduction is not enabled")
+	}
+	x := newLossRecoveryTest(t)
+	x.r.setMaxDatagramSize(1000)
+
+	sentTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	x.send(packetSpaceApplication, 0, 5000, sentTime, &streamFrame{streamID: 1})
+	x.send(packetSpaceApplication, 1, 5000, sentTime, &streamFrame{streamID: 1})
+	x.assertInFlight(10000)
+
+	now := sentTime.Add(100 * time.Millisecond)
+	x.r.congestion.onNewCongestionEvent(sentTime, now)
+	if x.r.congestion.slowStartThreshold != 5000 {
+		t.Fatalf("expect ssthresh: %v, actual: %v", 5000, &x.r.congestion)
+	}
+	if x.r.congestion.prrFlightSize != 10000 {
+		t.Fatalf("expect prr_flight_size: %v, actual: %v", 10000, &x.r.congestion)
+	}
+
+	x.send(packetSpaceApplication, 2, 1000, sentTime, &streamFrame{streamID: 1})
+	if x.r.congestion.prrOut != 1000 {
+		t.Fatalf("expect prr_out: %v, actual: %v", 1000, &x.r.congestion)
+	}
+	now = now.Add(50 * time.Millisecond)
+	x.ack(packetSpaceApplication, 1, 1, 50*time.Millisecond, now)
+	// pipe > ssthresh
+	x.assertInFlight(6000)
+	if x.r.congestion.prrDelivered != 5000 {
+		t.Fatalf("expect prr_delivered: %v, actual: %v", 5000, &x.r.congestion)
+	}
+	if x.r.congestion.prrSndCnt != 1500 { // 5000*5000/10000 - 1000
+		t.Fatalf("expect sndcnt: %v, actual: %v", 1500, &x.r.congestion)
+	}
+	x.ack(packetSpaceApplication, 1, 2, 50*time.Millisecond, now)
+	x.assertInFlight(5000)
+	// pipe == ssthresh
+	if x.r.congestion.prrSndCnt != 0 {
+		t.Fatalf("expect sndcnt: %v, actual: %v", 0, &x.r.congestion)
+	}
 }
 
 type lossRecoveryTest struct {
@@ -199,5 +267,12 @@ func (x *lossRecoveryTest) assertAppLimited(limited bool) {
 	if appLimited != limited {
 		x.t.Helper()
 		x.t.Fatalf("expect app limited: %v, actual: %v", limited, appLimited)
+	}
+}
+
+func (x *lossRecoveryTest) assertPacketSchedule(tm time.Time) {
+	if !x.r.lastPacketSchedule.Equal(tm) {
+		x.t.Helper()
+		x.t.Fatalf("expect last packet schedule: %v, actual: %v", x.r.lastPacketSchedule, tm)
 	}
 }

@@ -48,22 +48,24 @@ type frame interface {
 	encodedLen() int
 	encoder
 	decoder
+	logger // For qlog
 }
 
 // The PADDING frame (type=0x00) has no semantic value.
-type paddingFrame int
+type paddingFrame struct {
+	length int
+}
 
 func newPaddingFrame(n int) *paddingFrame {
-	f := paddingFrame(n)
-	return &f
+	return &paddingFrame{n}
 }
 
 func (s *paddingFrame) encodedLen() int {
-	return int(*s)
+	return s.length
 }
 
 func (s *paddingFrame) encode(b []byte) (int, error) {
-	n := int(*s)
+	n := s.length
 	if len(b) < n {
 		return 0, errShortBuffer
 	}
@@ -86,12 +88,18 @@ func (s *paddingFrame) decode(b []byte) (int, error) {
 			}
 		}
 	}
-	*s = paddingFrame(n)
+	s.length = n
 	return n, nil
 }
 
+func (s *paddingFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "padding")
+	b = appendField(b, "length", s.length)
+	return b
+}
+
 func (s *paddingFrame) String() string {
-	return fmt.Sprintf("padding{length=%d}", *s)
+	return fmt.Sprintf("padding{length=%d}", s.length)
 }
 
 type pingFrame struct{}
@@ -115,6 +123,10 @@ func (s *pingFrame) decode(b []byte) (int, error) {
 		n = getVarint(b, &typ)
 	}
 	return n, nil
+}
+
+func (s *pingFrame) log(b []byte) []byte {
+	return appendField(b, "frame_type", "ping")
 }
 
 func (s *pingFrame) String() string {
@@ -172,6 +184,13 @@ func (s *cryptoFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "crypto")
 	}
 	return dec.offset(), nil
+}
+
+func (s *cryptoFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "crypto")
+	b = appendField(b, "offset", s.offset)
+	b = appendField(b, "length", len(s.data))
+	return b
 }
 
 func (s *cryptoFrame) String() string {
@@ -367,6 +386,18 @@ func (s *ackFrame) fromRangeSet(ranges rangeSet) {
 	}
 }
 
+func (s *ackFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "ack")
+	b = appendField(b, "ack_delay", s.ackDelay)
+	b = appendField(b, "acked_ranges", s.toRangeSet())
+	if s.ecnCounts != nil {
+		b = appendField(b, "ect0", s.ecnCounts.ect0Count)
+		b = appendField(b, "ect1", s.ecnCounts.ect1Count)
+		b = appendField(b, "ce", s.ecnCounts.ceCount)
+	}
+	return b
+}
+
 func (s *ackFrame) String() string {
 	return fmt.Sprintf("ack{delay=%d largest=%d first=%d ranges=%d}", s.ackDelay, s.largestAck, s.firstAckRange, len(s.ackRanges))
 }
@@ -426,6 +457,14 @@ func (s *resetStreamFrame) decode(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
+func (s *resetStreamFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "reset_stream")
+	b = appendField(b, "stream_id", s.streamID)
+	b = appendField(b, "error_code", s.errorCode)
+	b = appendField(b, "final_size", s.finalSize)
+	return b
+}
+
 func (s *resetStreamFrame) String() string {
 	return fmt.Sprintf("resetStream{id=%d error=%d final=%d}", s.streamID, s.errorCode, s.finalSize)
 }
@@ -467,6 +506,13 @@ func (s *stopSendingFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "stop_sending")
 	}
 	return dec.offset(), nil
+}
+
+func (s *stopSendingFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "stop_sending")
+	b = appendField(b, "stream_id", s.streamID)
+	b = appendField(b, "error_code", s.errorCode)
+	return b
 }
 
 func (s *stopSendingFrame) String() string {
@@ -564,6 +610,15 @@ func (s *streamFrame) decode(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (s *streamFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "stream")
+	b = appendField(b, "stream_id", s.streamID)
+	b = appendField(b, "offset", s.offset)
+	b = appendField(b, "length", len(s.data))
+	b = appendField(b, "fin", s.fin)
+	return b
+}
+
 func (s *streamFrame) String() string {
 	return fmt.Sprintf("stream{id=%d offset=%d length=%d fin=%v}", s.streamID, s.offset, len(s.data), s.fin)
 }
@@ -605,6 +660,12 @@ func (s *maxDataFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "max_data")
 	}
 	return dec.offset(), nil
+}
+
+func (s *maxDataFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "max_data")
+	b = appendField(b, "maximum", s.maximumData)
+	return b
 }
 
 func (s *maxDataFrame) String() string {
@@ -654,6 +715,13 @@ func (s *maxStreamDataFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "max_stream_data")
 	}
 	return dec.offset(), nil
+}
+
+func (s *maxStreamDataFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "max_stream_data")
+	b = appendField(b, "stream_id", s.streamID)
+	b = appendField(b, "maximum", s.maximumData)
+	return b
 }
 
 func (s *maxStreamDataFrame) String() string {
@@ -708,8 +776,19 @@ func (s *maxStreamsFrame) decode(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
+func (s *maxStreamsFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "max_streams")
+	if s.bidi {
+		b = appendField(b, "stream_type", "bidirectional")
+	} else {
+		b = appendField(b, "stream_type", "unidirectional")
+	}
+	b = appendField(b, "maximum", s.maximumStreams)
+	return b
+}
+
 func (s *maxStreamsFrame) String() string {
-	return fmt.Sprintf("maxStreams{maximum=%d}", s.maximumStreams)
+	return fmt.Sprintf("maxStreams{maximum=%v bidi=%v}", s.maximumStreams, s.bidi)
 }
 
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.12
@@ -749,6 +828,12 @@ func (s *dataBlockedFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "data_blocked")
 	}
 	return dec.offset(), nil
+}
+
+func (s *dataBlockedFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "data_blocked")
+	b = appendField(b, "limit", s.dataLimit)
+	return b
 }
 
 func (s *dataBlockedFrame) String() string {
@@ -798,6 +883,13 @@ func (s *streamDataBlockedFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "stream_data_blocked")
 	}
 	return dec.offset(), nil
+}
+
+func (s *streamDataBlockedFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "stream_data_blocked")
+	b = appendField(b, "stream_id", s.streamID)
+	b = appendField(b, "limit", s.dataLimit)
+	return b
 }
 
 func (s *streamDataBlockedFrame) String() string {
@@ -850,6 +942,17 @@ func (s *streamsBlockedFrame) decode(b []byte) (int, error) {
 	}
 	s.bidi = typ == frameTypeStreamsBlockedBidi
 	return dec.offset(), nil
+}
+
+func (s *streamsBlockedFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "streams_blocked")
+	if s.bidi {
+		b = appendField(b, "stream_type", "bidirectional")
+	} else {
+		b = appendField(b, "stream_type", "unidirectional")
+	}
+	b = appendField(b, "limit", s.streamLimit)
+	return b
 }
 
 func (s *streamsBlockedFrame) String() string {
@@ -918,6 +1021,15 @@ func (s *newConnectionIDFrame) decode(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
+func (s *newConnectionIDFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "new_connection_id")
+	b = appendField(b, "sequence_number", s.sequenceNumber)
+	b = appendField(b, "retire_prior_to", s.retirePriorTo)
+	b = appendField(b, "connection_id", s.connectionID)
+	b = appendField(b, "stateless_reset_token", s.statelessResetToken)
+	return b
+}
+
 func (s *newConnectionIDFrame) String() string {
 	return fmt.Sprintf("newConnectionID{sequence=%d retire=%d cid=%x token=%x}",
 		s.sequenceNumber, s.retirePriorTo, s.connectionID, s.statelessResetToken)
@@ -954,6 +1066,12 @@ func (s *retireConnectionIDFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "retire_connection_id")
 	}
 	return dec.offset(), nil
+}
+
+func (s *retireConnectionIDFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "retire_connection_id")
+	b = appendField(b, "sequence_number", s.sequenceNumber)
+	return b
 }
 
 func (s *retireConnectionIDFrame) String() string {
@@ -994,6 +1112,12 @@ func (s *pathChallengeFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "path_challenge")
 	}
 	return dec.offset(), nil
+}
+
+func (s *pathChallengeFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "path_challenge")
+	b = appendField(b, "data", s.data)
+	return b
 }
 
 func (s *pathChallengeFrame) String() string {
@@ -1040,6 +1164,12 @@ func (s *pathResponseFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "path_response")
 	}
 	return dec.offset(), nil
+}
+
+func (s *pathResponseFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "path_response")
+	b = appendField(b, "data", s.data)
+	return b
 }
 
 func (s *pathResponseFrame) String() string {
@@ -1128,6 +1258,23 @@ func (s *connectionCloseFrame) decode(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
+func (s *connectionCloseFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "connection_close")
+	if s.application {
+		b = appendField(b, "error_space", "application")
+		b = appendField(b, "error_code", sprint(s.errorCode))
+	} else {
+		b = appendField(b, "error_space", "transport")
+		b = appendField(b, "error_code", errorCodeString(s.errorCode))
+		b = appendField(b, "raw_error_code", s.errorCode)
+		b = appendField(b, "trigger_frame_type", s.frameType)
+	}
+	if len(s.reasonPhrase) > 0 {
+		b = appendField(b, "reason", string(s.reasonPhrase))
+	}
+	return b
+}
+
 func (s *connectionCloseFrame) String() string {
 	return fmt.Sprintf("close{error=%d frame=%d reason=%s}", s.errorCode, s.frameType, s.reasonPhrase)
 }
@@ -1176,6 +1323,12 @@ func (s *newTokenFrame) decode(b []byte) (int, error) {
 	return dec.offset(), nil
 }
 
+func (s *newTokenFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "new_token")
+	b = appendField(b, "token", s.token)
+	return b
+}
+
 func (s *newTokenFrame) String() string {
 	return fmt.Sprintf("newToken{token=%x}", s.token)
 }
@@ -1203,6 +1356,11 @@ func (s *handshakeDoneFrame) decode(b []byte) (int, error) {
 		n = getVarint(b, &typ)
 	}
 	return n, nil
+}
+
+func (s *handshakeDoneFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "handshake_done")
+	return b
 }
 
 func (s *handshakeDoneFrame) String() string {
@@ -1254,6 +1412,12 @@ func (s *datagramFrame) decode(b []byte) (int, error) {
 	}
 	s.data = b[dec.offset():]
 	return len(b), nil
+}
+
+func (s *datagramFrame) log(b []byte) []byte {
+	b = appendField(b, "frame_type", "datagram")
+	b = appendField(b, "length", len(s.data))
+	return b
 }
 
 func (s *datagramFrame) String() string {

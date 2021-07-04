@@ -129,13 +129,13 @@ func (s *serverHandler) serveSync(c *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
 		case transport.EventStreamReadable:
-			err := s.handleStreamReadable(c, e.ID)
+			err := s.handleStreamReadable(c, e.Data)
 			if err != nil {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
 			}
 		case transport.EventStreamWritable:
-			err := s.handleStreamWritable(c, e.ID)
+			err := s.handleStreamWritable(c, e.Data)
 			if err != nil {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return
@@ -245,7 +245,7 @@ func (s *serverHandler) serveAsync(c *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
 		case transport.EventStreamOpen:
-			st, err := c.Stream(e.ID)
+			st, err := c.Stream(e.Data)
 			if err != nil {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return

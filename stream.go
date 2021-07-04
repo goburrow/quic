@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -44,6 +45,10 @@ type Stream struct {
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
+	// Due to asynchronous operators, application may not fully read data when the connection is closed.
+	// This stream needs to own the QUIC Stream in this case so that the application can continue reading.
+	closeErr error
+	closeRd  io.Reader
 }
 
 var (
@@ -65,27 +70,29 @@ func newStream(conn *Conn, id uint64) *Stream {
 
 // Write writes data to the connection stream.
 // The function is blocked until all data are put into stream buffer or timeout.
-func (s *Stream) Write(b []byte) (n int, err error) {
-	select {
-	case <-s.closeCh:
-		// This connection or stream is already closed.
-		return 0, errClosed
-	default:
-	}
+func (s *Stream) Write(b []byte) (int, error) {
 	s.wrMu.Lock()
 	defer s.wrMu.Unlock()
 
+	select {
+	case <-s.closeCh:
+		// This connection or stream is already closed.
+		return 0, s.closeErr
+	default:
+		return s.writeLocked(b)
+	}
+}
+
+func (s *Stream) writeLocked(b []byte) (int, error) {
 	s.wrData.setBuf(b)
-	defer func() {
-		n = s.wrData.setBuf(nil)
-	}()
 	cmd := connCommand{
 		cmd: cmdStreamWrite,
 		id:  s.id,
 	}
+	var err error
 	select {
 	case <-s.closeCh:
-		err = errClosed
+		err = s.closeErr
 	case <-s.wrData.deadlineCh:
 		err = errDeadlineExceeded
 	case s.conn.cmdCh <- cmd:
@@ -94,7 +101,7 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 		for err == errWait {
 			select {
 			case <-s.closeCh:
-				err = errClosed
+				err = s.closeErr
 			case <-s.wrData.deadlineCh:
 				err = errDeadlineExceeded
 			case <-s.wrData.waitCh:
@@ -102,32 +109,39 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 			}
 		}
 	}
-	return
+	n := s.wrData.setBuf(nil)
+	return n, err
 }
 
 // Read reads data from the stream.
 // The function is blocked until any stream data is available or timeout.
-func (s *Stream) Read(b []byte) (n int, err error) {
-	select {
-	case <-s.closeCh:
-		// This connection or stream is already closed.
-		return 0, errClosed
-	default:
-	}
+func (s *Stream) Read(b []byte) (int, error) {
 	s.rdMu.Lock()
 	defer s.rdMu.Unlock()
 
+	select {
+	case <-s.closeCh:
+		// This connection or stream is already closed.
+		return s.readClosed(b)
+	default:
+		return s.readLocked(b)
+	}
+}
+
+func (s *Stream) readLocked(b []byte) (int, error) {
 	s.rdData.setBuf(b)
-	defer func() {
-		n = s.rdData.setBuf(nil)
-	}()
 	cmd := connCommand{
 		cmd: cmdStreamRead,
 		id:  s.id,
 	}
+	var err error
 	select {
 	case <-s.closeCh:
-		err = errClosed
+		n := s.rdData.setBuf(nil)
+		if n > 0 {
+			return n, nil
+		}
+		return s.readClosed(b)
 	case <-s.rdData.deadlineCh:
 		err = errDeadlineExceeded
 	case s.conn.cmdCh <- cmd:
@@ -136,7 +150,11 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 		for err == errWait {
 			select {
 			case <-s.closeCh:
-				err = errClosed
+				n := s.rdData.setBuf(nil)
+				if n > 0 {
+					return n, nil
+				}
+				return s.readClosed(b)
 			case <-s.rdData.deadlineCh:
 				err = errDeadlineExceeded
 			case <-s.rdData.waitCh:
@@ -144,7 +162,20 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 			}
 		}
 	}
-	return
+	n := s.rdData.setBuf(nil)
+	return n, err
+}
+
+func (s *Stream) readClosed(b []byte) (int, error) {
+	if s.closeRd == nil {
+		return 0, s.closeErr
+	}
+	n, err := s.closeRd.Read(b)
+	if err == nil && n == 0 {
+		// Nothing else to read
+		err = s.closeErr
+	}
+	return n, err
 }
 
 // Close closes the sending part of the stream.
@@ -195,11 +226,15 @@ func (s *Stream) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+func (s *Stream) String() string {
+	return fmt.Sprintf("stream_id=%v", s.id)
+}
+
 func (s *Stream) close(comm command, errorCode uint64) error {
 	select {
 	case <-s.closeCh:
 		// This connection or stream is already closed.
-		return errClosed
+		return s.closeErr
 	default:
 	}
 	s.clMu.Lock()
@@ -212,7 +247,7 @@ func (s *Stream) close(comm command, errorCode uint64) error {
 	}
 	select {
 	case <-s.closeCh:
-		return errClosed
+		return s.closeErr
 	case s.conn.cmdCh <- cmd:
 		return <-s.clResultCh
 	}
@@ -252,8 +287,12 @@ func (s *Stream) sendCloseResult(err error) {
 }
 
 // setClosed is called from Conn goroutine.
-func (s *Stream) setClosed() {
-	s.closeOnce.Do(func() { close(s.closeCh) })
+func (s *Stream) setClosed(err error, rd io.Reader) {
+	s.closeOnce.Do(func() {
+		s.closeErr = err
+		s.closeRd = rd
+		close(s.closeCh)
+	})
 }
 
 type dataBuffer struct {
@@ -286,6 +325,7 @@ func (s *dataBuffer) checkWaiting() bool {
 	}
 }
 
+// setBuf sets new new buffer for data and return old read/write offset.
 func (s *dataBuffer) setBuf(b []byte) int {
 	s.buf = b
 	n := s.off

@@ -41,7 +41,7 @@ func (datagramCommand) Run(args []string) error {
 	addr := cmd.Arg(0)
 	config := newConfig()
 	config.Params.MaxIdleTimeout = 30 * time.Second
-	config.Params.MaxDatagramPayloadSize = 1024
+	config.Params.MaxDatagramFramePayloadSize = 1024
 	// Disable streams
 	config.Params.InitialMaxStreamDataBidiLocal = 0
 	config.Params.InitialMaxStreamDataBidiRemote = 0
@@ -126,7 +126,10 @@ func (s *datagramClientHandler) Serve(c *quic.Conn, events []transport.Event) {
 
 func (s *datagramClientHandler) handleDatagramWritable(c *quic.Conn) error {
 	if len(s.data) > 0 {
-		return c.DatagramWrite([]byte(s.data))
+		_, err := c.DatagramWrite([]byte(s.data))
+		if err != nil {
+			return err
+		}
 	}
 	// Read from stdin and send each line in a datagram.
 	go func(dgram *quic.Datagram) {
@@ -145,10 +148,15 @@ func (s *datagramClientHandler) handleDatagramWritable(c *quic.Conn) error {
 }
 
 func (s *datagramClientHandler) handleDatagramReadable(c *quic.Conn) error {
+	b := buffers.pop()
+	defer buffers.push(b)
 	for {
-		d := c.DatagramRead()
-		if len(d) > 0 {
-			_, err := fmt.Fprintf(os.Stdout, "recv: %s\n", d)
+		n, err := c.DatagramRead(b)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			_, err := fmt.Fprintf(os.Stdout, "recv: %s\n", b[:n])
 			if err != nil {
 				return err
 			}
@@ -177,10 +185,15 @@ func (s *datagramServerHandler) Serve(c *quic.Conn, events []transport.Event) {
 
 func (s *datagramServerHandler) handleDatagramReadable(c *quic.Conn) error {
 	// Echo back
+	b := buffers.pop()
+	defer buffers.push(b)
 	for {
-		d := c.DatagramRead()
-		if len(d) > 0 {
-			err := c.DatagramWrite(d)
+		n, err := c.DatagramRead(b)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			n, err = c.DatagramWrite(b[:n])
 			if err != nil {
 				return err
 			}

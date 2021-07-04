@@ -131,7 +131,9 @@ func TestRangeBufferInsertPos(t *testing.T) {
 		}
 		idx := x.ls.insertPos(b.offset)
 		x.ls.insert(idx, b)
-		x.assertSize(i+1, max-min)
+		if x.ls.length() != max-min {
+			t.Fatalf("expect length: %v, actual: %v", max-min, x.ls.length())
+		}
 		x.assertOrdered()
 	}
 }
@@ -192,7 +194,7 @@ func TestRangeBufferPushDataOverlap(t *testing.T) {
 	x.ls.write(data[150:200], 150)
 	x.assertSnapshot("ranges=4 [40,50) [50,100) [100,120) [150,200)")
 	x.assertOrdered()
-	x.assertSize(4, 160)
+	x.assertSize(4, 130)
 
 	read := make([]byte, len(data))
 	n := x.ls.read(read, 150)
@@ -218,7 +220,7 @@ func TestRangeBufferWrite(t *testing.T) {
 		offset := rand.Intn(len(data) - 1)
 		end := offset + 1 + rand.Intn(len(data)-1-offset)
 		x.ls.write(data[offset:end], uint64(offset))
-		if !isListOrdered(x.ls) {
+		if !isListOrdered(&x.ls) {
 			t.Fatalf("expect sorted: off=%d len=%d end=%d\nactual: %+v\nprev:   %s",
 				offset, end-offset, end, &x.ls, prev)
 		}
@@ -256,15 +258,56 @@ func TestRangeBufferPop(t *testing.T) {
 	x.assertSnapshot("ranges=1 [160,180)")
 }
 
+func TestRangeBufferDataCopied(t *testing.T) {
+	x := rangeBufferListTest{t: t}
+	data := makeData(100)
+	x.ls.write(data[:40], 0)
+	x.ls.write(data[40:90], 40)
+
+	for i := range data {
+		data[i] = 0
+	}
+	data = makeData(100)
+	read := make([]byte, 100)
+	x.ls.read(read[:60], 0)
+	if !bytes.Equal(data[:60], read[:60]) {
+		t.Fatalf("read data:\nexpect: %x\nactual: %x", data[:60], read[:60])
+	}
+	for i := range read {
+		read[i] = 0
+	}
+	read, off := x.ls.pop(20)
+	if off != 60 || !bytes.Equal(data[60:80], read) {
+		t.Fatalf("read data:\nexpect: %x\nactual: %x", data[60:80], read)
+	}
+	for i := range read {
+		read[i] = 0
+	}
+	x.ls.write(data[70:], 70)
+	for i := range data {
+		data[i] = 0
+	}
+	data = makeData(100)
+	x.assertSnapshot("ranges=3 [70,80) [80,90) [90,100)")
+	read, off = x.ls.pop(25)
+	if off != 70 || !bytes.Equal(data[70:95], read) {
+		t.Fatalf("read data:\nexpect: %x\nactual: %x", data[70:], read)
+	}
+}
+
 func BenchmarkRangeBuffer(b *testing.B) {
 	b.ReportAllocs()
 	ls := rangeBufferList{}
-	data := make([]byte, 1000)
+	data := make([]byte, 1500)
 	for i := 0; i < b.N; i++ {
 		ls.write(data, 0)
-		ls.write(data, uint64(len(data)))
-		ls.read(data, 0)
-		ls.read(data, uint64(len(data)))
+		ls.write(data, 1500)
+		ls.read(data[:1000], 0)
+		ls.read(data[:1000], 1000)
+		ls.read(data[:1000], 2000)
+		if !ls.isEmpty() {
+			b.Fatalf("expect range empty: actual: %v", &ls)
+		}
 	}
 }
 
@@ -274,15 +317,15 @@ type rangeBufferListTest struct {
 }
 
 func (t *rangeBufferListTest) assertOrdered() {
-	if !isListOrdered(t.ls) {
+	if !isListOrdered(&t.ls) {
 		t.t.Helper()
 		t.t.Fatalf("list is not sorted\nactual: %+v", &t.ls)
 	}
 }
 
-func (t *rangeBufferListTest) assertSize(length int, size uint64) {
-	ls := t.ls
-	if len(ls) != length {
+func (t *rangeBufferListTest) assertSize(length int, size int) {
+	ls := &t.ls
+	if len(ls.ls) != length {
 		t.t.Helper()
 		t.t.Fatalf("length does not match:\nexpect: %d\nactual: %+v", length, ls)
 	}
@@ -300,10 +343,10 @@ func (t *rangeBufferListTest) assertSnapshot(expect string) {
 	}
 }
 
-func isListOrdered(ls rangeBufferList) bool {
-	for i, b := range ls {
-		if i < len(ls)-1 {
-			next := ls[i+1]
+func isListOrdered(s *rangeBufferList) bool {
+	for i, b := range s.ls {
+		if i < len(s.ls)-1 {
+			next := s.ls[i+1]
 			if b.offset+uint64(len(b.data)) > next.offset {
 				return false
 			}

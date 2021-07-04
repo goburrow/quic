@@ -146,7 +146,7 @@ func (s *clientHandler) serveSync(c *quic.Conn, events []transport.Event) {
 				return
 			}
 		case transport.EventStreamReadable:
-			err := s.handleStreamReadable(c, e.ID)
+			err := s.handleStreamReadable(c, e.Data)
 			if err != nil {
 				c.CloseWithError(transport.ApplicationError, err.Error())
 				return

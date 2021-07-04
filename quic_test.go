@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,12 +25,12 @@ func TestServerAndClient(t *testing.T) {
 			switch e.Type {
 			case transport.EventConnOpen:
 			case transport.EventStreamOpen:
-				if e.ID != 4 || e.Data != 1 {
+				if e.Data != 4 {
 					t.Errorf("expect client open stream %d, actual %v", 4, e)
 				}
 			case transport.EventStreamReadable:
 				buf := make([]byte, 8)
-				n, err := conn.StreamRead(e.ID, buf)
+				n, err := conn.StreamRead(e.Data, buf)
 				if err != io.EOF {
 					t.Errorf("server stream receive: %v", err)
 					conn.Close()
@@ -38,16 +39,17 @@ func TestServerAndClient(t *testing.T) {
 				if string(buf[:n]) != "ping" {
 					t.Errorf("expect server receive: ping. Got %s", buf[:n])
 				}
-				n, err = conn.StreamWrite(e.ID, []byte("pong"))
+				n, err = conn.StreamWrite(e.Data, []byte("pong"))
 				if n != 4 || err != nil {
 					t.Errorf("server stream send: %v %v", n, err)
 					conn.Close()
 					return
 				}
 			case transport.EventStreamWritable:
-				if e.ID != 4 {
-					t.Errorf("expect writable stream %d, actual %d", 4, e.ID)
+				if e.Data != 4 {
+					t.Errorf("expect writable stream %d, actual %d", 4, e.Data)
 				}
+			case transport.EventStreamCreatable:
 			case transport.EventConnClosed:
 			default:
 				t.Errorf("unexpected event: %#v", e)
@@ -77,7 +79,7 @@ func TestServerAndClient(t *testing.T) {
 				conn.StreamClose(4)
 			case transport.EventStreamReadable:
 				buf := make([]byte, 8)
-				n, err := conn.StreamRead(e.ID, buf)
+				n, err := conn.StreamRead(e.Data, buf)
 				if n > 0 {
 					recvData <- buf[:n]
 				} else {
@@ -86,13 +88,14 @@ func TestServerAndClient(t *testing.T) {
 				}
 				conn.Close()
 			case transport.EventStreamWritable:
-				if e.ID != 4 {
-					t.Errorf("expect writable stream %d, actual %d", 4, e.ID)
+				if e.Data != 4 {
+					t.Errorf("expect writable stream %d, actual %d", 4, e.Data)
 				}
 			case transport.EventStreamComplete:
-				if e.ID != 4 {
-					t.Errorf("expect stream send complete %d, actual %d", 4, e.ID)
+				if e.Data != 4 {
+					t.Errorf("expect stream send complete %d, actual %d", 4, e.Data)
 				}
+			case transport.EventStreamCreatable:
 			case transport.EventConnClosed:
 			default:
 				t.Errorf("unexpected event: %#v", e)
@@ -132,6 +135,11 @@ func TestClientCloseHandshake(t *testing.T) {
 		if len(events) != 1 || events[0].Type != transport.EventConnClosed {
 			t.Errorf("expect only close event, got %v", events)
 		}
+		// Get error sent by the client
+		err := conn.Close()
+		if err == nil || !strings.HasPrefix(err.Error(), "error_code=crypto_error_42") {
+			t.Errorf("expect error: crypto_error_42, actual: %v", err)
+		}
 		closeCh <- struct{}{}
 	}))
 	defer s.Close()
@@ -141,6 +149,8 @@ func TestClientCloseHandshake(t *testing.T) {
 		if len(events) != 1 || events[0].Type != transport.EventConnClosed {
 			t.Errorf("expect only close event, got %v", events)
 		}
+		state := conn.ConnectionState()
+		t.Logf("client state: %+v", state)
 		closeCh <- struct{}{}
 	}))
 	defer c.Close()
@@ -156,7 +166,8 @@ func TestClientCloseHandshake(t *testing.T) {
 		select {
 		case <-closeCh:
 		case <-timeout:
-			t.Errorf("receive timed out")
+			t.Errorf("timed out")
+			return
 		}
 	}
 }

@@ -30,6 +30,7 @@ package quic
 import (
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -39,13 +40,12 @@ import (
 )
 
 const (
-	maxDatagramSize = transport.MaxIPv6PacketSize
-	cidLength       = transport.MaxCIDLength
-	bufferSize      = 1500
+	cidLength = 16 // must be less than transport.MaxCIDLength
+	// bufferSize is the size of the global buffers for sending and receiving UDP datagrams.
+	bufferSize = 1500
 )
 
-var errClosed = errors.New("use of closed connection") // XXX: use net.ErrClosed in Go 1.6?
-var errDeadlineExceeded = deadlineExceededError{}      // XXX: use os.ErrDeadlineExceeded?
+var errDeadlineExceeded = deadlineExceededError{} // XXX: use os.ErrDeadlineExceeded?
 var errWait = errors.New("waiting")
 
 type deadlineExceededError struct{}
@@ -81,19 +81,26 @@ func (s noopHandler) Serve(*Conn, []transport.Event) {}
 // Conn is not safe for concurrent use.
 // Its methods would only be called inside the Handler callback.
 type Conn struct {
-	scid []byte
-	addr net.Addr
 	conn *transport.Conn
+	addr net.Addr
+	scid []byte
 
-	streams  map[uint64]*Stream
-	datagram *Datagram
+	streams  map[uint64]*Stream // async streams
+	datagram *Datagram          // async datagram
 
 	events []transport.Event
 	// Channels for communicating with the connection.
 	recvCh chan *packet
 	cmdCh  chan connCommand
+	// Timers
+	timeoutTimer *time.Timer // Read timeout timer, set when polling.
+	delayTimer   *time.Timer // Delay timer, set when sending.
 	// Initial attempt key genereted for server connection.
 	attemptKey []byte
+	// Max UDP payload size for sending. It is initiated to MinInitialPacketSize (1200)
+	// and is updated when the connection is established using peer transport parameter
+	// max_udp_payload_size.
+	maxDatagramSize uint
 	// Stream IDs
 	nextStreamIDBidi uint64
 	nextStreamIDUni  uint64
@@ -103,16 +110,18 @@ type Conn struct {
 
 func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn, isClient bool) *Conn {
 	c := &Conn{
-		addr: addr,
 		scid: scid,
+		addr: addr,
 		conn: conn,
 
 		streams: make(map[uint64]*Stream),
-		recvCh:  make(chan *packet, 8),
-		cmdCh:   make(chan connCommand, 4),
+		recvCh:  make(chan *packet, 16),
+		cmdCh:   make(chan connCommand, 8),
 
 		nextStreamIDBidi: 0, // client by default
 		nextStreamIDUni:  2, // client by default
+
+		maxDatagramSize: transport.MinInitialPacketSize,
 	}
 	if !isClient {
 		c.nextStreamIDBidi++
@@ -209,15 +218,14 @@ func (s *Conn) NewStream(bidi bool) (uint64, bool) {
 }
 
 // DatagramWrite queues data to the connection buffer for sending via datagram.
-func (s *Conn) DatagramWrite(b []byte) error {
-	_, err := s.conn.Datagram().Write(b)
-	return err
+func (s *Conn) DatagramWrite(b []byte) (int, error) {
+	return s.conn.Datagram().Write(b)
 }
 
 // DatagramRead pulls received datagram directly from the connection buffer.
 // It returns nil when there is no data to read.
-func (s *Conn) DatagramRead() []byte {
-	return s.conn.Datagram().Pop()
+func (s *Conn) DatagramRead(b []byte) (int, error) {
+	return s.conn.Datagram().Read(b)
 }
 
 // Datagram returns a Datagram associated with the connection.
@@ -251,40 +259,42 @@ func (s *Conn) UserData() interface{} {
 	return s.userData
 }
 
-// Close sets the connection status to close state.
-func (s *Conn) Close() error {
-	s.setClosing(transport.NoError, "bye")
-	return nil
+func (s *Conn) String() string {
+	return fmt.Sprintf("scid=%x", s.scid)
 }
 
-// CloseWithError sets the connection to close state with provided code and reason sending to peer.
-func (s *Conn) CloseWithError(code uint64, reason string) {
-	s.conn.Close(true, code, reason)
+// Close sets the connection status to closing state.
+// If peer has already initiated closing with an error, this function will return
+// that error, which is either transport.Error or transport.AppError
+func (s *Conn) Close() error {
+	return s.conn.Close(transport.NoError, "bye", false)
+}
+
+// CloseWithError sets the connection to closing state with an
+// application code code and reason sending to peer.
+// The function returns error if peer has already initiated closing.
+func (s *Conn) CloseWithError(code uint64, reason string) error {
+	return s.conn.Close(code, reason, true)
+}
+
+func (s *Conn) setClosing(errCode uint64, reason string) {
+	s.conn.Close(errCode, reason, false)
+}
+
+func (s *Conn) onClosed(err error) {
+	// When connection closed and there are still data not read by Datagram or Stream
+	// because of async
+	if s.datagram != nil {
+		s.datagram.setClosed(err, s.conn.Datagram())
+	}
+	for id, st := range s.streams {
+		t, _ := s.conn.Stream(id)
+		st.setClosed(err, t)
+	}
 }
 
 func (s *Conn) readEvents() {
 	s.events = s.conn.Events(s.events)
-}
-
-func (s *Conn) clearEvents() {
-	for i := range s.events {
-		// Not necessary, but just in case more fields are added to Event in future.
-		s.events[i] = transport.Event{}
-	}
-	s.events = s.events[:0]
-}
-
-func (s *Conn) setClosing(errCode uint64, reason string) {
-	s.conn.Close(false, errCode, reason)
-}
-
-func (s *Conn) onClosed() {
-	if s.datagram != nil {
-		s.datagram.setClosed()
-	}
-	for _, st := range s.streams {
-		st.setClosed()
-	}
 }
 
 // handleEvents handles transport connection events.
@@ -292,15 +302,16 @@ func (s *Conn) handleEvents() {
 	for _, e := range s.events {
 		switch e.Type {
 		case transport.EventStreamWritable:
-			s.eventStreamWritable(e.ID)
+			s.eventStreamWritable(e.Data)
 		case transport.EventStreamReadable:
-			s.eventStreamReadable(e.ID)
+			s.eventStreamReadable(e.Data)
 		case transport.EventStreamClosed:
-			s.eventStreamClosed(e.ID)
+			s.eventStreamClosed(e.Data)
 		case transport.EventDatagramReadable:
 			s.eventDatagramReadable()
 		}
 	}
+	s.events = s.events[:0]
 }
 
 // handleCommand handles commands sent by Stream or Datagram.
@@ -480,9 +491,12 @@ func (s *Conn) eventStreamReadable(streamID uint64) {
 }
 
 func (s *Conn) eventStreamClosed(streamID uint64) {
+	// Stream has been closed gracefully.
 	ss := s.streams[streamID]
 	if ss != nil {
-		ss.setClosed()
+		// We do not expect application to read this error as stream is only closed
+		// when data is fully read by the application.
+		ss.setClosed(io.ErrClosedPipe, nil)
 		delete(s.streams, streamID)
 	}
 }
@@ -500,6 +514,45 @@ func (s *Conn) eventDatagramReadable() {
 			return
 		}
 		s.datagram.sendReadResult(errWait)
+	}
+}
+
+// setTimeoutTimer set timer with the duration from connection receive timeout.
+func (s *Conn) setTimeoutTimer() {
+	timeout := s.conn.Timeout()
+	if timeout < 0 {
+		// TODO
+		timeout = 10 * time.Second
+	}
+	if s.timeoutTimer == nil {
+		s.timeoutTimer = time.NewTimer(timeout)
+	} else {
+		s.timeoutTimer.Reset(timeout)
+	}
+}
+
+func (s *Conn) stopTimeoutTimer() {
+	s.timeoutTimer.Stop()
+}
+
+func (s *Conn) setDelayTimer(d time.Duration) {
+	if s.delayTimer == nil {
+		s.delayTimer = time.NewTimer(d)
+	} else {
+		s.delayTimer.Reset(d)
+	}
+}
+
+func (s *Conn) stopDelayTimer() {
+	s.delayTimer.Stop()
+}
+
+func (s *Conn) setMaxDatagramSize(v uint) {
+	if v >= transport.MinInitialPacketSize {
+		if v > bufferSize {
+			v = bufferSize
+		}
+		s.maxDatagramSize = v
 	}
 }
 
@@ -571,37 +624,33 @@ func (s *localConn) handleConn(c *Conn) {
 					c.attemptKey = nil
 					s.peersMu.Unlock()
 				}
+				c.setMaxDatagramSize(uint(c.conn.ConnectionState().PeerParams.MaxUDPPayloadSize))
 				established = true
 				s.serveConn(c)
 			}
 		}
-		p := newPacket()
-		s.sendConn(c, p.buf[:maxDatagramSize])
-		freePacket(p)
+		n, _ := s.sendConn(c)
+		if n > 0 && established {
+			s.serveConn(c)
+		}
 	}
 }
 
 func (s *localConn) pollConn(c *Conn) {
-	timeout := c.conn.Timeout()
-	if timeout < 0 {
-		// TODO
-		timeout = 10 * time.Second
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	c.setTimeoutTimer()
+	defer c.stopTimeoutTimer()
 	select {
 	case p := <-c.recvCh:
 		// Got packet
-		err := s.recvConn(c, p.data)
-		freePacket(p)
+		err := s.recvConn(c, p)
 		if err != nil {
 			return
 		}
 	case p := <-c.cmdCh:
 		c.handleCommand(&p)
-	case <-timer.C:
+	case <-c.timeoutTimer.C:
 		// Read timeout
-		s.logger.log(levelTrace, "verbose cid=%x addr=%s message=read_timed_out: %s", c.scid, c.addr, timeout)
+		s.logger.log(levelTrace, "verbose cid=%x addr=%s message=read_timed_out", c.scid, c.addr)
 		c.conn.Write(nil)
 		return
 	case <-s.closeCh:
@@ -610,79 +659,118 @@ func (s *localConn) pollConn(c *Conn) {
 		return
 	}
 	// Maybe another packets arrived too while we processed the first one.
-	if c.conn.HandshakeComplete() {
+	packets := s.pollConnNoDelay(c)
+	if packets == 0 && c.conn.HandshakeComplete() {
 		// Only for application space
-		s.pollConnDelay(c)
+		// TODO: check whether we only need to send back ACK, then we can delay it.
+		s.pollConnDelay(c, 2*time.Millisecond)
 	}
 }
 
-func (s *localConn) pollConnDelay(c *Conn) {
-	// TODO: check whether we only need to send back ACK, then we can delay it.
-	timer := time.NewTimer(2 * time.Millisecond) // FIXME: timer granularity
-	defer timer.Stop()
+func (s *localConn) pollConnNoDelay(c *Conn) int {
+	packets := 0
 	for i := 8; i > 0; i-- {
 		select {
-		case <-timer.C:
-			return
 		case p := <-c.recvCh:
-			err := s.recvConn(c, p.data)
-			freePacket(p)
+			err := s.recvConn(c, p)
 			if err != nil {
-				return
+				return -1
 			}
+			packets++
 		case p := <-c.cmdCh:
 			c.handleCommand(&p)
 		case <-s.closeCh:
 			c.Close()
-			return
+			return -1
+		default:
+			return packets
 		}
 	}
+	return packets
 }
 
-func (s *localConn) recvConn(c *Conn, data []byte) error {
-	n, err := c.conn.Write(data)
+func (s *localConn) pollConnDelay(c *Conn, delay time.Duration) int {
+	c.setDelayTimer(delay)
+	defer c.stopDelayTimer()
+	packets := 0
+	for i := 8; i > 0; i-- {
+		select {
+		case <-c.delayTimer.C:
+			return packets
+		case p := <-c.recvCh:
+			err := s.recvConn(c, p)
+			if err != nil {
+				return -1
+			}
+			packets++
+		case p := <-c.cmdCh:
+			c.handleCommand(&p)
+		case <-s.closeCh:
+			c.Close()
+			return -1
+		}
+	}
+	return packets
+}
+
+func (s *localConn) recvConn(c *Conn, p *packet) error {
+	defer freePacket(p)
+	s.logger.log(levelTrace, "datagrams_received cid=%x addr=%s raw=%x", c.scid, c.addr, p.data)
+	_, err := c.conn.Write(p.data)
 	if err != nil {
-		if _, ok := transport.IsPacketDropped(err); ok {
+		if trigger := transport.IsPacketDropped(err); trigger != "" {
 			// TODO: queue packet for later processing.
 			return nil
 		}
 		// Close connection when receive failed
+		s.logger.log(levelError, "error cid=%x addr=%s message=receive_failed: %v", c.scid, c.addr, err)
 		if err, ok := err.(*transport.Error); ok {
-			c.setClosing(err.Code, err.Message)
+			c.setClosing(err.Code, err.Reason)
 		} else {
-			s.logger.log(levelError, "internal_error cid=%x addr=%s description=receive_failed: %v", c.scid, c.addr, err)
 			c.setClosing(transport.InternalError, "")
 		}
 		return err
 	}
-	s.logger.log(levelTrace, "datagrams_processed cid=%x addr=%s byte_length=%d", c.scid, c.addr, n)
 	return nil
 }
 
-func (s *localConn) sendConn(c *Conn, buf []byte) error {
+// sendConn returns additional received packets when waiting.
+func (s *localConn) sendConn(c *Conn) (int, error) {
+	p := newPacket()
+	defer freePacket(p)
+	buf := p.buf[:c.maxDatagramSize]
+	packets := 0
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
 			// Close connection when send failed
+			s.logger.log(levelError, "error cid=%x addr=%s message=send_failed: %v", c.scid, c.addr, err)
 			if err, ok := err.(*transport.Error); ok {
-				c.setClosing(err.Code, err.Message)
+				c.setClosing(err.Code, err.Reason)
 			} else {
-				s.logger.log(levelError, "internal_error cid=%x addr=%s description=send_failed: %v", c.scid, c.addr, err)
 				c.setClosing(transport.InternalError, "")
 			}
-			return err
+			return 0, err
 		}
 		if n == 0 {
 			s.logger.log(levelTrace, "verbose cid=%x addr=%s message=send_done", c.scid, c.addr)
-			return nil
+			return packets, nil
+		}
+		delay := c.conn.Delay()
+		if delay > 0 {
+			// Process incoming packets or commands while waiting until the time for sending this packet.
+			pkt := s.pollConnDelay(c, delay)
+			if pkt > 0 {
+				packets += pkt
+			}
 		}
 		n, err = s.socket.WriteTo(buf[:n], c.addr)
 		if err != nil {
-			s.logger.log(levelError, "internal_error cid=%x addr=%s description=send_failed: %v", c.scid, c.addr, err)
+			s.logger.log(levelError, "error cid=%x addr=%s message=send_failed: %v", c.scid, c.addr, err)
 			c.setClosing(transport.InternalError, "")
-			return err
+			return 0, err
 		}
-		s.logger.log(levelTrace, "datagrams_sent cid=%x addr=%s byte_length=%d raw=%x", c.scid, c.addr, n, buf[:n])
+		s.logger.log(levelTrace, "datagrams_sent cid=%x addr=%s raw=%x", c.scid, c.addr, buf[:n])
 	}
 }
 
@@ -692,17 +780,27 @@ func (s *localConn) serveConn(c *Conn) {
 		s.logger.log(levelDebug, "debug cid=%x message=events: %v", c.scid, c.events)
 		s.handler.Serve(c, c.events)
 		c.handleEvents()
-		c.clearEvents()
 	}
 }
 
 func (s *localConn) connClosed(c *Conn) {
-	s.logger.log(levelInfo, "connection_closed cid=%x addr=%s", c.scid, c.addr)
+	// Use peer error if presents
+	state := c.ConnectionState()
+	err := state.PeerError
+	if err == nil {
+		err = state.LocalError
+	}
+	if err == nil {
+		s.logger.log(levelInfo, "connection_closed cid=%x addr=%s", c.scid, c.addr)
+		err = net.ErrClosed // Async streams will get this error.
+	} else {
+		s.logger.log(levelError, "connection_closed cid=%x addr=%s %v", c.scid, c.addr, err)
+	}
 	s.serveConn(c)
-	c.onClosed() // This is called after callback to ensure resources are created after cleanup
+	c.onClosed(err) // This is called after callback to cleanup any resources the application created.
 
 	s.peersMu.Lock()
-	delete(s.peers, string(c.scid[:]))
+	delete(s.peers, string(c.scid))
 	if c.attemptKey != nil {
 		delete(s.peers, string(c.attemptKey))
 		c.attemptKey = nil

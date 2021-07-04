@@ -96,10 +96,8 @@ func (s *transactionLogger) logEvent(e transport.LogEvent) {
 		b.WriteString(" ")
 		b.WriteString(s.prefix)
 	}
-	for _, f := range e.Fields {
-		b.WriteString(" ")
-		b.WriteString(f.String())
-	}
+	b.WriteString(" ")
+	b.Write(e.Message)
 	b.WriteString("\n")
 	s.writer.Write(b.Bytes())
 }

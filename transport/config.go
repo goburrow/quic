@@ -6,7 +6,7 @@
 // 	server, err := transport.Accept(scid, odcid, serverConfig)
 //
 // 	clientConfig := transport.NewConfig()
-// 	client, err := transport.Connect(scid, config)
+// 	client, err := transport.Connect(scid, dcid, clientConfig)
 //
 // To use the connection, feed it with input data and then get output data
 // sending to peer:
@@ -37,14 +37,8 @@ import (
 const (
 	// MaxCIDLength is the maximum length of a Connection ID
 	MaxCIDLength = 20
-
-	// https://www.rfc-editor.org/rfc/rfc9000.html#section-14
-
-	// MaxIPv6PacketSize is the QUIC maximum packet size for IPv6 when Path MTU Discovery is missing.
-	MaxIPv6PacketSize = 1232
-	// MaxIPv4PacketSize is the QUIC maximum packet size for IPv4 when Path MTU Discovery is missing.
-	MaxIPv4PacketSize = 1252
 	// MinInitialPacketSize is the QUIC minimum packet size when it contains Initial packet.
+	// https://www.rfc-editor.org/rfc/rfc9000.html#section-14
 	MinInitialPacketSize = 1200
 )
 
