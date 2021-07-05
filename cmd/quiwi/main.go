@@ -52,9 +52,9 @@ func newConfig() *transport.Config {
 	c.Params.MaxUDPPayloadSize = 1350
 	c.Params.MaxIdleTimeout = 30 * time.Second
 	c.Params.InitialMaxData = 1000000
-	c.Params.InitialMaxStreamDataBidiLocal = 100000
-	c.Params.InitialMaxStreamDataBidiRemote = 100000
-	c.Params.InitialMaxStreamDataUni = 100000
+	c.Params.InitialMaxStreamDataBidiLocal = 500000
+	c.Params.InitialMaxStreamDataBidiRemote = 500000
+	c.Params.InitialMaxStreamDataUni = 500000
 	c.Params.InitialMaxStreamsBidi = 8
 	c.Params.InitialMaxStreamsUni = 8
 	c.TLS = &tls.Config{

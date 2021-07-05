@@ -9,5 +9,5 @@ index cd3e42e..c12c400 100644
 -	initialRTT = 333 * time.Millisecond
 +	initialRTT = 100 * time.Millisecond
  
- 	// Endpoints should use an initial congestion window of 10 times the maximum datagram size,
- 	// limited to the larger of 14720 or twice the maximum datagram size
+ 	// The period of time for persistent congestion to be established,
+ 	// specified as a PTO multiplier. The recommended value is 3, which is approximately

@@ -102,7 +102,7 @@ func (s *Client) Connect(addr string) error {
 	s.peersMu.Unlock()
 	// Send initial packet
 	s.logger.log(levelInfo, "connection_started vantage_point=client cid=%x addr=%v", c.scid, c.addr)
-	if _, err = s.sendConn(c); err != nil {
+	if err = s.sendConn(c); err != nil {
 		s.peersMu.Lock()
 		delete(s.peers, string(c.scid))
 		s.peersMu.Unlock()
