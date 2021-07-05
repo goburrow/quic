@@ -149,6 +149,9 @@ func newConn(config *Config, scid, dcid []byte, isClient bool) (*Conn, error) {
 	s.handshake.init(config.TLS, &s.packetNumberSpaces, isClient)
 	s.streams.init(s.localParams.InitialMaxStreamsBidi, s.localParams.InitialMaxStreamsUni)
 	s.recovery.init()
+	s.recovery.enablePacing = enablePacing
+	s.recovery.congestion.enableCubic = enableCubic
+	s.recovery.congestion.enablePRR = enablePRR
 	s.flow.init(s.localParams.InitialMaxData, 0)
 	s.scid = scid
 	s.localParams.InitialSourceCID = s.scid // SCID is fixed so can use its reference
@@ -203,7 +206,12 @@ func (s *Conn) Write(b []byte) (int, error) {
 			return n, err
 		}
 	}
-	s.checkTimeout(now)
+	if n == 0 || !s.handshakeConfirmed {
+		// Check probe timeout when the connection does not receive anything or
+		// during handshake where there are multiple packet number spaces.
+		// FIXME: What if peer does not send ACK?
+		s.checkTimeout(now)
+	}
 	return n, nil
 }
 
@@ -980,7 +988,7 @@ func (s *Conn) setPeerParams(params *Parameters, now time.Time) {
 	// Update loss recovery state
 	s.recovery.setMaxAckDelay(s.peerParams.MaxAckDelay)
 	if s.peerParams.MaxUDPPayloadSize > 0 {
-		s.recovery.setMaxDatagramSize(s.peerParams.MaxUDPPayloadSize)
+		s.recovery.setMaxDatagramSize(uint(s.peerParams.MaxUDPPayloadSize))
 	}
 	// Datagram
 	if s.peerParams.MaxDatagramFramePayloadSize > 0 {
@@ -1160,7 +1168,7 @@ func (s *Conn) send(b []byte, space packetSpace, now time.Time) (int, error) {
 		return 0, newError(InternalError, sprint("encoded payload length ", p.packetSize, " exceeded buffer capacity ", len(b)))
 	}
 	pnSpace.encryptPacket(b[:p.packetSize], &p)
-	op.sentBytes = uint64(p.packetSize)
+	op.sentBytes = uint(p.packetSize)
 	// Finish preparing sending packet
 	debug("%v sending packet %s %s", s.pov(), &p, op)
 	s.onPacketSent(op, space)
@@ -1216,9 +1224,9 @@ func (s *Conn) writeSpace() packetSpace {
 }
 
 func (s *Conn) maxPacketSize() int {
-	var n uint64
+	var n uint
 	if s.state >= stateActive && s.peerParams.MaxUDPPayloadSize > 0 {
-		n = s.peerParams.MaxUDPPayloadSize
+		n = uint(s.peerParams.MaxUDPPayloadSize)
 	} else {
 		n = MinInitialPacketSize
 	}
@@ -1234,8 +1242,8 @@ func (s *Conn) maxPacketSize() int {
 		} else {
 			maxSend = 0
 		}
-		if n > maxSend {
-			n = maxSend
+		if n > uint(maxSend) {
+			n = uint(maxSend)
 		}
 	}
 	return int(n)
@@ -1254,6 +1262,7 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 			if err != nil {
 				debug("%v process lost crypto frame %s: %v", s.pov(), f, err)
 			}
+			freeDataBuffer(f.data)
 		case *resetStreamFrame:
 			st := s.streams.get(f.streamID)
 			if st != nil {
@@ -1273,8 +1282,7 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 					debug("%v process lost stream frame %s: %v", s.pov(), f, err)
 				}
 			}
-			// A packet may be considered lost on PTO, but later is acknowledged again.
-			// So we do not put the buffer back to the pool to avoid double free.
+			freeDataBuffer(f.data)
 		case *maxDataFrame:
 			s.updateMaxData = true
 		case *maxStreamDataFrame:
@@ -1300,6 +1308,8 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 		case *handshakeDoneFrame:
 			// Toggle flag to resend HANDSHAKE_DONE frame
 			s.handshakeConfirmed = false
+		case *datagramFrame:
+			freeDataBuffer(f.data)
 		}
 	})
 }
@@ -1474,13 +1484,13 @@ func (s *Conn) sendFrames(op *sentPacket, space packetSpace, left int, now time.
 	if s.recovery.lossProbes[space] > 0 {
 		if op.ackEliciting {
 			// Do not need PING if an ack-eliciting frame is sent
-			s.recovery.lossProbes[space]--
+			s.recovery.onProbeSent(space)
 		} else if f := s.sendFramePing(left); f != nil {
 			n := f.encodedLen()
 			op.addFrame(f)
 			payloadLen += n
 			left -= n
-			s.recovery.lossProbes[space]--
+			s.recovery.onProbeSent(space)
 		}
 	}
 	return payloadLen
@@ -1565,15 +1575,11 @@ func (s *Conn) setIdleTimer(now time.Time) {
 // the last packet it got from Read.
 // A non-positive duration means the packet should be delivered immediately.
 func (s *Conn) Delay() time.Duration {
-	if !enablePacing {
-		return 0
-	}
-	scheduleTime := s.recovery.lastPacketSchedule
-	if scheduleTime.IsZero() {
+	if s.recovery.lastPacketSchedule.IsZero() {
 		return 0
 	}
 	now := s.timeFn()
-	delay := scheduleTime.Sub(now)
+	delay := s.recovery.lastPacketSchedule.Sub(now)
 	debug("packet delay: %v", delay)
 	return delay
 }

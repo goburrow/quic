@@ -27,19 +27,6 @@ const (
 	// https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.2
 	initialRTT = 333 * time.Millisecond
 
-	// Endpoints should use an initial congestion window of 10 times the maximum datagram size,
-	// limited to the larger of 14720 or twice the maximum datagram size
-	// https://www.rfc-editor.org/rfc/rfc9002.html#section-7.2
-	initialMaxDatagramSize = 1472
-	initialWindowPackets   = 10
-	// The minimum congestion window is the smallest value the congestion window can decrease
-	// to as a response to loss. The recommended value is 2 * max_datagram_size.
-	minimumWindowPackets = 2
-
-	// Reduction in congestion window when a new loss event is detected.
-	// NOTE: The value in spec is 0.5, but used as "x/2" here to avoid casting to float.
-	lossReductionFactor = 2
-
 	// The period of time for persistent congestion to be established,
 	// specified as a PTO multiplier. The recommended value is 3, which is approximately
 	// equivalent to two TLPs before an RTO in TCP.
@@ -54,12 +41,7 @@ const (
 
 	// maxUint64 indicates infinity
 	maxUint64 = ^uint64(0)
-)
-
-// Experimental
-const (
-	enablePacing = true
-	enablePRR    = true
+	maxUint   = ^uint(0)
 )
 
 // https://www.rfc-editor.org/rfc/rfc9002.html#name-sent-packet-fields
@@ -67,7 +49,8 @@ type sentPacket struct {
 	packetNumber uint64    // The packet number of the sent packet.
 	frames       []frame   // The Frames included in the packet.
 	timeSent     time.Time // The time the packet was sent.
-	sentBytes    uint64    // The number of bytes sent in the packet, including header and encryption overhead
+	timeLost     time.Time // The time the packet declared lost.
+	sentBytes    uint      // The number of bytes sent in the packet, including header and encryption overhead
 
 	// ackEliciting indicates whether a packet is ack-eliciting. If true, it is expected that
 	// an acknowledgement will be received, though the peer could delay sending the ACK frame
@@ -101,10 +84,26 @@ func (s *sentPacket) addFrame(f frame) {
 	}
 }
 
+// markLost marks this packet lost. It moves frames from the current sentPacket
+// to a clone that is returned.
+func (s *sentPacket) markLost(now time.Time) *sentPacket {
+	s.timeLost = now
+	sp := newSentPacket(s.packetNumber, s.timeSent)
+	sp.inFlight = s.inFlight
+	sp.ackEliciting = s.ackEliciting
+	sp.sentBytes = s.sentBytes
+	sp.timeLost = s.timeLost
+	sp.frames, s.frames = s.frames, sp.frames
+	return sp
+}
+
 func (s *sentPacket) String() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "packet_number=%d sent_bytes=%d ack_eliciting=%v in_flight=%v",
 		s.packetNumber, s.sentBytes, s.ackEliciting, s.inFlight)
+	if !s.timeLost.IsZero() {
+		fmt.Fprintf(&buf, " lost_time=%v", s.timeLost)
+	}
 	for _, f := range s.frames {
 		fmt.Fprintf(&buf, " %s", f)
 	}
@@ -171,6 +170,7 @@ type lossRecovery struct {
 	hasHandshakeKeys               bool
 	peerCompletedAddressValidation bool
 	handshakeConfirmed             bool
+	enablePacing                   bool
 
 	congestion congestionControl
 }
@@ -197,7 +197,7 @@ func (s *lossRecovery) onPacketSent(p *sentPacket, space packetSpace) {
 		if p.ackEliciting {
 			s.timeOfLastAckElicitingPacket[space] = p.timeSent
 		}
-		s.congestion.onPacketSent(p.sentBytes)
+		s.congestion.onPacketSent(p.sentBytes, p.timeSent)
 		s.setLossDetectionTimer(p.timeSent)
 	}
 }
@@ -215,21 +215,33 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 		s.largestAckedPacket[space] = largestAcked
 	}
 	// Finds packets that are newly acknowledged and removes them from sent packets.
-	ackedPackets := make([]*sentPacket, 0, len(s.sent[space]))
+	ackedLen := len(s.acked[space])
 	hasAckEliciting := false
+	hasSpurious := false
 	s.filterSent(space, func(p *sentPacket) bool {
 		if ranges.contains(p.packetNumber) {
 			if p.ackEliciting {
 				hasAckEliciting = true
 			}
-			ackedPackets = append(ackedPackets, p)
+			if p.inFlight && !p.timeLost.IsZero() {
+				// The packet is already declared lost but it is spurious,
+				// so congestion changes need to be reverted.
+				hasSpurious = true
+				debug("spurious lost packet: %v", p)
+			}
+			// Move to the acked list.
+			s.acked[space] = append(s.acked[space], p)
 			return true
 		}
 		return false
 	})
+	ackedPackets := s.acked[space][ackedLen:]
 	if len(ackedPackets) == 0 {
 		// Nothing to do if there are no newly acked packets.
 		return
+	}
+	if hasSpurious {
+		s.congestion.onSpuriousCongestionEvent()
 	}
 	if hasAckEliciting {
 		largestPacket := ackedPackets[len(ackedPackets)-1]
@@ -246,11 +258,11 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 
 	// TODO: Process ECN information if present.
 
+	s.onPacketsAcked(ackedPackets, space, now)
 	s.detectLostPackets(space, now)
-	s.onPacketsAcked(ackedPackets, space)
 	// Reset pto_count unless the client is unsure if
 	// the server has validated the client's address.
-	if s.peerCompletedAddressValidation {
+	if s.ptoCount > 0 && s.peerCompletedAddressValidation {
 		s.ptoCount = 0
 		s.lossProbes[space] = 0
 	}
@@ -292,11 +304,11 @@ func (s *lossRecovery) updateRTT(latestRTT time.Duration, ackDelay time.Duration
 	s.smoothedRTT = s.smoothedRTT*7/8 + adjustedRTT*1/8
 }
 
-func (s *lossRecovery) onPacketsAcked(packets []*sentPacket, space packetSpace) {
+func (s *lossRecovery) onPacketsAcked(packets []*sentPacket, space packetSpace, now time.Time) {
+	rtt := s.roundTripTime()
 	for _, p := range packets {
-		s.acked[space] = append(s.acked[space], p)
 		if p.inFlight {
-			s.congestion.onPacketAcked(p.sentBytes, p.timeSent)
+			s.congestion.onPacketAcked(p.sentBytes, p.timeSent, rtt, now)
 		}
 	}
 }
@@ -309,7 +321,7 @@ func (s *lossRecovery) setLossDetectionTimer(now time.Time) {
 		s.lossDetectionTimer = lossTime
 		return
 	}
-	if s.congestion.bytesInFlight == 0 && s.peerCompletedAddressValidation {
+	if s.congestion.state.bytesInFlight == 0 && s.peerCompletedAddressValidation {
 		// There is nothing to detect lost, so no timer is set.
 		// However, the client needs to arm the timer if the
 		// server might be blocked by the anti-amplification limit.
@@ -350,7 +362,7 @@ func (s *lossRecovery) onLossDetectionTimeout(now time.Time) {
 	// If neither is available, send a single PING frame.
 	// TODO: When there are no ack eliciting packets, the connection might send 2 ping packets in a row.
 	// Maybe it should resend a packet from the next space instead.
-	s.markResendAckElicitingPackets(space, probes)
+	s.markResendAckElicitingPackets(space, probes, now)
 	s.setLossDetectionTimer(now)
 }
 
@@ -372,17 +384,24 @@ func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 	largestAcked := s.largestAckedPacket[space]
 	lossTime := time.Time{}
 
-	var lostPackets []*sentPacket
+	lostLen := len(s.lost[space])
 	s.filterSent(space, func(p *sentPacket) bool {
 		if p.packetNumber > largestAcked {
 			return false
 		}
-		// Mark packet as lost, or set time when it should be marked.
-		if !p.timeSent.After(lostSendTime) || largestAcked >= p.packetNumber+packetThreshold {
-			if p.inFlight {
-				lostPackets = append(lostPackets, p)
+		if !p.timeLost.IsZero() {
+			// The packet can be removed to the sent list if it has been marked lost for a RTT.
+			if p.timeLost.Before(lostSendTime) {
+				freeSentPacket(p)
+				return true
 			}
-			return true
+			return false
+		}
+		if !p.timeSent.After(lostSendTime) || largestAcked >= p.packetNumber+packetThreshold {
+			sp := p.markLost(now)
+			s.lost[space] = append(s.lost[space], sp)
+			// Declare the packet lost but not remove from the sent list yet for spurious check.
+			return false
 		}
 		if p.ackEliciting {
 			tm := p.timeSent.Add(lossDelay)
@@ -393,28 +412,30 @@ func (s *lossRecovery) detectLostPackets(space packetSpace, now time.Time) {
 		return false
 	})
 	s.lossTime[space] = lossTime
+	lostPackets := s.lost[space][lostLen:]
 	if len(lostPackets) > 0 {
 		s.onPacketsLost(lostPackets, space, now)
 	}
 }
 
-func (s *lossRecovery) markResendAckElicitingPackets(space packetSpace, probes int) {
+func (s *lossRecovery) markResendAckElicitingPackets(space packetSpace, probes int, now time.Time) {
 	// Retransmit the frames from the oldest sent packets on PTO.
 	// Calculate starting point first to keep lost packets in order.
 	sent := s.sent[space]
 	i := len(sent) - 1
 	if i >= 0 {
 		for ; i > 0 && probes > 0; i-- {
-			if sent[i].ackEliciting {
+			p := sent[i]
+			if p.ackEliciting && len(p.frames) > 0 {
 				probes--
 			}
 		}
 		for ; i < len(sent); i++ {
 			p := sent[i]
-			if p.ackEliciting {
-				debug("mark resending packet: %v", p)
-				s.lost[space] = append(s.lost[space], p)
-				p.ackEliciting = false // So it will not be marked as lost again.
+			if p.ackEliciting && len(p.frames) > 0 {
+				debug("mark packet lost for resending: %v", p)
+				sp := p.markLost(now)
+				s.lost[space] = append(s.lost[space], sp)
 			}
 			// The packet may not really lost, so do not change congestion control.
 			// It is kept in the sent list so we can actually declare it lost or acked later.
@@ -427,13 +448,13 @@ func (s *lossRecovery) markResendAckElicitingPackets(space packetSpace, probes i
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-a.11
 func (s *lossRecovery) onPacketNumberSpaceDiscarded(space packetSpace, now time.Time) {
 	// Remove any unacknowledged packets from flight.
-	var unackedBytes uint64
+	var unackedBytes uint
 	for _, p := range s.sent[space] {
 		if p.inFlight {
 			unackedBytes += p.sentBytes
 		}
 	}
-	s.congestion.onPacketLost(unackedBytes)
+	s.congestion.onPacketDiscarded(unackedBytes)
 	s.sent[space] = nil
 	s.lost[space] = nil
 	s.acked[space] = nil
@@ -492,7 +513,7 @@ func (s *lossRecovery) earliestProbeTime(now time.Time) (time.Time, packetSpace)
 	// duration = (smoothed_rtt + max(4 * rttvar, kGranularity)) * (2 ^ pto_count)
 	duration := s.probeTimeout() * (1 << s.ptoCount)
 	// Arm PTO from now when there are no inflight packets.
-	if s.congestion.bytesInFlight == 0 {
+	if s.congestion.state.bytesInFlight == 0 {
 		if s.hasHandshakeKeys {
 			return now.Add(duration), packetSpaceHandshake
 		}
@@ -539,19 +560,16 @@ func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, n
 	s.lostPackets += uint64(len(packets))
 	sentTimeOfLastLoss := time.Time{}
 	for _, p := range packets {
-		if p.ackEliciting {
-			s.lost[space] = append(s.lost[space], p)
-		}
 		if p.inFlight {
-			s.congestion.onPacketLost(p.sentBytes)
-			s.lostBytes += p.sentBytes
+			s.congestion.onPacketDiscarded(p.sentBytes)
+			s.lostBytes += uint64(p.sentBytes)
 			if sentTimeOfLastLoss.IsZero() || p.timeSent.After(sentTimeOfLastLoss) {
 				sentTimeOfLastLoss = p.timeSent
 			}
 		}
 	}
 	if !sentTimeOfLastLoss.IsZero() {
-		s.congestion.onNewCongestionEvent(sentTimeOfLastLoss, now)
+		s.congestion.onCongestionEvent(sentTimeOfLastLoss, now)
 	}
 	// Reset the congestion window if the loss of these
 	// packets indicates persistent congestion.
@@ -588,9 +606,7 @@ func (s *lossRecovery) drainLost(space packetSpace, fn func(frame)) {
 		for _, f := range p.frames {
 			fn(f)
 		}
-		// FIXME: Not putting this packets to the pool because it may not really lost
-		// and still in sent.
-		// See markResendAckElicitingPackets
+		freeSentPacket(p)
 		packets[i] = nil
 	}
 	s.lost[space] = packets[:0]
@@ -628,16 +644,23 @@ func (s *lossRecovery) setHandshakeConfirmed() {
 	s.handshakeConfirmed = true
 }
 
-func (s *lossRecovery) setMaxDatagramSize(n uint64) {
+func (s *lossRecovery) setMaxDatagramSize(n uint) {
+	if n > initialMaxDatagramSize {
+		n = initialMaxDatagramSize
+	} else if n < MinInitialPacketSize {
+		n = MinInitialPacketSize
+	}
 	s.congestion.setMaxDatagramSize(n)
 }
 
 // availSend returns number of bytes that are allowed to send.
-func (s *lossRecovery) availSend() uint64 {
-	if s.ptoCount > 0 {
+func (s *lossRecovery) availSend() uint {
+	for _, p := range s.lossProbes {
 		// https://www.rfc-editor.org/rfc/rfc9002.html#section-7.5
 		// Ignore congestion window if packet is sent on PTO timer expiration.
-		return initialWindowPackets * initialMaxDatagramSize
+		if p > 0 {
+			return initialWindowPackets * initialMaxDatagramSize
+		}
 	}
 	return s.congestion.available()
 }
@@ -648,11 +671,11 @@ func (s *lossRecovery) setPacketSchedule(p *sentPacket, space packetSpace) {
 	// Do not pace packet when:
 	// - At start of the connection.
 	// - Not application space.
-	// - Not an ack-eliciting packet.
-	if s.smoothedRTT == 0 || space != packetSpaceApplication {
+	// - Not an in-flight packet.
+	if !s.enablePacing || s.smoothedRTT == 0 || space != packetSpaceApplication || !p.inFlight {
 		return
 	}
-	if enablePacing && p.ackEliciting && !s.lastPacketSchedule.IsZero() {
+	if !s.lastPacketSchedule.IsZero() {
 		// interval = ( smoothed_rtt * packet_size / congestion_window ) / N
 		cwnd := s.congestion.window()
 		interval := s.smoothedRTT * time.Duration(p.sentBytes) / time.Duration(cwnd) / 3 * 2
@@ -660,13 +683,20 @@ func (s *lossRecovery) setPacketSchedule(p *sentPacket, space packetSpace) {
 			timeSent := s.lastPacketSchedule.Add(interval)
 			// Adjust packet sending time.
 			if timeSent.After(p.timeSent) {
-				debug("adjusted packet sending time: packet_number=%v sent_bytes=%v delay=%v",
+				debug("change packet schedule: packet_number=%v sent_bytes=%v delay=%v",
 					p.packetNumber, p.sentBytes, timeSent.Sub(p.timeSent))
-				p.timeSent = timeSent
+				// Should change p.timeSent?
+				s.lastPacketSchedule = timeSent
+				return
 			}
 		}
 	}
 	s.lastPacketSchedule = p.timeSent
+}
+
+// onProbeSent must only be called when lossProbes[space] > 0
+func (s *lossRecovery) onProbeSent(space packetSpace) {
+	s.lossProbes[space]--
 }
 
 func (s *lossRecovery) log(b []byte) []byte {
@@ -692,216 +722,4 @@ func (s *lossRecovery) logLossTimer(b []byte, now time.Time) []byte {
 		b = appendField(b, "delta", s.lossDetectionTimer.Sub(now))
 	}
 	return b
-}
-
-// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.2
-type congestionControl struct {
-	// maxDatagramSize is the sender's current maximum payload size.
-	maxDatagramSize uint64
-	// bytesInFlight is the sum of the size in bytes of all sent packets that contain at least
-	// one ack-eliciting or PADDING frame, and have not been acked or declared lost.
-	bytesInFlight uint64
-	// congestionWindow is the maximum number of bytes-in-flight that may be sent.
-	congestionWindow uint64
-	// recoveryStartTime is the time when QUIC first detects congestion due to loss or ECN,
-	// causing it to enter congestion recovery. When a packet sent after this time is acknowledged,
-	// QUIC exits congestion recovery.
-	recoveryStartTime time.Time
-	// slowStartThreshold is the slow start threshold in bytes.
-	// When the congestion window is below slowStartThreshold, the mode is slow start
-	// and the window grows by the number of bytes acknowledged.
-	slowStartThreshold uint64
-
-	// Proportional Rate Reduction
-	// https://www.rfc-editor.org/rfc/rfc6937.html
-
-	prrFlightSize uint64 // FlightSize at the start of recovery (RecoverFS).
-	prrDelivered  uint64 // Total bytes delivered during recovery (prr_delivered).
-	prrOut        uint64 // Total bytes sent during recovery (prr_out).
-	prrSndCnt     uint64 // Bytes should be sent (sndcnt).
-}
-
-// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.3
-func (s *congestionControl) init() {
-	s.maxDatagramSize = initialMaxDatagramSize
-	s.congestionWindow = initialWindowPackets * initialMaxDatagramSize
-	s.slowStartThreshold = maxUint64
-}
-
-// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.4
-func (s *congestionControl) onPacketSent(sentBytes uint64) {
-	s.bytesInFlight += sentBytes
-
-	if enablePRR {
-		s.prrOut += sentBytes
-		if s.prrSndCnt > sentBytes {
-			s.prrSndCnt -= sentBytes
-		} else {
-			s.prrSndCnt = 0
-		}
-	}
-}
-
-// onPacketsAcked is invoked from loss detection's onAckReceived and
-// is supplied with the newly acked_packets from sent_packets.
-// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.5
-func (s *congestionControl) onPacketAcked(sentBytes uint64, sentTime time.Time) {
-	// Remove from in flight.
-	if s.bytesInFlight > sentBytes {
-		s.bytesInFlight -= sentBytes
-	} else {
-		s.bytesInFlight = 0
-	}
-	if enablePRR {
-		s.prrDelivered += sentBytes
-		s.computePRR(sentBytes)
-	}
-	// Do not increase congestion_window if application limited or
-	// in recovery period.
-	if s.inRecovery(sentTime) {
-		return
-	}
-	if s.isAppLimited() {
-		debug("application limited on packet acked: %v", s)
-		return
-	}
-
-	if s.congestionWindow < s.slowStartThreshold {
-		// Slow start.
-		s.congestionWindow += sentBytes
-	} else {
-		// Congestion avoidance.
-		s.congestionWindow += s.maxDatagramSize * sentBytes / s.congestionWindow
-	}
-}
-
-// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.9
-func (s *congestionControl) onPacketLost(sentBytes uint64) {
-	if s.bytesInFlight > sentBytes {
-		s.bytesInFlight -= sentBytes
-	} else {
-		s.bytesInFlight = 0
-	}
-}
-
-// onNewCongestionEvent is invoked from ProcessECN and OnPacketsLost when a new congestion event is detected.
-// May start a new recovery period and reduces the congestion window.
-// https://www.rfc-editor.org/rfc/rfc9002.html#section-b.6
-func (s *congestionControl) onNewCongestionEvent(sentTime, now time.Time) {
-	// Start a new congestion event if packet was sent after the
-	// start of the previous congestion recovery period.
-	if s.inRecovery(sentTime) {
-		return
-	}
-	s.recoveryStartTime = now
-	s.slowStartThreshold = s.congestionWindow / lossReductionFactor
-	// congestion_window = max(ssthresh, kMinimumWindow)
-	minimumWindow := minimumWindowPackets * s.maxDatagramSize
-	if s.slowStartThreshold > minimumWindow {
-		s.congestionWindow = s.slowStartThreshold
-	} else {
-		s.congestionWindow = minimumWindow
-	}
-
-	// https://www.rfc-editor.org/rfc/rfc6937.html#section-3
-	s.prrFlightSize = s.bytesInFlight
-	s.prrDelivered = 0
-	s.prrOut = 0
-	s.prrSndCnt = 0
-	debug("congestion event: %v", s)
-}
-
-func (s *congestionControl) inRecovery(sentTime time.Time) bool {
-	return !s.recoveryStartTime.IsZero() && !sentTime.After(s.recoveryStartTime)
-}
-
-func (s *congestionControl) window() uint64 {
-	return s.congestionWindow + s.prrSndCnt
-}
-
-func (s *congestionControl) collapseWindow() {
-	s.congestionWindow = minimumWindowPackets * s.maxDatagramSize
-	s.recoveryStartTime = time.Time{}
-}
-
-func (s *congestionControl) available() uint64 {
-	cwnd := s.window()
-	if cwnd > s.bytesInFlight {
-		return cwnd - s.bytesInFlight
-	}
-	return 0
-}
-
-func (s *congestionControl) setMaxDatagramSize(maxDatagramSize uint64) {
-	if s.congestionWindow == initialWindowPackets*s.maxDatagramSize {
-		// Only update congestion window when it has not been updated.
-		s.congestionWindow = initialWindowPackets * maxDatagramSize
-	}
-	s.maxDatagramSize = maxDatagramSize
-}
-
-// isAppLimited indicates application limited or flow control limited.
-func (s *congestionControl) isAppLimited() bool {
-	if s.bytesInFlight >= s.congestionWindow {
-		return false
-	}
-	if s.congestionWindow < s.slowStartThreshold {
-		// Slow start
-		return s.bytesInFlight < s.congestionWindow/lossReductionFactor
-	}
-	// Alow a burst of 10 packets
-	return s.bytesInFlight+initialWindowPackets*s.maxDatagramSize < s.congestionWindow
-}
-
-func (s *congestionControl) computePRR(deliveredData uint64) {
-	if s.prrFlightSize == 0 {
-		return
-	}
-	pipe := s.bytesInFlight
-	ssthresh := s.slowStartThreshold
-	if pipe > ssthresh {
-		// Proportional Rate Reduction
-		// sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
-		limit := (s.prrDelivered*ssthresh + s.prrFlightSize - 1) / s.prrFlightSize
-		if limit > s.prrOut {
-			s.prrSndCnt = limit - s.prrOut
-		} else {
-			s.prrSndCnt = 0
-		}
-	} else {
-		// Two versions of the Reduction Bound
-		// if (conservative) {    // PRR-CRB
-		//     limit = prr_delivered - prr_out
-		// } else {               // PRR-SSRB
-		//     limit = MAX(prr_delivered - prr_out, DeliveredData) + MSS
-		// }
-		limit := deliveredData
-		if s.prrDelivered > s.prrOut && limit < s.prrDelivered-s.prrOut {
-			limit = s.prrDelivered - s.prrOut
-		}
-		limit += s.maxDatagramSize
-		// Attempt to catch up, as permitted by limit
-		// sndcnt = MIN(ssthresh-pipe, limit)
-		if limit > ssthresh-pipe {
-			limit = ssthresh - pipe
-		}
-		s.prrSndCnt = limit
-	}
-	debug("computePRR: %v", s)
-}
-
-func (s *congestionControl) log(b []byte) []byte {
-	b = appendField(b, "congestion_window", s.window())
-	b = appendField(b, "bytes_in_flight", s.bytesInFlight)
-	if s.slowStartThreshold != maxUint64 {
-		b = appendField(b, "ssthresh", s.slowStartThreshold)
-	}
-	return b
-}
-
-func (s *congestionControl) String() string {
-	return fmt.Sprintf("congestion_window=%v bytes_in_flight=%v max_datagram_size=%v ssthresh=%v recovery_start_time=%v "+
-		"prr_flight_size=%v prr_delivered=%v prr_out=%v prr_sndcnt=%v",
-		s.congestionWindow, s.bytesInFlight, s.maxDatagramSize, s.slowStartThreshold, s.recoveryStartTime,
-		s.prrFlightSize, s.prrDelivered, s.prrOut, s.prrSndCnt)
 }

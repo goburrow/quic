@@ -42,6 +42,13 @@ const (
 	MinInitialPacketSize = 1200
 )
 
+// Experimental
+const (
+	enablePacing = true
+	enableCubic  = true
+	enablePRR    = true
+)
+
 // supportedVersions are the QUIC versions supported by this implementation.
 var supportedVersions = [...]uint32{
 	1,

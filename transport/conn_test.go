@@ -661,7 +661,7 @@ func (t *testEndpoint) assertClientSend() {
 func (t *testEndpoint) clientSend() error {
 	n, err := t.client.Read(t.buf[:])
 	if err != nil {
-		return err
+		return fmt.Errorf("client read: %v %v", n, err)
 	}
 	if n > 0 {
 		t.clientTx += n
@@ -686,8 +686,8 @@ func (t *testEndpoint) assertServerSend() {
 
 func (t *testEndpoint) serverSend() error {
 	n, err := t.server.Read(t.buf[:])
-	if err != nil {
-		return err
+	if n == 0 || err != nil {
+		return fmt.Errorf("server read: %v %v", n, err)
 	}
 	if n > 0 {
 		t.serverTx += n
@@ -829,14 +829,16 @@ func (t *testEndpoint) handshake() error {
 }
 
 func (t *testEndpoint) assertClientLossTimer(now time.Time) {
-	if now.Before(t.client.recovery.lossDetectionTimer) {
+	d := now.Sub(t.client.recovery.lossDetectionTimer)
+	if d < 0 || d > time.Second {
 		t.t.Helper()
 		t.t.Fatalf("expect client loss timer before %v, actual %v", now, t.client.recovery.lossDetectionTimer)
 	}
 }
 
 func (t *testEndpoint) assertServerLossTimer(now time.Time) {
-	if now.Before(t.server.recovery.lossDetectionTimer) {
+	d := now.Sub(t.server.recovery.lossDetectionTimer)
+	if d < 0 || d > time.Second {
 		t.t.Helper()
 		t.t.Fatalf("expect server loss timer before %v, actual %v", now, t.server.recovery.lossDetectionTimer)
 	}

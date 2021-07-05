@@ -629,8 +629,8 @@ func (s *localConn) handleConn(c *Conn) {
 				s.serveConn(c)
 			}
 		}
-		n, _ := s.sendConn(c)
-		if n > 0 && established {
+		err := s.sendConn(c)
+		if err != nil && established {
 			s.serveConn(c)
 		}
 	}
@@ -659,17 +659,12 @@ func (s *localConn) pollConn(c *Conn) {
 		return
 	}
 	// Maybe another packets arrived too while we processed the first one.
-	packets := s.pollConnNoDelay(c)
-	if packets == 0 && c.conn.HandshakeComplete() {
-		// Only for application space
-		// TODO: check whether we only need to send back ACK, then we can delay it.
-		s.pollConnDelay(c, 2*time.Millisecond)
-	}
+	s.pollConnNoDelay(c, 4)
 }
 
-func (s *localConn) pollConnNoDelay(c *Conn) int {
+func (s *localConn) pollConnNoDelay(c *Conn, max int) int {
 	packets := 0
-	for i := 8; i > 0; i-- {
+	for ; max > 0; max-- {
 		select {
 		case p := <-c.recvCh:
 			err := s.recvConn(c, p)
@@ -690,10 +685,21 @@ func (s *localConn) pollConnNoDelay(c *Conn) int {
 }
 
 func (s *localConn) pollConnDelay(c *Conn, delay time.Duration) int {
+	// FIXME: Precise timer
+	// https://github.com/golang/go/issues/44343
+	if delay < 5*time.Millisecond {
+		return s.pollConnNoDelay(c, 1+int(delay/time.Millisecond))
+	}
+	packets := 0
+	// now := time.Now()
+	// defer func(expect time.Duration) {
+	// 	e := time.Since(now)
+	// 	log.Printf("pollConnDelay: expect=%v actual=%v diff=%v", expect, e, e-expect)
+	// }(delay)
+	delay -= 4 * time.Millisecond
 	c.setDelayTimer(delay)
 	defer c.stopDelayTimer()
-	packets := 0
-	for i := 8; i > 0; i-- {
+	for {
 		select {
 		case <-c.delayTimer.C:
 			return packets
@@ -709,8 +715,14 @@ func (s *localConn) pollConnDelay(c *Conn, delay time.Duration) int {
 			c.Close()
 			return -1
 		}
+		// Always check timer channel
+		select {
+		case <-c.delayTimer.C:
+			return packets
+		default:
+			// continue
+		}
 	}
-	return packets
 }
 
 func (s *localConn) recvConn(c *Conn, p *packet) error {
@@ -735,11 +747,10 @@ func (s *localConn) recvConn(c *Conn, p *packet) error {
 }
 
 // sendConn returns additional received packets when waiting.
-func (s *localConn) sendConn(c *Conn) (int, error) {
+func (s *localConn) sendConn(c *Conn) error {
 	p := newPacket()
 	defer freePacket(p)
 	buf := p.buf[:c.maxDatagramSize]
-	packets := 0
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
@@ -750,25 +761,22 @@ func (s *localConn) sendConn(c *Conn) (int, error) {
 			} else {
 				c.setClosing(transport.InternalError, "")
 			}
-			return 0, err
+			return err
 		}
 		if n == 0 {
 			s.logger.log(levelTrace, "verbose cid=%x addr=%s message=send_done", c.scid, c.addr)
-			return packets, nil
+			return nil
 		}
 		delay := c.conn.Delay()
 		if delay > 0 {
 			// Process incoming packets or commands while waiting until the time for sending this packet.
-			pkt := s.pollConnDelay(c, delay)
-			if pkt > 0 {
-				packets += pkt
-			}
+			s.pollConnDelay(c, delay)
 		}
 		n, err = s.socket.WriteTo(buf[:n], c.addr)
 		if err != nil {
 			s.logger.log(levelError, "error cid=%x addr=%s message=send_failed: %v", c.scid, c.addr, err)
 			c.setClosing(transport.InternalError, "")
-			return 0, err
+			return err
 		}
 		s.logger.log(levelTrace, "datagrams_sent cid=%x addr=%s raw=%x", c.scid, c.addr, buf[:n])
 	}

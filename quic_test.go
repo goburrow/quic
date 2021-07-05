@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -213,4 +215,27 @@ func newClientConfig() *transport.Config {
 		InsecureSkipVerify: true,
 	}
 	return config
+}
+
+func TestTimerPrecision(t *testing.T) {
+	n := 100
+	d := 10 * time.Millisecond
+
+	durations := make([]time.Duration, n)
+	wg := sync.WaitGroup{}
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			now := time.Now()
+			tm := time.NewTimer(d)
+			<-tm.C
+			durations[idx] = time.Since(now) - d
+		}(i)
+	}
+	wg.Wait()
+	sort.Slice(durations, func(i, j int) bool {
+		return durations[i] < durations[j]
+	})
+	t.Logf("timer: med=%v min=%v max=%v", durations[(n+1)/2], durations[0], durations[n-1])
 }
