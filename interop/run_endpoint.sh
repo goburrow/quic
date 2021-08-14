@@ -30,7 +30,7 @@ case "$TESTCASE" in
 esac
 
 run_client() {
-    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3 -qlog $QLOGDIR/client.qlog"
+    CLIENT_PARAMS="$CLIENT_PARAMS -insecure -root $DLDIR -v 3 -qlog $QLOGDIR"
     case "$TESTCASE" in
     chacha20)
         CLIENT_PARAMS="$CLIENT_PARAMS -cipher TLS_CHACHA20_POLY1305_SHA256"
@@ -47,7 +47,7 @@ run_client() {
 }
 
 run_server() {
-    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert /certs/cert.pem -key /certs/priv.key -root $WWWDIR -v 3 -qlog $QLOGDIR/server.qlog"
+    SERVER_PARAMS="$SERVER_PARAMS -listen :443 -cert /certs/cert.pem -key /certs/priv.key -root $WWWDIR -v 3 -qlog $QLOGDIR"
     case "$TESTCASE" in
     retry)
         SERVER_PARAMS="$SERVER_PARAMS -retry"

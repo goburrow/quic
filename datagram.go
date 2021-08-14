@@ -3,6 +3,7 @@ package quic
 import (
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -27,11 +28,15 @@ import (
 type Datagram struct {
 	conn *Conn
 
-	wrMu   sync.Mutex
-	wrData dataBuffer
+	// Writing
+	wrMu sync.Mutex
+	wrCh chan io.Writer
+	wrDl deadlineTimer
 
-	rdMu   sync.Mutex
-	rdData dataBuffer
+	// Reading
+	rdMu sync.Mutex
+	rdCh chan io.Reader
+	rdDl deadlineTimer
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -49,10 +54,12 @@ func newDatagram(conn *Conn) *Datagram {
 	s := &Datagram{
 		conn: conn,
 
+		wrCh:    make(chan io.Writer),
+		rdCh:    make(chan io.Reader),
 		closeCh: make(chan struct{}),
 	}
-	s.wrData.init()
-	s.rdData.init()
+	s.wrDl.init()
+	s.rdDl.init()
 	return s
 }
 
@@ -69,34 +76,36 @@ func (s *Datagram) Write(b []byte) (int, error) {
 	}
 }
 
-func (s *Datagram) writeLocked(b []byte) (int, error) {
-	s.wrData.setBuf(b)
+func (s *Datagram) writeLocked(b []byte) (n int, err error) {
 	cmd := connCommand{
 		cmd: cmdDatagramWrite,
 	}
-	var err error
 	// Datagram should always be written as a whole so len(b) is returned.
 	select {
 	case <-s.closeCh:
 		err = s.closeErr
-	case <-s.wrData.deadlineCh:
-		err = errDeadlineExceeded
+		return
+	case <-s.wrDl.ch:
+		err = os.ErrDeadlineExceeded
+		return
 	case s.conn.cmdCh <- cmd:
-		// Wait for result
-		err = <-s.wrData.resultCh
-		for err == errWait {
+		for {
 			select {
 			case <-s.closeCh:
 				err = s.closeErr
-			case <-s.wrData.deadlineCh:
-				err = errDeadlineExceeded
-			case <-s.wrData.waitCh:
-				err = <-s.wrData.resultCh
+				return
+			case <-s.wrDl.ch:
+				err = os.ErrDeadlineExceeded
+				return
+			case w := <-s.wrCh:
+				n, err = w.Write(b)
+				s.wrCh <- nil // Done writing
+				if err != nil || n > 0 {
+					return
+				}
 			}
 		}
 	}
-	n := s.wrData.setBuf(nil)
-	return n, err
 }
 
 // Read reads datagram from the connection.
@@ -112,41 +121,33 @@ func (s *Datagram) Read(b []byte) (int, error) {
 	}
 }
 
-func (s *Datagram) readLocked(b []byte) (int, error) {
-	s.rdData.setBuf(b)
+func (s *Datagram) readLocked(b []byte) (n int, err error) {
 	cmd := connCommand{
 		cmd: cmdDatagramRead,
 	}
-	var err error
 	select {
 	case <-s.closeCh:
-		n := s.rdData.setBuf(nil)
-		if n > 0 {
-			return n, nil
-		}
 		return s.readClosed(b)
-	case <-s.rdData.deadlineCh:
-		err = errDeadlineExceeded
+	case <-s.rdDl.ch:
+		err = os.ErrDeadlineExceeded
+		return
 	case s.conn.cmdCh <- cmd:
-		// Wait for result
-		err = <-s.rdData.resultCh
-		for err == errWait {
+		for {
 			select {
 			case <-s.closeCh:
-				n := s.rdData.setBuf(nil)
-				if n > 0 {
-					return n, nil
-				}
 				return s.readClosed(b)
-			case <-s.rdData.deadlineCh:
-				err = errDeadlineExceeded
-			case <-s.rdData.waitCh:
-				err = <-s.rdData.resultCh
+			case <-s.rdDl.ch:
+				err = os.ErrDeadlineExceeded
+				return
+			case r := <-s.rdCh:
+				n, err = r.Read(b)
+				s.rdCh <- nil
+				if err != nil || n > 0 || len(b) == 0 {
+					return
+				}
 			}
 		}
 	}
-	n := s.rdData.setBuf(nil)
-	return n, err
 }
 
 func (s *Datagram) readClosed(b []byte) (int, error) {
@@ -186,7 +187,7 @@ func (s *Datagram) SetDeadline(t time.Time) error {
 // SetWriteDeadline sets the write deadline associated with the stream.
 func (s *Datagram) SetWriteDeadline(t time.Time) error {
 	s.wrMu.Lock()
-	s.wrData.setDeadline(t)
+	s.wrDl.setDeadline(t)
 	s.wrMu.Unlock()
 	return nil
 }
@@ -194,31 +195,25 @@ func (s *Datagram) SetWriteDeadline(t time.Time) error {
 // SetReadDeadline sets the read deadline associated with the stream.
 func (s *Datagram) SetReadDeadline(t time.Time) error {
 	s.rdMu.Lock()
-	s.rdData.setDeadline(t)
+	s.rdDl.setDeadline(t)
 	s.rdMu.Unlock()
 	return nil
 }
 
-// recvWriteData is called from Conn goroutine.
-func (s *Datagram) recvWriteData(w io.Writer) (bool, error) {
-	return s.wrData.writeTo(w)
+func (s *Datagram) sendWriter(w io.Writer) {
+	select {
+	case s.wrCh <- w:
+		<-s.wrCh // Wait
+	default:
+	}
 }
 
-// recvReadData is called from Conn goroutine.
-func (s *Datagram) recvReadData(r io.Reader) (bool, error) {
-	return s.rdData.readFrom(r)
-}
-
-func (s *Datagram) isReading() bool {
-	return s.rdData.checkWaiting()
-}
-
-func (s *Datagram) sendWriteResult(err error) {
-	s.wrData.sendResult(err)
-}
-
-func (s *Datagram) sendReadResult(err error) {
-	s.rdData.sendResult(err)
+func (s *Datagram) sendReader(w io.Reader) {
+	select {
+	case s.rdCh <- w:
+		<-s.rdCh // Wait
+	default:
+	}
 }
 
 func (s *Datagram) setClosed(err error, rd io.Reader) {

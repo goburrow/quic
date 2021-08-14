@@ -5,108 +5,41 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/goburrow/quic/transport"
 )
 
-type limitedReadWriter struct {
-	buf []byte // write at buf[len(buf):]
-	n   int
+type stubReadWriter struct {
+	n int
+	e error
 }
 
-func newLimitedReadWriter(n int) *limitedReadWriter {
-	return &limitedReadWriter{
-		buf: make([]byte, 0, 100),
-		n:   n,
-	}
+func (s stubReadWriter) Read([]byte) (int, error) {
+	return s.n, s.e
 }
 
-func (s *limitedReadWriter) Write(b []byte) (int, error) {
-	if len(b) > s.n {
-		b = b[:s.n]
-	}
+func (s stubReadWriter) Write([]byte) (int, error) {
+	return s.n, s.e
+}
+
+type sizedReader struct {
+	size int
+	read int
+}
+
+func (s *sizedReader) Read(b []byte) (int, error) {
 	n := len(b)
-	m := len(s.buf)
-	if m+n > cap(s.buf) {
-		panic(io.ErrShortBuffer)
+	if n+s.read > s.size {
+		n = s.size - s.read
 	}
-	s.buf = s.buf[:m+n]
-	copy(s.buf[m:], b)
-	return n, nil
-}
-
-func (s *limitedReadWriter) Read(b []byte) (int, error) {
-	if len(b) > s.n {
-		b = b[:s.n]
-	}
-	m := len(s.buf)
-	n := copy(b, s.buf)
-	if n > 0 {
-		copy(s.buf, s.buf[n:])
-		s.buf = s.buf[:m-n]
+	s.read += n
+	if s.read == s.size {
+		return n, io.EOF
 	}
 	return n, nil
-}
-
-func (s *limitedReadWriter) grow(n int) {
-	if n > cap(s.buf) {
-		b := make([]byte, n)
-		copy(b, s.buf)
-		s.buf = b
-	} else {
-		s.buf = s.buf[:n]
-	}
-}
-
-func (s *limitedReadWriter) String() string {
-	return string(s.buf)
-}
-
-func TestDataBufferWrite(t *testing.T) {
-	s := dataBuffer{}
-	s.setBuf([]byte("0123456789"))
-
-	w := newLimitedReadWriter(6)
-	done, err := s.writeTo(w)
-	if done || s.off != 6 || err != nil {
-		t.Fatalf("expect write: %v %v %v, actual: %v %v %v", false, 6, nil, done, s.off, err)
-	}
-	w.n = 10
-	done, err = s.writeTo(w)
-	if !done || s.off != 10 || err != nil {
-		t.Fatalf("expect write: %v %v %v, actual: %v %v %v", true, 10, nil, done, s.off, err)
-	}
-	if w.String() != string(s.buf) {
-		t.Fatalf("expect data: %s, actual: %s", w, s.buf)
-	}
-	done, err = s.writeTo(w)
-	if !done || s.off != 10 || err != nil {
-		t.Fatalf("expect write: %v %v %v, actual: %v %v %v", true, 10, nil, done, s.off, err)
-	}
-}
-
-func TestDataBufferRead(t *testing.T) {
-	s := dataBuffer{}
-	s.setBuf(make([]byte, 10))
-
-	r := newLimitedReadWriter(20)
-	r.Write([]byte("01234567890123456789"))
-	r.n = 4
-
-	done, err := s.readFrom(r)
-	if !done || s.off != 4 || err != nil {
-		t.Fatalf("expect read: %v %v %v, actual: %v %v %v", true, 4, nil, done, s.off, err)
-	}
-	r.n = 10
-	done, err = s.readFrom(r)
-	if !done || s.off != 10 || err != nil {
-		t.Fatalf("expect read: %v %v %v, actual: %v %v %v", true, 10, nil, done, s.off, err)
-	}
-	if string(s.buf) != "0123456789" {
-		t.Fatalf("expect read: %s, actual: %s", "0123456789", s.buf)
-	}
 }
 
 func TestStreamWrite(t *testing.T) {
@@ -123,27 +56,25 @@ func TestStreamWrite(t *testing.T) {
 		}
 
 		buf := &bytes.Buffer{}
-		st.recvWriteData(buf)
+		st.sendWriter(buf)
 		if buf.String() != data1 {
-			t.Errorf("unexpected data: %s", &st.wrData.buf)
+			t.Errorf("unexpected data: %s", buf)
 		}
-		st.sendWriteResult(nil)
 
 		c = <-conn.cmdCh
 		if c.cmd != cmdStreamWrite || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.recvWriteData(buf)
+		st.sendWriter(buf)
 		if buf.String() != data1+data2 {
-			t.Errorf("unexpected data: %s", &st.wrData.buf)
+			t.Errorf("unexpected data: %s", buf)
 		}
-		st.sendWriteResult(nil)
 
 		c = <-conn.cmdCh
 		if c.cmd != cmdStreamWrite || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.sendWriteResult(io.EOF)
+		st.sendWriter(stubReadWriter{0, io.EOF})
 	}()
 
 	n, err := st.Write([]byte(data1))
@@ -171,14 +102,13 @@ func TestStreamWriteTimeout(t *testing.T) {
 		if c.cmd != cmdStreamWrite || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.sendWriteResult(errWait)
 		done <- struct{}{}
 	}()
 
 	st.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
 	n, err := st.Write([]byte("write"))
-	if n != 0 || err != errDeadlineExceeded {
-		t.Fatalf("expect write error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
+	if n != 0 || err != os.ErrDeadlineExceeded {
+		t.Fatalf("expect write error: %v %v, actual: %v %v", 0, os.ErrDeadlineExceeded, n, err)
 	}
 
 	st.setClosed(io.ErrUnexpectedEOF, nil)
@@ -205,15 +135,8 @@ func TestStreamWriteBlock(t *testing.T) {
 		if c.cmd != cmdStreamWrite || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.sendWriteResult(errWait)
 		time.Sleep(10 * time.Millisecond)
-
-		writing := st.isWriting()
-		if !writing {
-			t.Errorf("expected writing: %v, actual: %v", true, writing)
-		}
-		st.recvWriteData(io.Discard)
-		st.sendWriteResult(nil)
+		st.sendWriter(io.Discard)
 	}()
 
 	n, err := st.Write([]byte(data))
@@ -233,13 +156,13 @@ func TestStreamRead(t *testing.T) {
 		if c.cmd != cmdStreamRead || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.recvReadData(bytes.NewReader([]byte("read")))
-		st.sendReadResult(nil)
+		r := bytes.NewReader([]byte("read"))
+		st.sendReader(r)
 		c = <-conn.cmdCh
 		if c.cmd != cmdStreamRead || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.sendReadResult(io.EOF)
+		st.sendReader(r)
 	}()
 
 	n, err := st.Read(data)
@@ -267,14 +190,13 @@ func TestStreamReadTimeout(t *testing.T) {
 		if c.cmd != cmdStreamRead || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.sendReadResult(errWait)
 		done <- struct{}{}
 	}()
 
 	st.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	n, err := st.Read(data)
-	if n != 0 || err != errDeadlineExceeded {
-		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
+	if n != 0 || err != os.ErrDeadlineExceeded {
+		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, os.ErrDeadlineExceeded, n, err)
 	}
 
 	st.setClosed(io.ErrUnexpectedEOF, nil)
@@ -300,20 +222,14 @@ func TestStreamReadBlock(t *testing.T) {
 		if c.cmd != cmdStreamRead || c.id != 1 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		st.sendReadResult(errWait)
 		time.Sleep(10 * time.Millisecond)
-
-		reading := st.isReading()
-		if !reading {
-			t.Errorf("expect reading: %v, actual: %v", true, reading)
-		}
-		st.recvReadData(bytes.NewReader([]byte("read")))
-		st.sendReadResult(io.EOF)
+		r := bytes.NewReader([]byte("read"))
+		st.sendReader(r)
 	}()
 
 	n, err := st.Read(data)
-	if err != io.EOF || string(data[:n]) != "read" {
-		t.Fatalf("expect read: %v %v (%s), actual: %v %v (%s)", 4, io.EOF, "data", n, err, data[:n])
+	if err != nil || string(data[:n]) != "read" {
+		t.Fatalf("expect read: %v %v (%s), actual: %v %v (%s)", 4, nil, "data", n, err, data[:n])
 	}
 }
 
@@ -370,8 +286,7 @@ func TestStreamConnectionClose(t *testing.T) {
 			t.Errorf("unexpected command: %+v", c)
 		}
 		r := bytes.NewReader([]byte("readclose"))
-		st.recvReadData(r)
-		st.sendReadResult(nil)
+		st.sendReader(r)
 		st.setClosed(net.ErrClosed, r)
 	}()
 
@@ -413,9 +328,8 @@ func TestStreamConnectionTerminate(t *testing.T) {
 			t.Errorf("unexpected command: %+v", c)
 		}
 		r := bytes.NewReader([]byte("read"))
-		st.recvReadData(r)
-		st.sendReadResult(nil)
-		st.setClosed(net.ErrClosed, nopReader{})
+		st.sendReader(r)
+		st.setClosed(net.ErrClosed, nil)
 	}()
 
 	data := make([]byte, 4)
@@ -540,7 +454,7 @@ func BenchmarkStream(b *testing.B) {
 	serverConfig.Params.InitialMaxStreamsBidi = 0
 	serverConfig.Params.InitialMaxStreamsUni = uint64(streams)
 	serverConfig.Params.InitialMaxStreamDataUni = uint64(size)
-	serverConfig.Params.InitialMaxData = uint64(size * streams)
+	serverConfig.Params.InitialMaxData = uint64(size)
 	s, c := newPipe(serverConfig, nil)
 	defer s.Close()
 	go s.Serve()
@@ -560,7 +474,7 @@ func BenchmarkStream(b *testing.B) {
 		st.Close()
 	}
 	sendFn := func(st *Stream) {
-		data := stubReader{size: size}
+		data := sizedReader{size: size}
 		n, err := io.Copy(st, &data)
 		if int(n) != size || err != nil {
 			b.Errorf("expect client read from: %v %v, actual: %v %v", size, nil, n, err)
@@ -621,27 +535,4 @@ func BenchmarkStream(b *testing.B) {
 		}
 	}
 	b.StopTimer()
-}
-
-type stubReader struct {
-	size int
-	read int
-}
-
-func (s *stubReader) Read(b []byte) (int, error) {
-	n := len(b)
-	if n > s.size-s.read {
-		n = s.size - s.read
-	}
-	s.read += n
-	if s.read == s.size {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
-type nopReader struct{}
-
-func (s nopReader) Read(b []byte) (int, error) {
-	return 0, nil
 }

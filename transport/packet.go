@@ -421,7 +421,7 @@ func (s *packet) log(b []byte) []byte {
 			b = appendField(b, "supported_versions", s.supportedVersions)
 		}
 		if len(s.token) > 0 {
-			b = appendField(b, "stateless_reset_token", s.token)
+			b = appendField(b, "token", s.token)
 		}
 	}
 	b = appendField(b, "packet_number", s.packetNumber)
@@ -920,6 +920,8 @@ type packetNumberSpace struct {
 	// recvPacketNeedAck contains received packet numbers that need to acknowledge in ACK frame.
 	// A packet number is added when receiving a packet and removed when receiving an ACK frame.
 	recvPacketNeedAck rangeSet
+	// recvAckRanges is fo caching ranges built from AckFrame.
+	recvAckRanges rangeSet
 	// recvPacketNumbers tracks packet numbers received.
 	recvPacketNumbers packetNumberWindow
 

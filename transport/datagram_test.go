@@ -10,7 +10,8 @@ import (
 
 func TestDatagramBuffer(t *testing.T) {
 	x := datagramBufferTest{t: t}
-	x.assertPopNil()
+	x.assertSnapshot("length=0 write=0 read=0")
+	x.assertPop(nil)
 	x.assertAvail(0)
 	b := []byte("data")
 	x.b.write(b)
@@ -54,7 +55,7 @@ func TestDatagramOverrun(t *testing.T) {
 	b[0] = 31
 	x.b.write(b)
 	x.assertPop(b)
-	x.assertPopNil()
+	x.assertPop(nil)
 	x.assertSnapshot("length=0 write=0 read=0")
 }
 
@@ -89,104 +90,61 @@ func TestDatagramRandom(t *testing.T) {
 }
 
 func TestDatagramSend(t *testing.T) {
-	x := Datagram{}
-	n, err := x.Write([]byte("write"))
+	x := datagramTest{t: t}
+	x.assertFlushable(false)
+	x.assertPop(10, nil)
+	n, err := x.d.Write([]byte("write"))
 	if err == nil || err.Error() != "error_code=application_error reason=datagram: payload size exceeded limit 0" || n != 0 {
 		t.Fatalf("expect error %v, actual %v %v", "application_error", n, err)
 	}
-	x.setMaxSend(6)
-	n, err = x.Write([]byte("writelong"))
+	x.d.setMaxSend(6)
+	n, err = x.d.Write([]byte("writelong"))
 	if err == nil || err.Error() != "error_code=application_error reason=datagram: payload size exceeded limit 6" || n != 0 {
 		t.Fatalf("expect error %v, actual %v %v", "application_error", n, err)
 	}
-	if x.isFlushable() {
-		t.Fatalf("expect flushable %v, actual %v", false, x.isFlushable())
-	}
-	n, err = x.Write([]byte("write1"))
-	if n != 6 || err != nil {
-		t.Fatalf("expect write %v %v, actual %v %v", 6, nil, n, err)
-	}
-	n, err = x.Write([]byte("wr2"))
-	if n != 3 || err != nil {
-		t.Fatalf("expect write %v %v, actual %v %v", 3, nil, n, err)
-	}
-	if !x.isFlushable() {
-		t.Fatalf("expect flushable %v, actual %v", true, x.isFlushable())
-	}
-	b := x.popSend(3)
-	if b != nil {
-		t.Fatalf("expect pop %v, actual %v", nil, b)
-	}
-	b = x.popSend(6)
-	if string(b) != "write1" {
-		t.Fatalf("expect pop %v, actual %v", "write1", b)
-	}
-	if !x.isFlushable() {
-		t.Fatalf("expect flushable %v, actual %v", true, x.isFlushable())
-	}
-	b = x.popSend(5)
-	if string(b) != "wr2" {
-		t.Fatalf("expect pop %v, actual %v", "wr2", b)
-	}
-	if x.isFlushable() {
-		t.Fatalf("expect flushable %v, actual %v", false, x.isFlushable())
-	}
-	b = x.popSend(10)
-	if b != nil {
-		t.Fatalf("expect pop %v, actual %v", nil, b)
-	}
+	x.assertFlushable(false)
+	b := []byte("write1")
+	x.assertWrite(b)
+	x.assertWrite([]byte("wr2"))
+	x.assertFlushable(true)
+	x.assertPop(3, nil)
+	b[0] = 0 // Data should already be copied
+	x.assertPop(6, []byte("write1"))
+	x.assertFlushable(true)
+	x.assertPop(5, []byte("wr2"))
+	x.assertFlushable(false)
+	x.assertPop(10, nil)
 }
 
 func TestDatagramRecv(t *testing.T) {
-	x := Datagram{}
-	err := x.pushRecv([]byte("read"))
+	x := datagramTest{t: t}
+	x.assertReadable(false)
+	x.assertRead([]byte{0, 0}, nil)
+	err := x.d.pushRecv([]byte("read"))
 	if err == nil || err.Error() != "error_code=protocol_violation reason=datagram: payload size exceeded limit 0" {
 		t.Fatalf("expect error %v, actual %v", "protocol_violation", err)
 	}
-	x.setMaxRecv(5)
-	err = x.pushRecv([]byte("readlong"))
+	x.d.setMaxRecv(5)
+	err = x.d.pushRecv([]byte("readlong"))
 	if err == nil || err.Error() != "error_code=protocol_violation reason=datagram: payload size exceeded limit 5" {
 		t.Fatalf("expect error %v, actual %v", "protocol_violation", err)
 	}
-	if x.isReadable() {
-		t.Fatalf("expect readable %v, actual %v", false, x.isReadable())
-	}
+	x.assertReadable(false)
 	b := []byte("read1")
-	err = x.pushRecv(b)
-	if err != nil {
-		t.Fatalf("expect push %v, actual %v", nil, err)
-	}
+	x.assertPush(b)
 	b[4] = '2' // later ensure received data is intact.
-	err = x.pushRecv([]byte("rd2"))
-	if err != nil {
-		t.Fatalf("expect push %v, actual %v", nil, err)
-	}
-	if !x.isReadable() {
-		t.Fatalf("expect readable %v, actual %v", true, x.isReadable())
-	}
+	x.assertPush([]byte("rd2"))
+	x.assertReadable(true)
 	b = make([]byte, 10)
-	n, err := x.Read(b)
-	if n != 5 || err != nil || string(b[:n]) != "read1" {
-		t.Fatalf("expect read %v %v, actual %v %v %s", 5, nil, n, err, b[:n])
-	}
-	if !x.isReadable() {
-		t.Fatalf("expect readable %v, actual %v", true, x.isReadable())
-	}
-	n, err = x.Read(b[:2])
+	x.assertRead(b, []byte("read1"))
+	x.assertReadable(true)
+	n, err := x.d.Read(b[:2])
 	if n != 0 || err != io.ErrShortBuffer {
 		t.Fatalf("expect read %v %v, actual %v %v", 0, io.ErrShortBuffer, n, err)
 	}
-	n, err = x.Read(b)
-	if n != 3 || err != nil || string(b[:n]) != "rd2" {
-		t.Fatalf("expect read %v %v, actual %v %v %s", 3, nil, n, err, b[:n])
-	}
-	if x.isReadable() {
-		t.Fatalf("expect readable %v, actual %v", false, x.isReadable())
-	}
-	n, err = x.Read(b)
-	if n != 0 || err != nil {
-		t.Fatalf("expect read %v %v, actual %v %v", 0, nil, n, err)
-	}
+	x.assertRead(b, []byte("rd2"))
+	x.assertReadable(false)
+	x.assertRead(b, nil)
 }
 
 func BenchmarkDatagramSend(b *testing.B) {
@@ -238,17 +196,9 @@ func (t *datagramBufferTest) assertSnapshot(expect string) {
 
 func (t *datagramBufferTest) assertPop(expect []byte) {
 	actual := t.b.pop()
-	if !bytes.Equal(actual, expect) {
+	if (expect == nil && actual != nil) || !bytes.Equal(actual, expect) {
 		t.t.Helper()
 		t.t.Fatalf("pop does not match:\nexpect: %x\nactual: %x", expect, actual)
-	}
-}
-
-func (t *datagramBufferTest) assertPopNil() {
-	actual := t.b.pop()
-	if actual != nil {
-		t.t.Helper()
-		t.t.Fatalf("pop does not match:\nexpect: %v\nactual: %x", nil, actual)
 	}
 }
 
@@ -257,5 +207,58 @@ func (t *datagramBufferTest) assertAvail(expect int) {
 	if actual != expect {
 		t.t.Helper()
 		t.t.Fatalf("avail does not match:\nexpect: %x\nactual: %x", expect, actual)
+	}
+}
+
+type datagramTest struct {
+	t *testing.T
+	d Datagram
+}
+
+func (t *datagramTest) assertReadable(expect bool) {
+	actual := t.d.isReadable()
+	if actual != expect {
+		t.t.Helper()
+		t.t.Fatalf("expect readable: %v, actual: %v", expect, actual)
+	}
+}
+
+func (t *datagramTest) assertFlushable(expect bool) {
+	actual := t.d.isFlushable()
+	if actual != expect {
+		t.t.Helper()
+		t.t.Fatalf("expect flushable: %v, actual: %v", expect, actual)
+	}
+}
+
+func (t *datagramTest) assertWrite(b []byte) {
+	n, err := t.d.Write(b)
+	if n != len(b) || err != nil {
+		t.t.Helper()
+		t.t.Fatalf("expect write: %v %v, actual: %v %v", len(b), nil, n, err)
+	}
+}
+
+func (t *datagramTest) assertRead(b, expect []byte) {
+	n, err := t.d.Read(b)
+	if err != nil || !bytes.Equal(b[:n], expect) {
+		t.t.Helper()
+		t.t.Fatalf("expect read: %v %v, actual: %v %v %s", len(expect), nil, n, err, b[:n])
+	}
+}
+
+func (t *datagramTest) assertPop(max int, expect []byte) {
+	actual := t.d.popSend(max)
+	if (expect == nil && actual != nil) || !bytes.Equal(actual, expect) {
+		t.t.Helper()
+		t.t.Fatalf("expect pop: %v, actual: %v", expect, actual)
+	}
+}
+
+func (t *datagramTest) assertPush(b []byte) {
+	err := t.d.pushRecv(b)
+	if err != nil {
+		t.t.Helper()
+		t.t.Fatalf("expect push: %v, actual: %v", nil, err)
 	}
 }

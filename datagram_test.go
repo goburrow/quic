@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -22,16 +23,15 @@ func TestDatagramWrite(t *testing.T) {
 			t.Errorf("unexpected command: %+v", c)
 		}
 		buf := bytes.Buffer{}
-		dg.recvWriteData(&buf)
+		dg.sendWriter(&buf)
 		if buf.String() != data {
 			t.Errorf("unexpected write data: %s, actual: %s", data, &buf)
 		}
-		dg.sendWriteResult(nil)
 		c = <-conn.cmdCh
 		if c.cmd != cmdDatagramWrite {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		dg.sendWriteResult(io.EOF)
+		dg.sendWriter(stubReadWriter{0, io.EOF})
 	}()
 
 	n, err := dg.Write([]byte(data))
@@ -56,14 +56,13 @@ func TestDatagramWriteTimeout(t *testing.T) {
 		if c.cmd != cmdDatagramWrite {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		dg.sendWriteResult(errWait)
 		done <- struct{}{}
 	}()
 
 	dg.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
 	n, err := dg.Write([]byte(data))
-	if n != 0 || err != errDeadlineExceeded {
-		t.Fatalf("expect write error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
+	if n != 0 || err != os.ErrDeadlineExceeded {
+		t.Fatalf("expect write error: %v %v, actual: %v %v", 0, os.ErrDeadlineExceeded, n, err)
 	}
 
 	dg.setClosed(net.ErrClosed, nil)
@@ -90,13 +89,13 @@ func TestDatagramRead(t *testing.T) {
 		if c.cmd != cmdDatagramRead {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		dg.recvReadData(bytes.NewReader([]byte("datagram")))
-		dg.sendReadResult(nil)
+		r := bytes.NewReader([]byte("datagram"))
+		dg.sendReader(r)
 		c = <-conn.cmdCh
 		if c.cmd != cmdDatagramRead || c.n != 0 {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		dg.sendReadResult(io.EOF)
+		dg.sendReader(r)
 	}()
 
 	n, err := dg.Read(data)
@@ -124,14 +123,13 @@ func TestDatagramReadTimeout(t *testing.T) {
 		if c.cmd != cmdDatagramRead {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		dg.sendReadResult(errWait)
 		done <- struct{}{}
 	}()
 
 	dg.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	n, err := dg.Read([]byte(data))
-	if n != 0 || err != errDeadlineExceeded {
-		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, errDeadlineExceeded, n, err)
+	if n != 0 || err != os.ErrDeadlineExceeded {
+		t.Fatalf("expect read error: %v %v, actual: %v %v", 0, os.ErrDeadlineExceeded, n, err)
 	}
 
 	dg.setClosed(net.ErrClosed, nil)
@@ -157,14 +155,9 @@ func TestDatagramReadBlock(t *testing.T) {
 		if c.cmd != cmdDatagramRead {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		dg.sendReadResult(errWait)
 		time.Sleep(10 * time.Millisecond)
-		reading := dg.isReading()
-		if !reading {
-			t.Errorf("expect reading: %v, actual: %v", true, reading)
-		}
-		dg.recvReadData(bytes.NewReader([]byte("datagram")))
-		dg.sendReadResult(nil)
+		r := bytes.NewReader([]byte("datagram"))
+		dg.sendReader(r)
 	}()
 
 	n, err := dg.Read(data)
@@ -183,10 +176,9 @@ func TestDatagramConnectionClose(t *testing.T) {
 		if c.cmd != cmdDatagramRead {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		b := bytes.NewReader([]byte("datagramdatagram"))
-		dg.recvReadData(b)
-		dg.sendReadResult(nil)
-		dg.setClosed(net.ErrClosed, b)
+		r := bytes.NewReader([]byte("datagramdatagram"))
+		dg.sendReader(r)
+		dg.setClosed(net.ErrClosed, r)
 	}()
 
 	data := make([]byte, 8)
@@ -218,10 +210,9 @@ func TestDatagramConnectionTerminate(t *testing.T) {
 		if c.cmd != cmdDatagramRead {
 			t.Errorf("unexpected command: %+v", c)
 		}
-		b := bytes.NewReader([]byte("datagram"))
-		dg.recvReadData(b)
-		dg.sendReadResult(nil)
-		dg.setClosed(net.ErrClosed, nopReader{})
+		r := bytes.NewReader([]byte("datagram"))
+		dg.sendReader(r)
+		dg.setClosed(net.ErrClosed, stubReadWriter{0, nil})
 	}()
 
 	data := make([]byte, 8)

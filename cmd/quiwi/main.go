@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -108,7 +109,7 @@ func (w *keyLogWriter) Write(b []byte) (int, error) {
 	return w.w.Write(b)
 }
 
-var buffers = newBufferCache(8192, 10)
+var buffers = newBufferCache(4096, 10)
 
 type bufferCache struct {
 	list chan []byte
@@ -142,5 +143,25 @@ func (s *bufferCache) push(b []byte) {
 	case s.list <- b:
 	default:
 		// Full
+	}
+}
+
+type bufferFile struct {
+	f *os.File
+	r *bufio.Reader
+	w *bufio.Writer
+}
+
+func newBufferFileWriter(f *os.File) bufferFile {
+	return bufferFile{
+		f: f,
+		w: bufio.NewWriter(f),
+	}
+}
+
+func newBufferFileReader(f *os.File) bufferFile {
+	return bufferFile{
+		f: f,
+		r: bufio.NewReader(f),
 	}
 }

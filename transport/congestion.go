@@ -36,17 +36,15 @@ type congestionControl struct {
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.3
 func (s *congestionControl) init() {
 	s.state.init()
-	s.cubic.init(&s.state)
-	s.prr.init(&s.state)
 }
 
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.4
 func (s *congestionControl) onPacketSent(sentBytes uint, sentTime time.Time) {
 	if s.enableCubic {
-		s.cubic.onPacketSent(sentBytes, sentTime)
+		s.cubic.onSent(&s.state, sentBytes, sentTime)
 	}
 	if s.enablePRR {
-		s.prr.onPacketSent(sentBytes)
+		s.prr.onSent(sentBytes)
 	}
 	s.state.bytesInFlight += sentBytes
 	s.state.lastSentTime = sentTime
@@ -56,6 +54,7 @@ func (s *congestionControl) onPacketSent(sentBytes uint, sentTime time.Time) {
 // is supplied with the newly acked_packets from sent_packets.
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.5
 func (s *congestionControl) onPacketAcked(sentBytes uint, sentTime time.Time, rtt time.Duration, now time.Time) {
+	appLimited := s.state.isAppLimited()
 	// Remove from in flight.
 	if s.state.bytesInFlight > sentBytes {
 		s.state.bytesInFlight -= sentBytes
@@ -66,18 +65,18 @@ func (s *congestionControl) onPacketAcked(sentBytes uint, sentTime time.Time, rt
 	// in recovery period.
 	if s.state.inRecovery(sentTime) {
 		if s.enablePRR {
-			s.prr.onPacketAcked(sentBytes)
+			s.prr.onAcked(&s.state, sentBytes)
 		}
 		return
 	}
-	if s.state.isAppLimited() {
+	if appLimited {
 		debug("application limited on packet acked: %v", s)
 		return
 	}
 	if s.enableCubic {
-		s.cubic.onPacketAcked(sentBytes, rtt, now)
+		s.cubic.onAcked(&s.state, sentBytes, rtt, now)
 	} else {
-		s.renoOnPacketAcked(sentBytes)
+		s.renoOnAcked(sentBytes)
 	}
 	debug("congestion packet acked: %v", s)
 }
@@ -94,7 +93,7 @@ func (s *congestionControl) onPacketDiscarded(sentBytes uint) {
 // onCongestionEvent is invoked from ProcessECN and OnPacketsLost when a new congestion event is detected.
 // May start a new recovery period and reduces the congestion window.
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-b.6
-func (s *congestionControl) onCongestionEvent(sentTime, now time.Time) {
+func (s *congestionControl) onCongestionEvent(sentTime time.Time, now time.Time) {
 	// Start a new congestion event if packet was sent after the
 	// start of the previous congestion recovery period.
 	if s.state.inRecovery(sentTime) {
@@ -102,19 +101,22 @@ func (s *congestionControl) onCongestionEvent(sentTime, now time.Time) {
 	}
 	s.state.recoveryStartTime = now
 	if s.enableCubic {
-		s.cubic.onCongestionEvent()
+		s.cubic.onLost(&s.state)
 	} else {
-		s.renoOnCongestionEvent()
+		s.renoOnLost()
 	}
 	if s.enablePRR {
-		s.prr.onCongestionEvent()
+		s.prr.onLost(&s.state)
 	}
 	debug("congestion event: %v", s)
 }
 
-func (s *congestionControl) onSpuriousCongestionEvent() {
+func (s *congestionControl) rollback() {
+	if s.enablePRR {
+		s.prr.rollback()
+	}
 	if s.enableCubic {
-		s.cubic.onSpuriousCongestionEvent()
+		s.cubic.rollback(&s.state)
 	}
 }
 
@@ -148,7 +150,7 @@ func (s *congestionControl) setMaxDatagramSize(maxDatagramSize uint) {
 
 // Reno (default)
 
-func (s *congestionControl) renoOnCongestionEvent() {
+func (s *congestionControl) renoOnLost() {
 	s.state.slowStartThreshold = s.state.congestionWindow / lossReductionFactor
 	// congestion_window = max(ssthresh, kMinimumWindow)
 	minimumWindow := minimumWindowPackets * s.state.maxDatagramSize
@@ -158,7 +160,7 @@ func (s *congestionControl) renoOnCongestionEvent() {
 	s.state.congestionWindow = s.state.slowStartThreshold
 }
 
-func (s *congestionControl) renoOnPacketAcked(sentBytes uint) {
+func (s *congestionControl) renoOnAcked(sentBytes uint) {
 	if s.state.isSlowStart() {
 		s.state.congestionWindow += sentBytes
 	} else {
@@ -218,11 +220,8 @@ func (s *congestionState) isAppLimited() bool {
 	if s.bytesInFlight >= s.congestionWindow {
 		return false
 	}
-	if s.isSlowStart() {
-		return s.bytesInFlight < s.congestionWindow/lossReductionFactor
-	}
-	// Alow a burst of 10 packets
-	return s.bytesInFlight+initialWindowPackets*s.maxDatagramSize < s.congestionWindow
+	// Alow a burst of 2 packets
+	return s.bytesInFlight+minimumWindowPackets*s.maxDatagramSize < s.congestionWindow
 }
 
 func (s *congestionState) String() string {
@@ -245,8 +244,6 @@ const (
 
 // https://www.rfc-editor.org/rfc/rfc8312.html
 type cubic struct {
-	state *congestionState
-
 	// The time period in seconds it takes to increase the congestion
 	// window size at the beginning of the current congestion avoidance
 	// stage to W_max.
@@ -262,20 +259,16 @@ type cubic struct {
 	priorWindowMax          uint
 }
 
-func (s *cubic) init(state *congestionState) {
-	s.state = state
-}
-
-func (s *cubic) onCongestionEvent() {
+func (s *cubic) onLost(state *congestionState) {
 	// Save previous state in case the congestion is spurious.
 	s.priorWindowMax = s.windowMax
 	s.priorK = s.k
-	s.priorSlowStartThreshold = s.state.slowStartThreshold
-	s.priorCongestionWindow = s.state.congestionWindow
-	s.priorRecoveryStartTime = s.state.recoveryStartTime
+	s.priorSlowStartThreshold = state.slowStartThreshold
+	s.priorCongestionWindow = state.congestionWindow
+	s.priorRecoveryStartTime = state.recoveryStartTime
 
 	// Save window size before reduction
-	s.windowMax = s.state.congestionWindow
+	s.windowMax = state.congestionWindow
 
 	// Fast convergence.
 	// https://www.rfc-editor.org/rfc/rfc8312.html#section-4.6
@@ -289,85 +282,85 @@ func (s *cubic) onCongestionEvent() {
 	}
 	// Multiplicative Decrease.
 	// https://www.rfc-editor.org/rfc/rfc8312.html#section-4.5
-	s.state.slowStartThreshold = s.state.congestionWindow * cubicTenTimesBeta / 10
-	minimumWindow := minimumWindowPackets * s.state.maxDatagramSize
-	if s.state.slowStartThreshold < minimumWindow {
-		s.state.slowStartThreshold = minimumWindow
+	state.slowStartThreshold = state.congestionWindow * cubicTenTimesBeta / 10
+	minimumWindow := minimumWindowPackets * state.maxDatagramSize
+	if state.slowStartThreshold < minimumWindow {
+		state.slowStartThreshold = minimumWindow
 	}
-	s.state.congestionWindow = s.state.slowStartThreshold
-	s.updateK()
+	state.congestionWindow = state.slowStartThreshold
+	s.updateK(state)
 }
 
-func (s *cubic) onSpuriousCongestionEvent() {
-	if s.state.congestionWindow < s.priorCongestionWindow {
-		s.windowMax = s.priorWindowMax
-		s.k = s.priorK
-		s.state.slowStartThreshold = s.priorSlowStartThreshold
-		s.state.congestionWindow = s.priorCongestionWindow
-		s.state.recoveryStartTime = s.priorRecoveryStartTime
-	}
-}
-
-func (s *cubic) onPacketSent(sentBytes uint, sentTime time.Time) {
-	if s.state.bytesInFlight == 0 && !s.state.lastSentTime.IsZero() && !s.state.recoveryStartTime.IsZero() {
+func (s *cubic) onSent(state *congestionState, sentBytes uint, sentTime time.Time) {
+	if state.bytesInFlight == 0 && !state.lastSentTime.IsZero() && !state.recoveryStartTime.IsZero() {
 		// First transmit when no packets in flight
-		delta := sentTime.Sub(s.state.lastSentTime)
+		delta := sentTime.Sub(state.lastSentTime)
 		if delta > 0 {
 			// We were application limited (idle) for a while.
 			// Shift epoch start to keep cwnd growth to cubic curve.
-			s.state.recoveryStartTime = s.state.recoveryStartTime.Add(delta)
+			state.recoveryStartTime = state.recoveryStartTime.Add(delta)
 		}
 	}
 }
 
-func (s *cubic) onPacketAcked(sentBytes uint, rtt time.Duration, now time.Time) {
-	if s.state.isSlowStart() {
-		s.state.congestionWindow += sentBytes
+func (s *cubic) onAcked(state *congestionState, sentBytes uint, rtt time.Duration, now time.Time) {
+	if state.isSlowStart() {
+		state.congestionWindow += sentBytes
 		return
 	}
 	// Congestion avoidance.
-	timeInCA := now.Sub(s.state.recoveryStartTime)
+	timeInCA := now.Sub(state.recoveryStartTime)
 	// Spec said comparing W_cubic(t) vs W_est(t) instead.
-	windowCubic := s.computeWCubic(timeInCA + rtt)
-	windowEst := s.computeWEst(timeInCA, rtt)
+	windowCubic := s.computeWCubic(state, timeInCA+rtt)
+	windowEst := s.computeWEst(state, timeInCA, rtt)
 	if windowCubic < windowEst {
 		// TCP-Friendly region.
 		// https://www.rfc-editor.org/rfc/rfc8312.html#section-4.2
-		if s.state.congestionWindow < windowEst {
-			s.state.congestionWindow = windowEst
+		if state.congestionWindow < windowEst {
+			state.congestionWindow = windowEst
 		}
 	} else {
 		// Concave and convex region.
 		// cwnd MUST be incremented by (W_cubic(t+RTT) - cwnd)/cwnd.
 		// https://www.rfc-editor.org/rfc/rfc8312.html#section-4.3
-		// windowTarget := s.computeWCubic(timeInCA + rtt)
-		if s.state.congestionWindow < windowCubic {
-			s.state.congestionWindow += (windowCubic - s.state.congestionWindow) * s.state.maxDatagramSize / s.state.congestionWindow
+		// windowCubic = s.computeWCubic(state, timeInCA+rtt)
+		if state.congestionWindow < windowCubic {
+			state.congestionWindow += (windowCubic - state.congestionWindow) * state.maxDatagramSize / state.congestionWindow
 		}
+	}
+}
+
+func (s *cubic) rollback(state *congestionState) {
+	if state.congestionWindow < s.priorCongestionWindow {
+		s.windowMax = s.priorWindowMax
+		s.k = s.priorK
+		state.slowStartThreshold = s.priorSlowStartThreshold
+		state.congestionWindow = s.priorCongestionWindow
+		state.recoveryStartTime = s.priorRecoveryStartTime
 	}
 }
 
 // K = cubic_root(W_max*(1-beta_cubic)/C)
 // https://www.rfc-editor.org/rfc/rfc8312.html#section-4.1
-func (s *cubic) updateK() {
-	d := float64(s.windowMax/s.state.maxDatagramSize) * (10 - cubicTenTimesBeta) / cubicTenTimesC
-	s.k = time.Duration(math.Cbrt(d) * float64(time.Second))
+func (s *cubic) updateK(state *congestionState) {
+	d := s.windowMax * (10 - cubicTenTimesBeta) / cubicTenTimesC / state.maxDatagramSize
+	s.k = time.Duration(math.Cbrt(float64(d)) * float64(time.Second))
 }
 
 // W_cubic(t) = C*(t-K)^3 + W_max
-func (s *cubic) computeWCubic(t time.Duration) uint {
+func (s *cubic) computeWCubic(state *congestionState, t time.Duration) uint {
 	d := float32(t-s.k) / float32(time.Second)
 	d = d * d * d / 10 * cubicTenTimesC
 	if d < 0 {
-		return s.windowMax - uint(-d)*s.state.maxDatagramSize
+		return s.windowMax - uint(-d)*state.maxDatagramSize
 	}
-	return s.windowMax + uint(d)*s.state.maxDatagramSize
+	return s.windowMax + uint(d)*state.maxDatagramSize
 }
 
 // W_est(t) = W_max*beta_cubic + [3*(1-beta_cubic)/(1+beta_cubic)] * (t/RTT)
-func (s *cubic) computeWEst(t, rtt time.Duration) uint {
+func (s *cubic) computeWEst(state *congestionState, t, rtt time.Duration) uint {
 	d := t / (10 + cubicTenTimesBeta) * 3 * (10 - cubicTenTimesBeta) / rtt
-	return s.windowMax*cubicTenTimesBeta/10 + uint(d)*s.state.maxDatagramSize
+	return s.windowMax*cubicTenTimesBeta/10 + uint(d)*state.maxDatagramSize
 }
 
 func (s *cubic) String() string {
@@ -377,26 +370,20 @@ func (s *cubic) String() string {
 // Proportional Rate Reduction
 // https://www.rfc-editor.org/rfc/rfc6937.html
 type proportionalRateReduction struct {
-	state *congestionState
-
 	flightSize uint // FlightSize at the start of recovery (RecoverFS).
 	delivered  uint // Total bytes delivered during recovery (prr_delivered).
 	out        uint // Total bytes sent during recovery (prr_out).
 	sndCnt     uint // Bytes should be sent (sndcnt).
 }
 
-func (s *proportionalRateReduction) init(state *congestionState) {
-	s.state = state
-}
-
-func (s *proportionalRateReduction) onCongestionEvent() {
-	s.flightSize = s.state.bytesInFlight
+func (s *proportionalRateReduction) onLost(state *congestionState) {
+	s.flightSize = state.bytesInFlight
 	s.delivered = 0
 	s.out = 0
 	s.sndCnt = 0
 }
 
-func (s *proportionalRateReduction) onPacketSent(sentBytes uint) {
+func (s *proportionalRateReduction) onSent(sentBytes uint) {
 	s.out += sentBytes
 	if s.sndCnt > sentBytes {
 		s.sndCnt -= sentBytes
@@ -405,13 +392,13 @@ func (s *proportionalRateReduction) onPacketSent(sentBytes uint) {
 	}
 }
 
-func (s *proportionalRateReduction) onPacketAcked(sentBytes uint) {
+func (s *proportionalRateReduction) onAcked(state *congestionState, sentBytes uint) {
 	if s.flightSize == 0 {
 		return
 	}
 	s.delivered += sentBytes
-	pipe := s.state.bytesInFlight
-	ssthresh := s.state.slowStartThreshold
+	pipe := state.bytesInFlight
+	ssthresh := state.slowStartThreshold
 	if pipe > ssthresh {
 		// Proportional Rate Reduction
 		// sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
@@ -432,7 +419,7 @@ func (s *proportionalRateReduction) onPacketAcked(sentBytes uint) {
 		if s.delivered > s.out && limit < s.delivered-s.out {
 			limit = s.delivered - s.out
 		}
-		limit += s.state.maxDatagramSize
+		limit += state.maxDatagramSize
 		// Attempt to catch up, as permitted by limit
 		// sndcnt = MIN(ssthresh-pipe, limit)
 		if limit > ssthresh-pipe {
@@ -440,6 +427,13 @@ func (s *proportionalRateReduction) onPacketAcked(sentBytes uint) {
 		}
 		s.sndCnt = limit
 	}
+}
+
+func (s *proportionalRateReduction) rollback() {
+	s.flightSize = 0
+	s.delivered = 0
+	s.out = 0
+	s.sndCnt = 0
 }
 
 func (s *proportionalRateReduction) String() string {

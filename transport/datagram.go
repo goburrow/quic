@@ -75,13 +75,16 @@ func (s *Datagram) setMaxRecv(max uint64) {
 }
 
 type datagramBuffer struct {
-	data [maxDatagramBufferLen][]byte
+	data [][]byte
 
 	w int // Writing index, data at w is always nil.
 	r int // Reading index, data at r is nil if there is nothing to read.
 }
 
 func (s *datagramBuffer) write(b []byte) {
+	if len(s.data) == 0 {
+		s.data = make([][]byte, maxDatagramBufferLen)
+	}
 	data := newDataBuffer(len(b))
 	copy(data, b)
 	s.data[s.w] = data
@@ -113,7 +116,7 @@ func (s *datagramBuffer) read(b []byte) int {
 }
 
 func (s *datagramBuffer) pop() []byte {
-	if s.data[s.r] == nil {
+	if s.r >= len(s.data) || s.data[s.r] == nil {
 		return nil
 	}
 	b := s.data[s.r]
@@ -126,7 +129,10 @@ func (s *datagramBuffer) pop() []byte {
 }
 
 func (s *datagramBuffer) avail() int {
-	return len(s.data[s.r])
+	if s.r < len(s.data) {
+		return len(s.data[s.r])
+	}
+	return 0
 }
 
 func (s *datagramBuffer) String() string {

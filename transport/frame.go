@@ -1,6 +1,9 @@
 package transport
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 const (
 	frameTypePadding     = 0x00
@@ -233,9 +236,8 @@ type ecnCounts struct {
 }
 
 func newAckFrame(ackDelay uint64, r rangeSet) *ackFrame {
-	f := &ackFrame{
-		ackDelay: ackDelay,
-	}
+	f := framePool.ack.Get().(*ackFrame)
+	f.ackDelay = ackDelay
 	f.fromRangeSet(r)
 	return f
 }
@@ -301,7 +303,12 @@ func (s *ackFrame) decode(b []byte) (int, error) {
 		return 0, newError(FrameEncodingError, "ack")
 	}
 	if rangeCount > 0 {
-		s.ackRanges = make([]ackRange, int(rangeCount))
+		numRanges := int(rangeCount)
+		if cap(s.ackRanges) < numRanges {
+			s.ackRanges = make([]ackRange, numRanges)
+		} else {
+			s.ackRanges = s.ackRanges[:numRanges]
+		}
 		for i := range s.ackRanges {
 			r := &s.ackRanges[i]
 			ok = dec.readVarint(&r.gap) && dec.readVarint(&r.ackRange)
@@ -310,7 +317,7 @@ func (s *ackFrame) decode(b []byte) (int, error) {
 			}
 		}
 	} else {
-		s.ackRanges = nil
+		s.ackRanges = s.ackRanges[:0]
 	}
 	if typ == frameTypeAckECN {
 		counts := ecnCounts{}
@@ -339,14 +346,18 @@ func (s *ackFrame) decode(b []byte) (int, error) {
 //   -----  `- ackRange1 = 1
 // |   `- gap2 = 2
 // `- ackRange2 = 0
-func (s *ackFrame) toRangeSet() rangeSet {
+func (s *ackFrame) toRangeSet(ranges rangeSet) rangeSet {
 	if s.largestAck < s.firstAckRange {
 		return nil
 	}
-	n := len(s.ackRanges)
-	ranges := make(rangeSet, n+1)
+	n := len(s.ackRanges) + 1
+	if cap(ranges) < n {
+		ranges = make(rangeSet, n)
+	} else {
+		ranges = ranges[:n]
+	}
 	smallest := s.largestAck - s.firstAckRange
-	ranges[n] = numberRange{start: smallest, end: s.largestAck}
+	ranges[n-1] = numberRange{start: smallest, end: s.largestAck}
 	for i, r := range s.ackRanges {
 		if smallest < r.gap+2 {
 			return nil
@@ -355,7 +366,7 @@ func (s *ackFrame) toRangeSet() rangeSet {
 		if smallest < r.ackRange {
 			return nil
 		}
-		ranges[n-i-1] = numberRange{start: smallest - r.ackRange, end: smallest}
+		ranges[n-i-2] = numberRange{start: smallest - r.ackRange, end: smallest}
 		smallest -= r.ackRange
 	}
 	return ranges
@@ -370,7 +381,12 @@ func (s *ackFrame) fromRangeSet(ranges rangeSet) {
 	s.largestAck = r.end
 	s.firstAckRange = r.end - r.start
 	if n > 1 {
-		s.ackRanges = make([]ackRange, n-1)
+		numRanges := n - 1
+		if cap(s.ackRanges) < numRanges {
+			s.ackRanges = make([]ackRange, numRanges)
+		} else {
+			s.ackRanges = s.ackRanges[:numRanges]
+		}
 		smallest := r.start
 		for i := n - 2; i >= 0; i-- {
 			r = ranges[i]
@@ -389,7 +405,7 @@ func (s *ackFrame) fromRangeSet(ranges rangeSet) {
 func (s *ackFrame) log(b []byte) []byte {
 	b = appendField(b, "frame_type", "ack")
 	b = appendField(b, "ack_delay", s.ackDelay)
-	b = appendField(b, "acked_ranges", s.toRangeSet())
+	b = appendField(b, "acked_ranges", s.toRangeSet(nil))
 	if s.ecnCounts != nil {
 		b = appendField(b, "ect0", s.ecnCounts.ect0Count)
 		b = appendField(b, "ect1", s.ecnCounts.ect1Count)
@@ -537,12 +553,12 @@ type streamFrame struct {
 }
 
 func newStreamFrame(id uint64, data []byte, offset uint64, fin bool) *streamFrame {
-	return &streamFrame{
-		streamID: id,
-		data:     data,
-		offset:   offset,
-		fin:      fin,
-	}
+	f := framePool.stream.Get().(*streamFrame)
+	f.streamID = id
+	f.data = data
+	f.offset = offset
+	f.fin = fin
+	return f
 }
 
 func (s *streamFrame) encodedLen() int {
@@ -632,9 +648,9 @@ type maxDataFrame struct {
 }
 
 func newMaxDataFrame(max uint64) *maxDataFrame {
-	return &maxDataFrame{
-		maximumData: max,
-	}
+	f := framePool.maxData.Get().(*maxDataFrame)
+	f.maximumData = max
+	return f
 }
 
 func (s *maxDataFrame) encodedLen() int {
@@ -684,10 +700,10 @@ type maxStreamDataFrame struct {
 }
 
 func newMaxStreamDataFrame(id, max uint64) *maxStreamDataFrame {
-	return &maxStreamDataFrame{
-		streamID:    id,
-		maximumData: max,
-	}
+	f := framePool.maxStreamData.Get().(*maxStreamDataFrame)
+	f.streamID = id
+	f.maximumData = max
+	return f
 }
 
 func (s *maxStreamDataFrame) encodedLen() int {
@@ -1267,7 +1283,9 @@ func (s *connectionCloseFrame) log(b []byte) []byte {
 		b = appendField(b, "error_space", "transport")
 		b = appendField(b, "error_code", errorCodeString(s.errorCode))
 		b = appendField(b, "raw_error_code", s.errorCode)
-		b = appendField(b, "trigger_frame_type", s.frameType)
+		if s.frameType != 0 {
+			b = appendField(b, "trigger_frame_type", s.frameType)
+		}
 	}
 	if len(s.reasonPhrase) > 0 {
 		b = appendField(b, "reason", string(s.reasonPhrase))
@@ -1374,9 +1392,9 @@ type datagramFrame struct {
 }
 
 func newDatagramFrame(data []byte) *datagramFrame {
-	return &datagramFrame{
-		data: data,
-	}
+	f := framePool.datagram.Get().(*datagramFrame)
+	f.data = data
+	return f
 }
 
 func (s *datagramFrame) encodedLen() int {
@@ -1455,5 +1473,53 @@ func isFrameAllowedInPacket(typ uint64, pktType packetType) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+var framePool = struct {
+	ack           sync.Pool
+	stream        sync.Pool
+	datagram      sync.Pool
+	maxData       sync.Pool
+	maxStreamData sync.Pool
+}{
+	ack: sync.Pool{
+		New: func() interface{} { return &ackFrame{} },
+	},
+	stream: sync.Pool{
+		New: func() interface{} { return &streamFrame{} },
+	},
+	datagram: sync.Pool{
+		New: func() interface{} { return &datagramFrame{} },
+	},
+	maxData: sync.Pool{
+		New: func() interface{} { return &maxDataFrame{} },
+	},
+	maxStreamData: sync.Pool{
+		New: func() interface{} { return &maxStreamDataFrame{} },
+	},
+}
+
+func freeFrame(f frame) {
+	switch f := f.(type) {
+	case *ackFrame:
+		ackRanges := f.ackRanges[:0]
+		*f = ackFrame{}
+		f.ackRanges = ackRanges
+		framePool.ack.Put(f)
+	case *streamFrame:
+		*f = streamFrame{}
+		// Stream data is managed by dataBufferPools
+		framePool.stream.Put(f)
+	case *datagramFrame:
+		*f = datagramFrame{}
+		// Datagram data is managed by dataBufferPools
+		framePool.datagram.Put(f)
+	case *maxDataFrame:
+		*f = maxDataFrame{}
+		framePool.maxData.Put(f)
+	case *maxStreamDataFrame:
+		*f = maxStreamDataFrame{}
+		framePool.maxStreamData.Put(f)
 	}
 }

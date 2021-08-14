@@ -471,8 +471,8 @@ func (s *tlsHandshake) doHandshake() error {
 	return nil
 }
 
-func (s *tlsHandshake) HandshakeComplete() bool {
-	return s.tlsConn.ConnectionState().HandshakeComplete
+func (s *tlsHandshake) connectionState() tls.ConnectionState {
+	return s.tlsConn.ConnectionState()
 }
 
 func (s *tlsHandshake) writeSpace() packetSpace {
@@ -482,7 +482,7 @@ func (s *tlsHandshake) writeSpace() packetSpace {
 	case tls13.EncryptionLevelHandshake:
 		return packetSpaceHandshake
 	case tls13.EncryptionLevelApplication:
-		if !s.HandshakeComplete() {
+		if !s.connectionState().HandshakeComplete {
 			// Downgrade to handshake packet space as the handshake is not complete yet
 			return packetSpaceHandshake
 		}

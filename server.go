@@ -57,7 +57,8 @@ func (s *Server) Serve() error {
 	if s.socket == nil {
 		return errors.New("no listening connection")
 	}
-	s.logger.log(levelInfo, "server_listening addr=%s", s.socket.LocalAddr())
+	s.logger.log(levelInfo, zs("", "connectivity:server_listening"),
+		zv("addr", s.socket.LocalAddr()))
 	for {
 		p := newPacket()
 		n, addr, err := s.socket.ReadFrom(p.buf[:])
@@ -65,7 +66,6 @@ func (s *Server) Serve() error {
 			// Process returned data first before considering error
 			p.data = p.buf[:n]
 			p.addr = addr
-			s.logger.log(levelTrace, "datagrams_received addr=%s byte_length=%d raw=%x", addr, n, p.data)
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -74,7 +74,8 @@ func (s *Server) Serve() error {
 			// Stop on socket error.
 			// FIXME: Should we stop on timeout when read deadline is set
 			if err, ok := err.(net.Error); ok && err.Timeout() {
-				s.logger.log(levelTrace, "verbose message=read_timed_out: %v", err)
+				s.logger.log(levelTrace, zs("", "generic:verbose"),
+					zs("message", "read_timed_out"), ze("", err))
 			} else {
 				return err
 			}
@@ -85,10 +86,15 @@ func (s *Server) Serve() error {
 func (s *Server) recv(p *packet) {
 	_, err := p.header.Decode(p.data, cidLength)
 	if err != nil {
-		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error message=%v", p.addr, len(p.data), err)
+		s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
+			zv("addr", p.addr), zx("raw", p.data))
+		s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
+			zv("addr", p.addr), zi("packet_size", len(p.data)), zs("trigger", "header_parse_error"), ze("message", err))
 		freePacket(p)
 		return
 	}
+	s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
+		zx("cid", p.header.DCID), zv("addr", p.addr), zx("raw", p.data))
 	s.peersMu.RLock()
 	if s.closing {
 		// Do not process packet when closing
@@ -104,13 +110,15 @@ func (s *Server) recv(p *packet) {
 	if c == nil {
 		// Server must ensure the any datagram packet containing Initial packet being at least 1200 bytes
 		if p.header.Type != "initial" || len(p.data) < transport.MinInitialPacketSize {
-			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=unexpected_packet", p.addr, &p.header)
+			s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
+				zx("cid", p.header.DCID), zv("addr", p.addr), zs("trigger", "unexpected_packet"), zv("", &p.header))
 			freePacket(p)
 			return
 		}
 		if !transport.IsVersionSupported(p.header.Version) {
 			// Negotiate version
-			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=unsupported_version", p.addr, &p.header)
+			s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
+				zx("cid", p.header.DCID), zv("addr", p.addr), zs("trigger", "unsupported_version"), zv("", &p.header))
 			s.negotiate(p.addr, &p.header)
 			freePacket(p)
 			return
@@ -126,16 +134,21 @@ func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 	defer freePacket(p)
 	n, err := transport.NegotiateVersion(p.buf[:], h.SCID, h.DCID)
 	if err != nil {
-		s.logger.log(levelError, "error addr=%s %s message=version_negotiation_failed: %v", addr, h, err)
+		s.logger.log(levelError, zs("", "generic:error"),
+			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "version_negotiation_failed"), ze("", err))
 		return
 	}
-	n, err = s.socket.WriteTo(p.buf[:n], addr)
+	p.data = p.buf[:n]
+	n, err = s.socket.WriteTo(p.data, addr)
 	if err != nil {
-		s.logger.log(levelError, "error addr=%s %s message=version_negotiation_failed: %v", addr, h, err)
+		s.logger.log(levelError, zs("", "generic:error"),
+			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "version_negotiation_failed"), ze("", err))
 		return
 	}
-	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=version_negotiation dcid=%x scid=%x", addr, h.SCID, h.DCID)
-	s.logger.log(levelTrace, "datagrams_sent addr=%s byte_length=%d raw=%x", addr, n, p.buf[:n])
+	s.logger.log(levelDebug, zs("", "transport:packet_sent"),
+		zx("cid", h.DCID), zv("addr", addr), zx("dcid", h.SCID), zx("scid", h.DCID))
+	s.logger.log(levelTrace, zs("", "transport:datagrams_sent"),
+		zx("cid", h.DCID), zv("addr", addr), zx("raw", p.data))
 }
 
 func (s *Server) retry(addr net.Addr, h *transport.Header) {
@@ -144,23 +157,29 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	// newCID is a new DCID client should send in next Initial packet
 	var newCID [cidLength]byte
 	if err := s.rand(newCID[:]); err != nil {
-		s.logger.log(levelError, "error addr=%s %s message=retry_failed: %v", addr, h, err)
+		s.logger.log(levelError, zs("", "generic:error"),
+			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
 	token := s.addrValid.GenerateToken(addr, h.DCID)
 	// Header => Retry: DCID => ODCID, SCID => DCID, newCID => SCID
 	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
 	if err != nil {
-		s.logger.log(levelError, "error addr=%s %s message=retry_failed: %v", addr, h, err)
+		s.logger.log(levelError, zs("", "generic:error"),
+			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
-	n, err = s.socket.WriteTo(p.buf[:n], addr)
+	p.data = p.buf[:n]
+	n, err = s.socket.WriteTo(p.data, addr)
 	if err != nil {
-		s.logger.log(levelError, "error addr=%s %s message=retry_failed: %v", addr, h, err)
+		s.logger.log(levelError, zs("", "generic:error"),
+			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
-	s.logger.log(levelDebug, "packet_sent addr=%s packet_type=retry dcid=%x scid=%x odcid=%x token=%x", addr, h.SCID, newCID, h.DCID, token)
-	s.logger.log(levelTrace, "datagrams_sent addr=%s byte_length=%d raw=%x", addr, n, p.buf[:n])
+	s.logger.log(levelDebug, zs("", "transport:packet_sent"),
+		zx("cid", h.DCID), zv("addr", addr), zs("packet_type", "retry"), zx("dcid", h.SCID), zx("scid", newCID[:]), zx("odcid", h.DCID), zx("token", token))
+	s.logger.log(levelTrace, zs("", "transport:datagrams_sent"),
+		zx("cid", h.DCID), zv("addr", addr), zx("raw", p.data))
 }
 
 func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
@@ -176,14 +195,16 @@ func (s *Server) handleNewConn(p *packet) {
 	if s.addrValid != nil {
 		// Retry token
 		if len(p.header.Token) == 0 {
-			s.logger.log(levelDebug, "packet_dropped addr=%s %s trigger=retry_required", p.addr, &p.header)
+			s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
+				zv("addr", p.addr), zv("", &p.header), zs("trigger", "retry_required"))
 			s.retry(p.addr, &p.header)
 			freePacket(p)
 			return
 		}
 		odcid = s.verifyToken(p.addr, p.header.Token)
 		if len(odcid) == 0 {
-			s.logger.log(levelInfo, "packet_dropped addr=%s %s trigger=invalid_token", p.addr, &p.header)
+			s.logger.log(levelInfo, zs("", "transport:packet_dropped"),
+				zv("addr", p.addr), zv("", &p.header), zs("trigger", "invalid_token"))
 			freePacket(p)
 			return
 		}
@@ -192,7 +213,8 @@ func (s *Server) handleNewConn(p *packet) {
 	}
 	c, err := s.newConn(p.addr, scid, odcid)
 	if err != nil {
-		s.logger.log(levelError, "packet_dropped addr=%s %s trigger=create_connection_failed message=%v", p.addr, &p.header, err)
+		s.logger.log(levelError, zs("", "transport:packet_dropped"),
+			zv("addr", p.addr), zv("", &p.header), zs("trigger", "create_connection_failed"), ze("message", err))
 		freePacket(p)
 		return
 	}
@@ -210,22 +232,24 @@ func (s *Server) handleNewConn(p *packet) {
 	if ec := s.peers[string(c.scid)]; ec != nil {
 		// scid is randomly generated, but possible clash. Drop packet for now.
 		s.peersMu.Unlock()
-		s.logger.log(levelError, "packet_dropped addr=%s %s trigger=create_connection_failed message=generated cid conflict", p.addr, &p.header)
+		s.logger.log(levelError, zs("", "transport:packet_dropped"),
+			zv("addr", p.addr), zv("", &p.header), zs("trigger", "create_connection_failed"), zs("message", "generated cid conflict"))
 		freePacket(p)
 		return
 	}
 	if ec := s.peers[string(c.attemptKey)]; ec != nil {
 		// Client may send multiple initial packets, discard the new connection and reuse the one already created.
 		s.peersMu.Unlock()
-		s.logger.log(levelInfo, "info addr=%s cid=%x odcid=%x message=found connection from initial attempt key, discard new connection",
-			p.addr, c.scid, odcid)
+		s.logger.log(levelInfo, zs("", "generic:info"),
+			zx("cid", c.scid), zv("addr", p.addr), zx("odcid", odcid), zs("message", "found connection from initial attempt key, discard new connection"))
 		ec.recvCh <- p
 		return
 	}
 	s.peers[string(c.scid)] = c
 	s.peers[string(c.attemptKey)] = c
 	s.peersMu.Unlock()
-	s.logger.log(levelInfo, "connection_started vantage_point=server addr=%s cid=%x odcid=%x", p.addr, c.scid, odcid)
+	s.logger.log(levelInfo, zs("", "connectivity:connection_started"),
+		zx("cid", c.scid), zv("addr", p.addr), zs("vantage_point", "server"), zx("odcid", odcid))
 	c.recvCh <- p // Buffered channel
 	s.handleConn(c)
 }

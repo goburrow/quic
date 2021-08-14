@@ -156,7 +156,7 @@ func (s *datagramClientHandler) handleDatagramReadable(c *quic.Conn) error {
 			return err
 		}
 		if n > 0 {
-			_, err := fmt.Fprintf(os.Stdout, "recv: %s\n", b[:n])
+			_, err := fmt.Fprintln(os.Stdout, "recv:", b[:n])
 			if err != nil {
 				return err
 			}

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"io"
 	"testing"
 )
@@ -421,6 +422,49 @@ func TestStreamRemoteUni(t *testing.T) {
 	err = s.pushRecv(b, 11, false)
 	if err == nil || err.Error() != "error_code=flow_control_error reason=stream: data exceeded limit 20" {
 		t.Fatalf("expect error %v, actual %v", "flow_control_error", err)
+	}
+}
+
+func TestStreamWriteTo(t *testing.T) {
+	buf := &bytes.Buffer{}
+	s := Stream{}
+	s.init(true, true)
+	s.flow.init(1<<30, 1<<30)
+
+	n, err := s.WriteTo(buf)
+	if n != 0 || err != nil {
+		t.Fatalf("expect write to: %v %v, actual: %v %v", 0, nil, n, err)
+	}
+	b := []byte("1234567890abcdefghij")
+	s.pushRecv(b[:5], 0, false)
+	s.pushRecv(b[10:14], 10, false)
+	n, err = s.WriteTo(buf)
+	if n != 5 || err != nil {
+		t.Fatalf("expect write to: %v %v, actual: %v %v", 5, nil, n, err)
+	}
+	if buf.String() != "12345" {
+		t.Fatalf("expect write to: %s, actual: %s", "12345", buf)
+	}
+	n, err = s.WriteTo(buf)
+	if n != 0 || err != nil {
+		t.Fatalf("expect write to: %v %v, actual: %v %v", 0, nil, n, err)
+	}
+	s.pushRecv(b[5:10], 5, false)
+	n, err = s.WriteTo(buf)
+	if n != 9 || err != nil {
+		t.Fatalf("expect write to: %v %v, actual: %v %v", 9, nil, n, err)
+	}
+	if buf.String() != "1234567890abcd" {
+		t.Fatalf("expect write to: %s, actual: %s", "1234567890", buf)
+	}
+	s.pushRecv(b[14:18], 14, false)
+	s.pushRecv(b[18:], 18, true)
+	n, err = s.WriteTo(buf)
+	if n != 6 || err != io.EOF {
+		t.Fatalf("expect write to: %v %v, actual: %v %v", 6, io.EOF, n, err)
+	}
+	if !bytes.Equal(b, buf.Bytes()) {
+		t.Fatalf("expect write to: %s, actual: %s", "b", buf)
 	}
 }
 

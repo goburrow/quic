@@ -97,7 +97,7 @@ func TestFrameAck(t *testing.T) {
 		},
 	}
 	testFrame(t, f, "025234745602407801020304")
-	ranges := f.toRangeSet()
+	ranges := f.toRangeSet(nil)
 	if ranges.String() != "ranges=3 [4526,4530] [4535,4537] [4540,4660]" {
 		t.Fatalf("range set: actual=%s", ranges)
 	}
@@ -138,7 +138,7 @@ func TestFrameAckContinuous(t *testing.T) {
 		n := uint64(i)
 		ranges.push(n, n)
 		f.fromRangeSet(ranges)
-		actual := f.toRangeSet()
+		actual := f.toRangeSet(nil)
 		if len(actual) != 1 || actual[0].start != 0 || actual[0].end != n {
 			t.Fatalf("expect range %v, actual %v", ranges, actual)
 		}

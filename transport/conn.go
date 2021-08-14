@@ -561,10 +561,13 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
-	ranges := f.toRangeSet()
+	s.logFrameProcessed(&f, now)
+	ranges := f.toRangeSet(s.packetNumberSpaces[space].recvAckRanges[:0])
 	if ranges == nil {
 		return 0, newError(FrameEncodingError, sprint("ack: invalid ranges ", f.String()))
 	}
+	// Cache received ack ranges slice.
+	s.packetNumberSpaces[space].recvAckRanges = ranges
 	// Servers complete address validation when a protected packet is received.
 	if !s.recovery.peerCompletedAddressValidation && space == packetSpaceHandshake {
 		s.recovery.setPeerCompletedAddressValidation()
@@ -575,7 +578,6 @@ func (s *Conn) recvFrameAck(b []byte, space packetSpace, now time.Time) (int, er
 	}
 	ackDelay := time.Duration((1<<ackDelayExponent)*f.ackDelay) * time.Microsecond
 	s.recovery.onAckReceived(ranges, ackDelay, space, now)
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -588,6 +590,7 @@ func (s *Conn) recvFrameResetStream(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Not for send-only stream
 	local := isStreamLocal(f.streamID, s.isClient)
 	bidi := isStreamBidi(f.streamID)
@@ -599,19 +602,20 @@ func (s *Conn) recvFrameResetStream(b []byte, now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	mayRecv := uint64(0)
-	if f.finalSize > st.recv.length {
-		mayRecv = f.finalSize - st.recv.length
+	if !st.isClosed() {
+		mayRecv := uint64(0)
+		if f.finalSize > st.recv.length {
+			mayRecv = f.finalSize - st.recv.length
+		}
+		if mayRecv > s.flow.availRecv() {
+			return 0, newError(FlowControlError, sprint("reset_stream: connection data exceeded limit ", s.flow.recvMax))
+		}
+		err = st.resetRecv(f.finalSize, f.errorCode)
+		if err != nil {
+			return 0, err
+		}
+		s.flow.addRecv(mayRecv)
 	}
-	if mayRecv > s.flow.availRecv() {
-		return 0, newError(FlowControlError, sprint("reset_stream: connection data exceeded limit ", s.flow.recvMax))
-	}
-	err = st.resetRecv(f.finalSize, f.errorCode)
-	if err != nil {
-		return 0, err
-	}
-	s.flow.addRecv(mayRecv)
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -624,6 +628,7 @@ func (s *Conn) recvFrameStopSending(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Not for a locally-initiated stream that has not yet been created.
 	local := isStreamLocal(f.streamID, s.isClient)
 	if local && s.streams.get(f.streamID) == nil {
@@ -639,8 +644,9 @@ func (s *Conn) recvFrameStopSending(b []byte, now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	st.stopSend(f.errorCode)
-	s.logFrameProcessed(&f, now)
+	if !st.isClosed() {
+		st.stopSend(f.errorCode)
+	}
 	return n, nil
 }
 
@@ -651,6 +657,7 @@ func (s *Conn) recvFrameCrypto(b []byte, space packetSpace, now time.Time) (int,
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Push the data to the stream so it can be re-ordered.
 	err = s.packetNumberSpaces[space].cryptoStream.pushRecv(f.data, f.offset, false)
 	if err != nil {
@@ -660,7 +667,6 @@ func (s *Conn) recvFrameCrypto(b []byte, space packetSpace, now time.Time) (int,
 	if err != nil {
 		return 0, err
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -683,6 +689,7 @@ func (s *Conn) recvFrameStream(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Peer can't send on our unidirectional streams.
 	local := isStreamLocal(f.streamID, s.isClient)
 	bidi := isStreamBidi(f.streamID)
@@ -697,15 +704,17 @@ func (s *Conn) recvFrameStream(b []byte, now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	err = st.pushRecv(f.data, f.offset, f.fin)
-	if err != nil {
-		return 0, err
+	// Stream can be closed before data is resent by peer, ignore it.
+	if !st.isClosed() {
+		err = st.pushRecv(f.data, f.offset, f.fin)
+		if err != nil {
+			return 0, err
+		}
+		debug("%v stream recv: id=%v %v", s.pov(), f.streamID, &st.recv)
 	}
-	debug("%v stream recv: id=%v %v", s.pov(), f.streamID, &st.recv)
 	// A receiver maintains a cumulative sum of bytes received on all streams,
 	// which is used to check for flow control violations
 	s.flow.addRecv(uint64(len(f.data)))
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -716,8 +725,8 @@ func (s *Conn) recvFrameMaxData(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
-	s.flow.setSendMax(f.maximumData)
 	s.logFrameProcessed(&f, now)
+	s.flow.setSendMax(f.maximumData)
 	return n, nil
 }
 
@@ -728,12 +737,14 @@ func (s *Conn) recvFrameMaxStreamData(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	st, err := s.getOrCreateStream(f.streamID, false)
 	if err != nil {
 		return 0, err
 	}
-	st.flow.setSendMax(f.maximumData)
-	s.logFrameProcessed(&f, now)
+	if !st.isClosed() {
+		st.flow.setSendMax(f.maximumData)
+	}
 	return n, nil
 }
 
@@ -744,6 +755,7 @@ func (s *Conn) recvFrameMaxStreams(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	if f.maximumStreams > maxStreams {
 		return 0, newError(StreamLimitError, sprint("max_streams: streams exceeded limit ", f.maximumStreams))
 	}
@@ -752,7 +764,6 @@ func (s *Conn) recvFrameMaxStreams(b []byte, now time.Time) (int, error) {
 	} else {
 		s.streams.setPeerMaxStreamsUni(f.maximumStreams)
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -763,11 +774,11 @@ func (s *Conn) recvFrameDataBlocked(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Respond MAX_DATA frame
 	if s.flow.recvMaxNext > f.dataLimit {
 		s.updateMaxData = true
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -778,12 +789,15 @@ func (s *Conn) recvFrameStreamDataBlocked(b []byte, now time.Time) (int, error) 
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Respond MAX_STREAM_DATA frame
-	st := s.streams.get(f.streamID)
-	if st != nil && st.flow.recvMaxNext > f.dataLimit {
+	st, err := s.getOrCreateStream(f.streamID, false)
+	if err != nil {
+		return 0, err
+	}
+	if !st.isClosed() && st.flow.recvMaxNext > f.dataLimit {
 		st.setUpdateMaxData(true)
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -794,6 +808,7 @@ func (s *Conn) recvFrameStreamsBlocked(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	// Respond MAX_STREAMS frame
 	if f.bidi {
 		if s.streams.maxStreamsNext.localBidi > f.streamLimit {
@@ -804,7 +819,6 @@ func (s *Conn) recvFrameStreamsBlocked(b []byte, now time.Time) (int, error) {
 			s.streams.setUpdateMaxStreamsUni(true)
 		}
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -839,9 +853,8 @@ func (s *Conn) recvFramePathChallenge(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
-	s.pathResponse = make([]byte, len(f.data))
-	copy(s.pathResponse, f.data)
 	s.logFrameProcessed(&f, now)
+	s.pathResponse = copyBytes(f.data)
 	return n, nil
 }
 
@@ -864,6 +877,7 @@ func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Ti
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %s (%s)", s.pov(), b[0], &f, errorCodeString(f.errorCode))
+	s.logFrameProcessed(&f, now)
 	// After receiving a CONNECTION_CLOSE frame, endpoints enter the draining state.
 	if s.peerError == nil {
 		if f.application {
@@ -878,7 +892,6 @@ func (s *Conn) recvFrameConnectionClose(b []byte, space packetSpace, now time.Ti
 		debug("%v set draining_timer=%v", s.pov(), s.drainingTimer)
 		s.setState(stateDraining, now)
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -888,10 +901,11 @@ func (s *Conn) recvFrameHandshakeDone(b []byte, now time.Time) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	if !s.isClient {
 		return 0, newError(ProtocolViolation, "handshake_done: unexpected for server")
 	}
-	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
 	if s.state == stateActive && !s.handshakeConfirmed {
 		// Drop client's handshake state when it received done from server
 		s.dropPacketSpace(packetSpaceHandshake, now)
@@ -899,7 +913,6 @@ func (s *Conn) recvFrameHandshakeDone(b []byte, now time.Time) (int, error) {
 		// Server address is now validated.
 		s.recovery.setPeerCompletedAddressValidation()
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -910,11 +923,11 @@ func (s *Conn) recvFrameDatagram(b []byte, now time.Time) (int, error) {
 		return 0, err
 	}
 	debug("%v received frame 0x%x: %v", s.pov(), b[0], &f)
+	s.logFrameProcessed(&f, now)
 	err = s.datagram.pushRecv(f.data)
 	if err != nil {
 		return 0, err
 	}
-	s.logFrameProcessed(&f, now)
 	return n, nil
 }
 
@@ -929,7 +942,7 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 			s.packetNumberSpaces[space].cryptoStream.ackSend(f.offset, uint64(len(f.data)))
 			freeDataBuffer(f.data)
 		case *streamFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				complete := st.ackSend(f.offset, uint64(len(f.data)))
 				if complete {
@@ -938,12 +951,12 @@ func (s *Conn) processAckedPackets(space packetSpace) {
 			}
 			freeDataBuffer(f.data)
 		case *resetStreamFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				st.setResetStream(deliveryConfirmed)
 			}
 		case *stopSendingFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				st.setStopSending(deliveryConfirmed)
 			}
@@ -965,7 +978,7 @@ func (s *Conn) doHandshake(now time.Time) error {
 			s.recovery.setHasHandshakeKeys()
 		}
 	}
-	if s.state < stateActive && s.handshake.HandshakeComplete() {
+	if s.state < stateActive && s.handshake.connectionState().HandshakeComplete {
 		params := s.handshake.peerTransportParams()
 		debug("%v peer transport params: %+v", s.pov(), params)
 		if err := s.validatePeerTransportParams(params); err != nil {
@@ -1252,7 +1265,6 @@ func (s *Conn) maxPacketSize() int {
 func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 	s.logPacketsLost(s.recovery.lost[space], space, now)
 	s.recovery.drainLost(space, func(f frame) {
-		debug("%v lost frame space=%v %v", s.pov(), space, f)
 		switch f := f.(type) {
 		case *ackFrame:
 			s.packetNumberSpaces[space].ackElicited = true
@@ -1264,17 +1276,17 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 			}
 			freeDataBuffer(f.data)
 		case *resetStreamFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				st.setResetStream(deliveryReady)
 			}
 		case *stopSendingFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				st.setStopSending(deliveryReady)
 			}
 		case *streamFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				// Push data back to send again
 				err := st.pushSend(f.data, f.offset, f.fin)
@@ -1286,7 +1298,7 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 		case *maxDataFrame:
 			s.updateMaxData = true
 		case *maxStreamDataFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				st.setUpdateMaxData(true)
 			}
@@ -1299,7 +1311,7 @@ func (s *Conn) processLostPackets(space packetSpace, now time.Time) {
 		case *dataBlockedFrame:
 			s.flow.setSendBlocked(true)
 		case *streamDataBlockedFrame:
-			st := s.streams.get(f.streamID)
+			st := s.streams.getOpen(f.streamID)
 			if st != nil {
 				st.flow.setSendBlocked(true)
 			}
@@ -1626,7 +1638,7 @@ func (s *Conn) ConnectionState() ConnectionState {
 		LostBytes:   s.recovery.lostBytes,
 		PeerParams:  s.peerParams,
 
-		TLS: s.handshake.tlsConn.ConnectionState(),
+		TLS: s.handshake.connectionState(),
 	}
 	if !isNoError(s.localError) {
 		state.LocalError = s.localError
@@ -1868,6 +1880,11 @@ func (s *Conn) setState(state connectionState, now time.Time) {
 	case stateActive:
 		s.addEvent(newEventConnectionOpen())
 	case stateClosed:
+		// When the connection is closed, all streams should be detached from the connection.
+		// That will allow all streams to be drained concurrently by the application.
+		for _, st := range s.streams.streams {
+			st.connFlow = nil
+		}
 		s.addEvent(newEventConnectionClosed())
 	}
 	debug("%v set state=%v", s.pov(), state)
@@ -1958,9 +1975,9 @@ func (s *Conn) logPacketSent(p *packet, frames []frame, now time.Time) {
 		e := newLogEvent(now, logEventPacketSent)
 		logPacket(&e, p)
 		s.logEventFn(e)
-		e.Type = logEventFramesProcessed
+		e.Name = logEventFramesProcessed
 		for _, f := range frames {
-			e.resetMessage()
+			e.resetData()
 			logFrame(&e, f)
 			s.logEventFn(e)
 		}
@@ -1976,7 +1993,7 @@ func (s *Conn) logPacketsLost(packets []*sentPacket, space packetSpace, now time
 		}
 		for _, sp := range packets {
 			p.packetNumber = sp.packetNumber
-			e.resetMessage()
+			e.resetData()
 			logPacket(&e, &p)
 			s.logEventFn(e)
 		}
@@ -2031,7 +2048,7 @@ func (s *Conn) logStreamClosed(id uint64, now time.Time) {
 
 func (s *Conn) logConnectionState(old, new connectionState, now time.Time) {
 	if s.logEventFn != nil {
-		e := newLogEvent(now, logEventStateUpdated)
+		e := newLogEvent(now, logEventConnStateUpdated)
 		logConnectionState(&e, old, new)
 		s.logEventFn(e)
 		freeLogEvent(e)

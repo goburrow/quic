@@ -72,21 +72,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 	}
 	n, err := s.recv.Read(b)
 	if n > 0 {
-		// A receiver could use the current offset of data consumed to determine the
-		// flow control offset to be advertised.
-		s.flow.addRecvMaxNext(uint64(n))
-		if s.connFlow != nil {
-			s.connFlow.addRecvMaxNext(uint64(n))
-		}
-		// Only tell peer to update max data when the stream is consumed.
-		if !s.recv.fin && s.flow.shouldUpdateRecvMax() {
-			s.updateMaxData = true
-		}
-	}
-	// Override error from buffer read (only io.EOF) when receiving part is terminated.
-	if s.recv.resetReceived {
-		s.recv.setClosed() // Reset error has been read by application
-		return n, newAppError(s.recv.stopError, "reset_stream")
+		s.consumeRecv(uint64(n))
 	}
 	return n, err
 }
@@ -126,6 +112,18 @@ func (s *Stream) Write(b []byte) (int, error) {
 func (s *Stream) WriteString(b string) (int, error) {
 	// b will be copied so hopefully complier does not allocate memory for byte conversion
 	return s.Write([]byte(b))
+}
+
+// WriteTo writes stream data to w until there is no more data or when an error occurs.
+func (s *Stream) WriteTo(w io.Writer) (int64, error) {
+	if s.recv.closed {
+		return 0, io.EOF
+	}
+	n, err := s.recv.WriteTo(w)
+	if n > 0 {
+		s.consumeRecv(uint64(n))
+	}
+	return n, err
 }
 
 // isReadable returns true if the stream has any data to read.
@@ -215,6 +213,19 @@ func (s *Stream) pushSend(data []byte, offset uint64, fin bool) error {
 // It returns true if all data has been sent and confirmed.
 func (s *Stream) ackSend(offset, length uint64) bool {
 	return s.send.ack(offset, length)
+}
+
+func (s *Stream) consumeRecv(n uint64) {
+	// A receiver could use the current offset of data consumed to determine the
+	// flow control offset to be advertised.
+	s.flow.addRecvMaxNext(n)
+	if s.connFlow != nil {
+		s.connFlow.addRecvMaxNext(n)
+	}
+	// Only tell peer to update max data when the stream is consumed.
+	if !s.recv.fin && s.flow.shouldUpdateRecvMax() {
+		s.updateMaxData = true
+	}
 }
 
 // setUpdateMaxData sets whether the MAX_STREAM_DATA should be sent.
@@ -349,14 +360,32 @@ func (s *recvStream) push(data []byte, offset uint64, fin bool) error {
 }
 
 // Read makes recvStream an io.Reader.
-func (s *recvStream) Read(b []byte) (int, error) {
-	n := s.buf.read(b, s.offset)
+func (s *recvStream) Read(b []byte) (n int, err error) {
+	n = s.buf.read(b, s.offset)
 	s.offset += uint64(n)
-	if s.fin && s.offset >= s.length {
+	if s.resetReceived {
+		s.setClosed() // Reset error has been read by application
+		err = newAppError(s.stopError, "reset_stream")
+	} else if s.fin && s.offset >= s.length {
 		s.setClosed() // Data is fully read by application
-		return n, io.EOF
+		err = io.EOF
 	}
-	return n, nil
+	return n, err
+}
+
+func (s *recvStream) WriteTo(w io.Writer) (int64, error) {
+	n, err := s.buf.consume(s.offset, w.Write)
+	s.offset += uint64(n)
+	if err == nil {
+		if s.resetReceived {
+			s.setClosed() // Reset error has been read by application
+			err = newAppError(s.stopError, "reset_stream")
+		} else if s.fin && s.offset >= s.length {
+			s.setClosed() // Data is fully read by application
+			err = io.EOF
+		}
+	}
+	return int64(n), err
 }
 
 // ready returns true if data is available at the current read offset.
@@ -612,6 +641,11 @@ func (s *streamMap) get(id uint64) *Stream {
 	if _, ok := s.closedStreams[id]; ok {
 		return &s.closedStream
 	}
+	return s.streams[id]
+}
+
+// getOpen returns only active stream.
+func (s *streamMap) getOpen(id uint64) *Stream {
 	return s.streams[id]
 }
 

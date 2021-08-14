@@ -113,7 +113,8 @@ func (s *sentPacket) String() string {
 func freeSentPacket(s *sentPacket) {
 	// Reset everything but frames slice.
 	frames := s.frames
-	for i := range frames {
+	for i, f := range frames {
+		freeFrame(f)
 		frames[i] = nil
 	}
 	*s = sentPacket{}
@@ -241,7 +242,7 @@ func (s *lossRecovery) onAckReceived(ranges rangeSet, ackDelay time.Duration, sp
 		return
 	}
 	if hasSpurious {
-		s.congestion.onSpuriousCongestionEvent()
+		s.congestion.rollback()
 	}
 	if hasAckEliciting {
 		largestPacket := ackedPackets[len(ackedPackets)-1]
@@ -422,24 +423,18 @@ func (s *lossRecovery) markResendAckElicitingPackets(space packetSpace, probes i
 	// Retransmit the frames from the oldest sent packets on PTO.
 	// Calculate starting point first to keep lost packets in order.
 	sent := s.sent[space]
-	i := len(sent) - 1
-	if i >= 0 {
-		for ; i > 0 && probes > 0; i-- {
-			p := sent[i]
-			if p.ackEliciting && len(p.frames) > 0 {
-				probes--
+	for _, p := range sent {
+		if p.ackEliciting && len(p.frames) > 0 {
+			debug("mark packet lost for resending: %v", p)
+			sp := p.markLost(now)
+			s.lost[space] = append(s.lost[space], sp)
+			probes--
+			if probes == 0 {
+				break
 			}
 		}
-		for ; i < len(sent); i++ {
-			p := sent[i]
-			if p.ackEliciting && len(p.frames) > 0 {
-				debug("mark packet lost for resending: %v", p)
-				sp := p.markLost(now)
-				s.lost[space] = append(s.lost[space], sp)
-			}
-			// The packet may not really lost, so do not change congestion control.
-			// It is kept in the sent list so we can actually declare it lost or acked later.
-		}
+		// The packet may not really lost, so do not change congestion control.
+		// It is kept in the sent list so we can actually declare it lost or acked later.
 	}
 }
 
@@ -560,6 +555,7 @@ func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, n
 	s.lostPackets += uint64(len(packets))
 	sentTimeOfLastLoss := time.Time{}
 	for _, p := range packets {
+		debug("lost packet: %v", p)
 		if p.inFlight {
 			s.congestion.onPacketDiscarded(p.sentBytes)
 			s.lostBytes += uint64(p.sentBytes)
@@ -568,7 +564,8 @@ func (s *lossRecovery) onPacketsLost(packets []*sentPacket, space packetSpace, n
 			}
 		}
 	}
-	if !sentTimeOfLastLoss.IsZero() {
+	if len(packets) > 1 && !sentTimeOfLastLoss.IsZero() {
+		// Only consider new congestion event when there are multiple packets lost.
 		s.congestion.onCongestionEvent(sentTimeOfLastLoss, now)
 	}
 	// Reset the congestion window if the loss of these

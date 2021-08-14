@@ -44,10 +44,15 @@ func TestCongestionCubic(t *testing.T) {
 	rtt := 100 * time.Millisecond
 	// Slow start
 	x.c.onPacketSent(8*mss, sentTime)
+	x.assertInFlight(8 * mss)
 
 	now := sentTime.Add(100 * time.Millisecond)
 	x.c.onPacketAcked(1500, sentTime, rtt, now)
 	x.assertCongestionWindow(14720 + 1500)
+
+	x.c.onPacketSent(3*mss, sentTime)
+	x.assertAppLimited(false)
+
 	x.c.onPacketAcked(500, sentTime, rtt, now)
 	x.assertCongestionWindow(14720 + 2000)
 
@@ -58,14 +63,14 @@ func TestCongestionCubic(t *testing.T) {
 	x.assertCongestionWindow(16720 - 16720*3/10)
 	x.assertSlowStartThreshold(11704) // = cwnd
 
-	k := math.Cbrt(16720 / mss * 0.3 / 0.4) // 2.02062
+	k := math.Cbrt(16720 * 0.3 / 0.4 / mss) // 2.04
 	x.assertCubicK(k)
 
 	// Congestion avoidance
 	sentTime = now.Add(1 * time.Millisecond) // No longer in recovery
 	// for i := 0; i < 100; i++ {
 	// 	now = now.Add(rtt)
-	// 	x.c.cubic.onPacketAcked(1000, rtt, now)
+	// 	x.c.cubic.onAcked(&x.c.state, 1000, rtt, now)
 	// }
 	now = now.Add(rtt)
 	x.c.onPacketAcked(1000, sentTime, rtt, now)
@@ -197,7 +202,7 @@ func (x *congestionControlTest) assertWindowAvailable(n uint) {
 func (x *congestionControlTest) assertCubicK(v float64) {
 	k := float64(x.c.cubic.k) / float64(time.Second)
 	delta := (v - k) / v
-	if delta < -0.01 || delta > 0.01 {
+	if delta < -0.03 || delta > 0.03 {
 		x.t.Helper()
 		x.t.Fatalf("expect k: %v, actual: %v (diff: %.2f%%)", v, x.c.cubic.k, delta*100)
 	}

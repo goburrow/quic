@@ -265,6 +265,33 @@ func (s *rangeBufferList) read(data []byte, offset uint64) int {
 	return n
 }
 
+func (s *rangeBufferList) consume(offset uint64, fn func([]byte) (int, error)) (n int, err error) {
+	var i, k int
+	for i = 0; i < len(s.ls); i++ {
+		b := s.ls[i]
+		if b.offset != offset {
+			break
+		}
+		k, err = fn(b.data)
+		if k <= 0 {
+			break
+		}
+		n += k
+		if k < len(b.data) {
+			s.ls[i] = newRangeBuffer(b.data[k:], b.offset+uint64(k))
+		}
+		freeDataBuffer(b.data)
+		if k != len(b.data) || err != nil {
+			break
+		}
+		offset += uint64(k)
+	}
+	if i > 0 {
+		s.shift(i)
+	}
+	return
+}
+
 // Return first continuous range
 func (s *rangeBufferList) pop(max int) ([]byte, uint64) {
 	if len(s.ls) == 0 || max <= 0 {
@@ -391,7 +418,7 @@ func freeDataBuffer(b []byte) {
 	size := cap(b)
 	for i, n := range dataBufferSizes {
 		if size == n {
-			dataBufferPools[i].Put(b[:size])
+			dataBufferPools[i].Put(b[:n])
 			return
 		}
 	}

@@ -1,9 +1,9 @@
 package quic
 
 import (
-	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +23,91 @@ const (
 )
 
 const logTimeFormat = "2006/01/02 15:04:05.000000" // Similar to log package
+const hexTable = "0123456789abcdef"
+
+type fieldType int8
+
+const (
+	fieldTypeString fieldType = iota
+	fieldTypeInt
+	fieldTypeHex
+	fieldTypeError
+	fieldTypeStringer
+)
+
+type logField struct {
+	key string
+	str string
+	num int
+	byt []byte
+	any interface{}
+	typ fieldType
+}
+
+func (s *logField) log(b []byte) []byte {
+	// Always add whitespace
+	b = append(b, ' ')
+	if s.key != "" {
+		b = append(b, s.key...)
+		b = append(b, '=')
+	}
+	switch s.typ {
+	case fieldTypeString:
+		b = append(b, s.str...)
+	case fieldTypeInt:
+		b = strconv.AppendInt(b, int64(s.num), 10)
+	case fieldTypeHex:
+		for _, v := range s.byt {
+			b = append(b, hexTable[v>>4])
+			b = append(b, hexTable[v&0x0f])
+		}
+	case fieldTypeError:
+		b = append(b, s.any.(error).Error()...)
+	case fieldTypeStringer:
+		b = append(b, s.any.(fmt.Stringer).String()...)
+	}
+	return b
+}
+
+func zs(key string, val string) logField {
+	return logField{
+		key: key,
+		typ: fieldTypeString,
+		str: val,
+	}
+}
+
+func zi(key string, val int) logField {
+	return logField{
+		key: key,
+		typ: fieldTypeInt,
+		num: val,
+	}
+}
+
+func zx(key string, val []byte) logField {
+	return logField{
+		key: key,
+		typ: fieldTypeHex,
+		byt: val,
+	}
+}
+
+func ze(key string, val error) logField {
+	return logField{
+		key: key,
+		typ: fieldTypeError,
+		any: val,
+	}
+}
+
+func zv(key string, val fmt.Stringer) logField {
+	return logField{
+		key: key,
+		typ: fieldTypeStringer,
+		any: val,
+	}
+}
 
 // logger logs QUIC transactions.
 type logger struct {
@@ -47,27 +132,29 @@ func (s *logger) Write(b []byte) (int, error) {
 	return s.writer.Write(b)
 }
 
-func (s *logger) log(level logLevel, format string, values ...interface{}) {
+func (s *logger) log(level logLevel, fields ...logField) {
 	if s.logLevel() < level {
 		return
 	}
 	p := newPacket()
 	defer freePacket(p)
-	b := bytes.NewBuffer(p.buf[:0])
-	b.WriteString(time.Now().Format(logTimeFormat))
-	b.WriteString(" ")
-	fmt.Fprintf(b, format, values...)
-	b.WriteString("\n")
-	s.Write(b.Bytes())
+	b := p.buf[:0]
+	b = time.Now().AppendFormat(b, logTimeFormat)
+	for _, f := range fields {
+		b = f.log(b)
+	}
+	b = append(b, '\n')
+	s.Write(b)
 }
 
 func (s *logger) attachLogger(c *Conn) {
 	if s.logLevel() < levelDebug {
 		return
 	}
+	fd := zx("cid", c.scid)
 	tl := transactionLogger{
 		writer: s, // Write protected
-		prefix: fmt.Sprintf("cid=%x", c.scid),
+		prefix: string(fd.log(nil)),
 	}
 	c.conn.SetLogger(tl.logEvent)
 }
@@ -88,16 +175,16 @@ type transactionLogger struct {
 func (s *transactionLogger) logEvent(e transport.LogEvent) {
 	p := newPacket()
 	defer freePacket(p)
-	b := bytes.NewBuffer(p.buf[:0])
-	b.WriteString(e.Time.Format(logTimeFormat))
-	b.WriteString("   ") // extra indentation for transport-level events
-	b.WriteString(e.Type)
-	if s.prefix != "" {
-		b.WriteString(" ")
-		b.WriteString(s.prefix)
+	b := p.buf[:0]
+	b = e.Time.AppendFormat(b, logTimeFormat)
+	b = append(b, "   "...) // extra indentation for transport-level events
+	b = append(b, e.Name...)
+	if len(s.prefix) > 0 {
+		// Prefix already included a whitespace
+		b = append(b, s.prefix...)
 	}
-	b.WriteString(" ")
-	b.Write(e.Message)
-	b.WriteString("\n")
-	s.writer.Write(b.Bytes())
+	b = append(b, ' ')
+	b = append(b, e.Data...)
+	b = append(b, '\n')
+	s.writer.Write(b)
 }

@@ -34,7 +34,7 @@ func (clientCommand) Run(args []string) error {
 	multi := cmd.Bool("multi", false, "download files using multiple streams")
 	version := cmd.Uint("version", 0, "use specific QUIC version")
 	cipher := cmd.String("cipher", "", "TLS 1.3 cipher suite, e.g. TLS_CHACHA20_POLY1305_SHA256")
-	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
+	qlogPath := cmd.String("qlog", "", "qlog directory or file path")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
 	useAsync := cmd.Bool("async", false, "use asynchronous Stream APIs")
 	keyUpdate := cmd.Int("keyupdate", 0, "key update interval")
@@ -79,19 +79,16 @@ func (clientCommand) Run(args []string) error {
 	}
 	client := quic.NewClient(config)
 	client.SetHandler(&handler)
-	if *qlogFile == "" {
+	if *qlogPath == "" {
 		client.SetLogger(*logLevel, os.Stderr)
 	} else {
-		logFd, err := os.Create(*qlogFile + ".txt")
+		qw, err := newQLogWriter(*qlogPath, "client-")
 		if err != nil {
 			return err
 		}
-		defer logFd.Close()
-		defer func() {
-			logFd.Seek(0, os.SEEK_SET)
-			qlogTransformToFile(*qlogFile, logFd)
-		}()
-		client.SetLogger(*logLevel, logFd)
+		defer qw.Close()
+		go qw.process()
+		client.SetLogger(*logLevel, qw)
 	}
 	if err := client.ListenAndServe(*listenAddr); err != nil {
 		return err
@@ -184,64 +181,50 @@ func (s *clientHandler) handleStreamCreatable(c *quic.Conn) error {
 				return err
 			}
 		}
-		req := fmt.Sprintf("GET %s\r\n", fileURL.Path)
+		req := "GET " + fileURL.Path + "\r\n"
 		_, err = c.StreamWrite(streamID, []byte(req))
 		if err != nil {
 			return err
 		}
 		c.StreamClose(streamID)
 		s.files = s.files[1:]
-		s.getRequests(c)[streamID] = output
+		s.getRequests(c)[streamID] = newBufferFileWriter(output)
 	}
 	return nil
 }
 
 func (s *clientHandler) handleStreamReadable(c *quic.Conn, streamID uint64) error {
 	requests := s.getRequests(c)
-	f := requests[streamID]
-	if f == nil {
+	writer := requests[streamID]
+	if writer.f == nil {
 		return nil
 	}
-	buf := buffers.pop()
-	defer buffers.push(buf)
-	for {
-		n, err := c.StreamRead(streamID, buf)
-		if n > 0 {
-			_, err := f.Write(buf[:n])
-			if err != nil {
-				s.closeFile(f)
-				delete(requests, streamID)
-				return c.StreamCloseRead(streamID, 1)
-			}
-		}
-		if err != nil {
-			s.closeFile(f)
-			delete(requests, streamID)
-			if err == io.EOF {
-				return nil
-			}
+	_, err := c.StreamWriteTo(streamID, writer.w)
+	if err != nil {
+		s.closeFile(writer)
+		delete(requests, streamID)
+		if err != io.EOF {
 			c.StreamCloseRead(streamID, 1)
 			return err
 		}
-		if n <= 0 {
-			return nil
-		}
 	}
+	return nil
 }
 
-func (s *clientHandler) getRequests(c *quic.Conn) map[uint64]*os.File {
+func (s *clientHandler) getRequests(c *quic.Conn) map[uint64]bufferFile {
 	if c.UserData() == nil {
-		responses := make(map[uint64]*os.File)
+		responses := make(map[uint64]bufferFile)
 		c.SetUserData(responses)
 		return responses
 	}
-	return c.UserData().(map[uint64]*os.File)
+	return c.UserData().(map[uint64]bufferFile)
 }
 
-func (s *clientHandler) closeFile(f *os.File) {
+func (s *clientHandler) closeFile(bf bufferFile) {
 	// Do not close file when download directory is not specified as it is stdout.
 	if s.root != "" {
-		f.Close()
+		bf.w.Flush()
+		bf.f.Close()
 	}
 }
 
@@ -299,7 +282,7 @@ func (s *clientHandler) downloadFileAsync(st *quic.Stream, fileURL *url.URL) {
 		defer f.Close()
 		output = f
 	}
-	req := fmt.Sprintf("GET %s\r\n", fileURL.Path)
+	req := "GET " + fileURL.Path + "\r\n"
 	_, err := st.Write([]byte(req))
 	if err != nil {
 		log.Printf("download %v: %v", fileURL.Path, err)

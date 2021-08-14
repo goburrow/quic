@@ -2,6 +2,7 @@ package qlog
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"strconv"
@@ -11,185 +12,197 @@ import (
 
 const logTimeFormat = "2006/01/02 15:04:05.000000 "
 
-// Decode decodes quiwi log file.
-func Decode(r io.Reader) (*LogFile, error) {
+const (
+	eventConnStarted = "connectivity:connection_started"
+	eventConnClosed  = "connectivity:connection_closed"
+
+	eventPacketSent     = "transport:packet_sent"
+	eventPacketReceived = "transport:packet_received"
+	eventPacketLost     = "recovery:packet_lost"
+	eventPacketDropped  = "transport:packet_dropped"
+	eventPacketBuffered = "transport:packet_buffered"
+	eventPacketRestored = "transport:packet_restored"
+
+	eventFramesProcessed = "transport:frames_processed"
+)
+
+// Decode decodes quiwi logs to a qlog file.
+func Decode(r io.Reader) (File, error) {
 	dec := newDecoder(r)
-	err := dec.decode()
-	if err != nil {
-		return nil, err
+	traces, err := dec.decode()
+	f := File{
+		Version: version,
+		Format:  "JSON",
+		Title:   "quiwi",
+		Traces:  traces,
 	}
-	return dec.result, nil
+	if err == io.EOF {
+		err = nil
+	}
+	return f, err
 }
 
+// decoder is for decoding quiwi logs to qlog.
 type decoder struct {
-	scanner *bufio.Scanner
-	result  *LogFile
-
-	isServer   bool
-	lineNumber uint
+	reader *bufio.Reader
 }
 
+// newDecoder returns a new Decoder that reads data from r.
 func newDecoder(r io.Reader) *decoder {
 	return &decoder{
-		scanner: bufio.NewScanner(r),
-		result: &LogFile{
-			Version: "draft-02-wip",
-			Title:   "quiwi",
-		},
+		reader: bufio.NewReader(r),
 	}
 }
 
-func (s *decoder) decode() error {
-	for s.scanner.Scan() {
-		s.lineNumber++
-		line := strings.TrimSpace(s.scanner.Text())
+// decode parses logs until EOF and sets results to f.
+func (s *decoder) decode() ([]Trace, error) {
+	var traces []Trace
+	for {
+		line, err := s.reader.ReadSlice('\n')
+		if err != nil {
+			return traces, err
+		}
+		line = bytes.TrimSpace(line)
 		if len(line) > 0 {
-			e, err := s.parseLine(line)
+			event, err := s.parseLine(line)
 			if err != nil {
-				return err
+				return traces, err
 			}
-			s.addEvent(&e)
+			traces = s.addEvent(traces, event)
 		}
 	}
-	return s.scanner.Err()
 }
 
-func (s *decoder) parseLine(line string) (eventGroup, error) {
-	e := eventGroup{}
+func (s *decoder) parseLine(line []byte) (Event, error) {
 	if len(line) < len(logTimeFormat) {
-		return e, s.newErrorInvalid()
+		return Event{}, fmt.Errorf("time invalid: %s", line)
 	}
 	// Time
-	tm, err := time.Parse(logTimeFormat, line[:len(logTimeFormat)])
+	tm, err := time.Parse(logTimeFormat, string(line[:len(logTimeFormat)]))
 	if err != nil {
-		return e, s.newError("parse time", err)
+		return Event{}, fmt.Errorf("time format: %v %s", err, line)
 	}
-	e.time = uint64(tm.UnixNano()) / 1e6 // ms
+	e := Event{}
+	e.Time = uint64(tm.UnixNano()) / 1e6 // ms
 
-	line = strings.TrimSpace(line[len(logTimeFormat):])
+	line = bytes.TrimSpace(line[len(logTimeFormat):])
 	// Event name
-	idx := strings.Index(line, " ")
+	idx := bytes.IndexByte(line, ' ')
 	if idx <= 0 {
-		e.event = line
+		e.Name = string(line)
 		return e, nil
 	}
-	e.event = line[:idx]
-	e.data = parseEventData(line[idx+1:])
-	e.category = "transport"
+	e.Name = string(line[:idx])
+	e.Data = parseEventData(line[idx+1:])
 	// CID is Group ID
-	if cid, ok := e.data["cid"]; ok {
-		e.groupID = cid.(string)
+	if cid, ok := e.Data["cid"]; ok {
+		e.GroupID = cid.(string)
 	}
-	delete(e.data, "cid")
-	switch e.event {
-	case "packet_received", "packet_sent", "packet_lost", "packet_dropped":
+	delete(e.Data, "cid")
+	if packetEvents[e.Name] {
 		// Move packet headers to sub property
 		header := make(map[string]interface{})
-		for k, v := range e.data {
-			if k == "packet_type" {
-				continue
+		raw := make(map[string]interface{})
+		for k, v := range e.Data {
+			if packetHeaderFields[k] {
+				header[k] = v
+				delete(e.Data, k)
+			} else if t := packetRawFields[k]; t != "" {
+				raw[t] = v
+				delete(e.Data, k)
 			}
-			header[k] = v
-			delete(e.data, k)
 		}
-		e.data["header"] = header
-	case "metrics_updated":
-		e.category = "recovery"
+		e.Data["header"] = header
+		if len(raw) > 0 {
+			e.Data["raw"] = raw
+		}
 	}
 	return e, nil
 }
 
-func (s *decoder) addEvent(e *eventGroup) {
-	f := s.result
-	if len(f.Traces) == 0 && e.event == "server_listening" {
-		s.isServer = true
-	}
-	t := findTrace(f, e.groupID)
+func (s *decoder) addEvent(traces []Trace, e Event) []Trace {
+	t := s.findTrace(traces, e.GroupID)
 	if t == nil {
-		f.Traces = append(f.Traces, Trace{})
-		t = &f.Traces[len(f.Traces)-1]
-		if s.isServer {
-			t.VantagePoint.Type = vantagePointServer
-		} else {
-			t.VantagePoint.Type = vantagePointClient
+		if e.Name != eventConnStarted {
+			return traces
 		}
-		t.Title = e.groupID
-		t.Configuration.TimeUnit = "ms"
-		t.CommonFields.CID = e.groupID
-		t.EventFields = eventFields
+		traces = append(traces, newTrace(&e))
+		t = &traces[len(traces)-1]
 	}
-	if e.event == "frames_processed" {
-		p := findLastTracePacket(t)
+	if e.Name == eventFramesProcessed {
+		// Append frame event to packet event instead.
+		p := findLastPacketEvent(t)
 		if p != nil {
 			var frames []map[string]interface{}
-			if f, ok := p["frames"]; ok {
+			if f, ok := p.Data["frames"]; ok {
 				frames = f.([]map[string]interface{})
 			}
-			frames = append(frames, e.data)
-			p["frames"] = frames
-			return
+			frames = append(frames, e.Data)
+			p.Data["frames"] = frames
+			return traces
 		}
 	}
-	event := Event{
-		e.time,
-		e.category,
-		e.event,
-		e.data,
-	}
-	t.Events = append(t.Events, event)
+	t.Events = append(t.Events, e)
+	return traces
 }
 
-func (s *decoder) newErrorInvalid() error {
-	return fmt.Errorf("%d: invalid format", s.lineNumber)
-}
-
-func (s *decoder) newError(msg string, err error) error {
-	return fmt.Errorf("%d: %s: %v", s.lineNumber, msg, err)
-}
-
-func findTrace(f *LogFile, id string) *Trace {
-	for i := len(f.Traces) - 1; i >= 0; i-- {
-		t := &f.Traces[i]
-		if t.CommonFields.CID == id {
+func (s *decoder) findTrace(traces []Trace, id string) *Trace {
+	for i := len(traces) - 1; i >= 0; i-- {
+		t := &traces[i]
+		if t.CommonFields.GroupID == id {
 			return t
 		}
 	}
 	return nil
 }
 
-func findLastTracePacket(t *Trace) map[string]interface{} {
+func newTrace(e *Event) Trace {
+	t := Trace{}
+	switch e.Data["vantage_point"] {
+	case "server":
+		t.VantagePoint.Type = vantagePointServer
+	case "client":
+		t.VantagePoint.Type = vantagePointClient
+	default:
+		t.VantagePoint.Type = vantagePointUnknown
+	}
+	delete(e.Data, "vantage_point")
+	t.Title = e.GroupID
+	t.CommonFields.GroupID = e.GroupID
+	return t
+}
+
+func findLastPacketEvent(t *Trace) *Event {
 	for i := len(t.Events) - 1; i >= 0; i-- {
-		e := t.Events[i]
-		switch e.Event() {
-		case "packet_sent", "packet_received":
-			return e.Data()
+		e := &t.Events[i]
+		switch e.Name {
+		case eventPacketSent, eventPacketReceived:
+			return e
 		}
 	}
 	return nil
 }
 
-func parseEventData(line string) map[string]interface{} {
-	line = strings.TrimSpace(line)
+func parseEventData(line []byte) map[string]interface{} {
+	line = bytes.TrimSpace(line)
 	data := make(map[string]interface{})
-	var field string
 	for len(line) > 0 {
-		idx := strings.Index(line, " ")
+		idx := bytes.IndexByte(line, ' ')
+		field := line
 		if idx > 0 {
 			field = line[:idx]
-		} else {
-			field = line
 		}
-		sep := strings.Index(field, "=")
+		sep := bytes.IndexByte(field, '=')
 		if sep <= 0 {
-			data["message"] = line // Take whole remaining
+			data["message"] = string(line) // Take whole remaining
 			break
 		}
-		key := field[:sep]
+		key := string(field[:sep])
 		if key == "message" || key == "description" || key == "reason" {
-			data[key] = line[sep+1:]
+			data[key] = string(line[sep+1:])
 			break
 		}
-		data[key] = parseEventValue(field[sep+1:])
+		data[key] = parseEventValue(string(field[sep+1:]))
 		if idx > 0 {
 			line = line[idx+1:]
 		} else {
@@ -232,4 +245,29 @@ func parseEventValue(value string) interface{} {
 		}
 	}
 	return value
+}
+
+var packetEvents = map[string]bool{
+	eventPacketReceived: true,
+	eventPacketSent:     true,
+	eventPacketLost:     true,
+	eventPacketDropped:  true,
+	eventPacketBuffered: true,
+	eventPacketRestored: true,
+}
+
+// https://quicwg.org/qlog/draft-ietf-quic-qlog-quic-events.html#section-a.4
+var packetHeaderFields = map[string]bool{
+	"packet_type":        true,
+	"version":            true,
+	"dcid":               true,
+	"scid":               true,
+	"packet_number":      true,
+	"supported_versions": true,
+	"token":              true,
+}
+
+var packetRawFields = map[string]string{
+	"packet_size":    "length",
+	"payload_length": "payload_length",
 }

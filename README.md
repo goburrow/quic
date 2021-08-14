@@ -46,7 +46,7 @@ go build -tags quicdebug
 # Check heap allocations
 go build -gcflags '-m' 2>&1 | sort -V > debug.txt
 go test -bench BenchmarkStream -run NONE -benchmem -memprofile mem.out -cpuprofile cpu.out
-go tool pprof mem.out
+go tool pprof -http=:8080 mem.out
 
 # Raspberry Pi Zero
 GOOS=linux GOARCH=arm GOARM=6 CGO_ENABLED=0 go build

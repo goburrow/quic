@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -40,7 +41,7 @@ func (serverCommand) Run(args []string) error {
 	domains := cmd.String("domains", "", "allowed host names for ACME (separated by a comma)")
 	cacheDir := cmd.String("cache", ".", "certificate cache directory when using ACME")
 	root := cmd.String("root", "www", "root directory")
-	qlogFile := cmd.String("qlog", "", "write logs to qlog file")
+	qlogPath := cmd.String("qlog", "", "qlog directory or file path")
 	logLevel := cmd.Int("v", 2, "log verbose: 0=off 1=error 2=info 3=debug 4=trace")
 	useAsync := cmd.Bool("async", false, "use asynchronous Stream APIs")
 	enableRetry := cmd.Bool("retry", false, "enable address validation using Retry packet")
@@ -85,19 +86,16 @@ func (serverCommand) Run(args []string) error {
 		server.SetAddressValidator(quic.NewAddressValidator())
 	}
 	// Logging
-	if *qlogFile == "" {
+	if *qlogPath == "" {
 		server.SetLogger(*logLevel, os.Stderr)
 	} else {
-		logFd, err := os.Create(*qlogFile + ".txt")
+		qw, err := newQLogWriter(*qlogPath, "server-")
 		if err != nil {
 			return err
 		}
-		defer logFd.Close()
-		defer func() {
-			logFd.Seek(0, os.SEEK_SET)
-			qlogTransformToFile(*qlogFile, logFd)
-		}()
-		server.SetLogger(*logLevel, logFd)
+		defer qw.Close()
+		go qw.process()
+		server.SetLogger(*logLevel, qw)
 	}
 
 	sigCh := make(chan os.Signal, 3)
@@ -142,7 +140,7 @@ func (s *serverHandler) serveSync(c *quic.Conn, events []transport.Event) {
 			}
 		case transport.EventConnClosed:
 			for _, f := range s.getResponses(c) {
-				f.Close()
+				f.f.Close()
 			}
 		}
 	}
@@ -164,22 +162,26 @@ func (s *serverHandler) handleStreamReadable(c *quic.Conn, streamID uint64) erro
 		c.StreamWrite(streamID, []byte("not found"))
 		return c.StreamClose(streamID)
 	}
+	reader := newBufferFileReader(f)
 	// Write initial data
 	for i := 0; i < 4; i++ {
-		n, err := f.Read(buf)
-		if n > 0 {
-			m, err := c.StreamWrite(streamID, buf[:n])
-			if m < n {
-				_, err = f.Seek(int64(m-n), io.SeekCurrent)
-				if err != nil {
-					f.Close()
-					c.StreamCloseWrite(streamID, 1)
-					return err
-				}
+		b, err := reader.r.Peek(reader.r.Size())
+		if len(b) > 0 {
+			n, err := c.StreamWrite(streamID, b)
+			if err != nil {
+				f.Close()
+				c.StreamCloseWrite(streamID, 1)
+				return err
+			}
+			reader.r.Discard(n)
+			if n < len(b) {
 				break
 			}
 		}
 		if err != nil {
+			if err == bufio.ErrBufferFull && len(b) > 0 {
+				continue
+			}
 			f.Close()
 			if err == io.EOF {
 				c.StreamClose(streamID) // Done sending
@@ -189,36 +191,36 @@ func (s *serverHandler) handleStreamReadable(c *quic.Conn, streamID uint64) erro
 			return err
 		}
 	}
-	s.getResponses(c)[streamID] = f // Continue later
+	s.getResponses(c)[streamID] = reader // Continue later
 	return nil
 }
 
 func (s *serverHandler) handleStreamWritable(c *quic.Conn, streamID uint64) error {
 	responses := s.getResponses(c)
-	f := responses[streamID]
-	if f == nil {
+	reader := responses[streamID]
+	if reader.f == nil {
 		return nil
 	}
-	buf := buffers.pop()
-	defer buffers.push(buf)
 	for i := 0; i < 4; i++ {
-		n, err := f.Read(buf)
-		if n > 0 {
-			m, _ := c.StreamWrite(streamID, buf[:n])
-			if m < n {
-				// Will send it again
-				_, err = f.Seek(int64(m-n), io.SeekCurrent)
-				if err != nil {
-					f.Close()
-					delete(responses, streamID)
-					c.StreamCloseWrite(streamID, 1)
-					return err
-				}
+		b, err := reader.r.Peek(reader.r.Size())
+		if len(b) > 0 {
+			n, err := c.StreamWrite(streamID, b)
+			if err != nil {
+				reader.f.Close()
+				delete(responses, streamID)
+				c.StreamCloseWrite(streamID, 1)
+				return err
+			}
+			reader.r.Discard(n)
+			if n < len(b) {
 				return nil
 			}
 		}
 		if err != nil {
-			f.Close()
+			if err == bufio.ErrBufferFull && len(b) > 0 {
+				continue
+			}
+			reader.f.Close()
 			delete(responses, streamID)
 			if err == io.EOF {
 				c.StreamClose(streamID) // Done sending
@@ -231,13 +233,13 @@ func (s *serverHandler) handleStreamWritable(c *quic.Conn, streamID uint64) erro
 	return nil
 }
 
-func (s *serverHandler) getResponses(c *quic.Conn) map[uint64]*os.File {
+func (s *serverHandler) getResponses(c *quic.Conn) map[uint64]bufferFile {
 	if c.UserData() == nil {
-		responses := make(map[uint64]*os.File)
+		responses := make(map[uint64]bufferFile)
 		c.SetUserData(responses)
 		return responses
 	}
-	return c.UserData().(map[uint64]*os.File)
+	return c.UserData().(map[uint64]bufferFile)
 }
 
 // serveAsync demonstrates using asynchronous Stream APIs.

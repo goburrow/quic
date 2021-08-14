@@ -881,6 +881,126 @@ func BenchmarkCreateConn(b *testing.B) {
 	}
 }
 
+func BenchmarkConnHandshake(b *testing.B) {
+	clientConfig := newTestConfig()
+	clientConfig.TLS.ServerName = "localhost"
+	clientConfig.TLS.RootCAs = testCA
+	clientSCID := []byte("client")
+
+	serverConfig := newTestConfig()
+	serverConfig.TLS.Certificates = testCerts
+	serverSCID := []byte("server")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		client, err := Connect(clientSCID, serverSCID, clientConfig)
+		if err != nil {
+			b.Fatal(err)
+		}
+		server, err := Accept(serverSCID, nil, serverConfig)
+		if err != nil {
+			b.Fatal(err)
+		}
+		p := newTestEndpoint(nil, client, server)
+		err = p.handshake()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkConnStream(b *testing.B) {
+	const dataSize = 128
+	serverConfig := newTestConfig()
+	serverConfig.TLS.Certificates = testCerts
+	serverConfig.Params.InitialMaxData = uint64(b.N * dataSize * 10)
+	serverConfig.Params.InitialMaxStreamDataUni = uint64(b.N * dataSize * 10)
+	serverConfig.Params.InitialMaxStreamsUni = 10
+	p := newTestEndpoint(nil, newTestClient(nil), newTestServer(serverConfig))
+	err := p.handshake()
+	if err != nil {
+		b.Fatal(err)
+	}
+	data := make([]byte, dataSize)
+	b.ResetTimer()
+	b.ReportAllocs()
+	streamID := uint64(2)
+	for i := 0; i < b.N; i++ {
+		st, err := p.client.Stream(streamID)
+		if err != nil {
+			b.Fatal(err)
+		}
+		n, err := st.Write(data)
+		if n != len(data) || err != nil {
+			b.Fatalf("write: %v %v", n, err)
+		}
+		err = p.clientSend()
+		if err != nil {
+			b.Fatal(err)
+		}
+		st, _ = p.server.Stream(streamID)
+		n, err = st.Read(p.buf[:])
+		if n != len(data) || err != nil {
+			b.Fatalf("read: %v %v", n, err)
+		}
+		err = p.serverSend()
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Force client sending ack
+		p.client.packetNumberSpaces[packetSpaceApplication].ackElicited = true
+		p.client.events = p.client.events[:0]
+		p.server.events = p.server.events[:0]
+	}
+}
+
+func BenchmarkConnCreateStream(b *testing.B) {
+	const dataSize = 512
+	serverConfig := newTestConfig()
+	serverConfig.TLS.Certificates = testCerts
+	serverConfig.Params.InitialMaxData = uint64(b.N * dataSize * 10)
+	serverConfig.Params.InitialMaxStreamDataUni = uint64(b.N * dataSize * 10)
+	serverConfig.Params.InitialMaxStreamsUni = uint64(b.N * 10)
+	p := newTestEndpoint(nil, newTestClient(nil), newTestServer(serverConfig))
+	err := p.handshake()
+	if err != nil {
+		b.Fatal(err)
+	}
+	data := make([]byte, dataSize)
+	b.ResetTimer()
+	b.ReportAllocs()
+	streamID := uint64(2)
+	for i := 0; i < b.N; i++ {
+		st, err := p.client.Stream(streamID)
+		if err != nil {
+			b.Fatal(err)
+		}
+		n, err := st.Write(data)
+		if n != len(data) || err != nil {
+			b.Fatalf("write: %v %v", n, err)
+		}
+		st.Close()
+		err = p.clientSend()
+		if err != nil {
+			b.Fatal(err)
+		}
+		st, _ = p.server.Stream(streamID)
+		n, err = st.Read(p.buf[:])
+		if n != len(data) || err != io.EOF {
+			b.Fatalf("read: %v %v", n, err)
+		}
+		err = p.serverSend()
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Force client sending ack
+		p.client.packetNumberSpaces[packetSpaceApplication].ackElicited = true
+		p.client.events = p.client.events[:0]
+		p.server.events = p.server.events[:0]
+		streamID += 4
+	}
+}
+
 type noRand struct{}
 
 func (noRand) Read(b []byte) (int, error) {

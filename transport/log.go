@@ -2,7 +2,6 @@ package transport
 
 import (
 	"bytes"
-	"encoding/hex"
 	"strconv"
 	"time"
 )
@@ -10,20 +9,20 @@ import (
 // Supported log events
 // https://quicwg.org/qlog/draft-ietf-quic-qlog-quic-events.html
 const (
+	// Connection
+	logEventConnStateUpdated = "connectivity:connection_state_updated"
 	// Packet
-	logEventPacketReceived  = "packet_received"
-	logEventPacketSent      = "packet_sent"
-	logEventPacketDropped   = "packet_dropped"
-	logEventPacketLost      = "packet_lost"
-	logEventFramesProcessed = "frames_processed"
+	logEventPacketReceived  = "transport:packet_received"
+	logEventPacketSent      = "transport:packet_sent"
+	logEventPacketDropped   = "transport:packet_dropped"
+	logEventPacketLost      = "recovery:packet_lost"
+	logEventFramesProcessed = "transport:frames_processed"
 	// Stream
-	logEventStreamStateUpdated = "stream_state_updated"
-
+	logEventStreamStateUpdated = "transport:stream_state_updated"
 	// Recovery
-	logEventParametersSet    = "parameters_set"
-	logEventMetricsUpdated   = "metrics_updated"
-	logEventStateUpdated     = "connection_state_updated"
-	logEventLossTimerUpdated = "loss_timer_updated"
+	logEventParametersSet    = "recovery:parameters_set"
+	logEventMetricsUpdated   = "recovery:metrics_updated"
+	logEventLossTimerUpdated = "recovery:loss_timer_updated"
 )
 
 // Packet dropped triggers.
@@ -38,50 +37,52 @@ const (
 	logTriggerUnsupportedVersion  = "unsupported_version"
 )
 
+const hexTable = "0123456789abcdef"
+
 // logger logs their state in key=value pairs.
 type logger interface {
 	log([]byte) []byte
 }
 
 // LogEvent is event sent by connection.
-// Application must not retain Message as it is from internal buffers.
+// Application must not retain Data as it is from internal buffers.
 type LogEvent struct {
-	Time    time.Time
-	Type    string
-	Message []byte
+	Time time.Time
+	Name string
+	Data []byte
 }
 
 // newLogEvent creates a new LogEvent.
-func newLogEvent(tm time.Time, tp string) LogEvent {
+func newLogEvent(tm time.Time, nm string) LogEvent {
 	return LogEvent{
-		Time:    tm,
-		Type:    tp,
-		Message: newDataBuffer(dataBufferSizes[0])[:0],
+		Time: tm,
+		Name: nm,
+		Data: newDataBuffer(dataBufferSizes[0])[:0],
 	}
 }
 
 // AddField adds a key-value field to current event.
 // Only limited types of v are supported.
 func (s *LogEvent) addField(k string, v interface{}) {
-	s.Message = appendField(s.Message, k, v)
+	s.Data = appendField(s.Data, k, v)
 }
 
-func (s *LogEvent) resetMessage() {
-	s.Message = s.Message[:0]
+func (s *LogEvent) resetData() {
+	s.Data = s.Data[:0]
 }
 
 func (s LogEvent) String() string {
 	w := bytes.Buffer{}
 	w.WriteString(s.Time.Format(time.RFC3339))
 	w.WriteString(" ")
-	w.WriteString(s.Type)
+	w.WriteString(s.Name)
 	w.WriteString(" ")
-	w.Write(s.Message)
+	w.Write(s.Data)
 	return w.String()
 }
 
 func freeLogEvent(e LogEvent) {
-	freeDataBuffer(e.Message)
+	freeDataBuffer(e.Data)
 }
 
 func appendField(b []byte, key string, val interface{}) []byte {
@@ -120,9 +121,10 @@ func appendFieldValue(b []byte, val interface{}) []byte {
 	case string:
 		b = append(b, val...)
 	case []byte:
-		n := hex.EncodedLen(len(val))
-		b = append(b, make([]byte, n)...)
-		hex.Encode(b[len(b)-n:], val)
+		for _, v := range val {
+			b = append(b, hexTable[v>>4])
+			b = append(b, hexTable[v&0x0f])
+		}
 	case []uint32:
 		b = append(b, '[')
 		for i, v := range val {
@@ -163,12 +165,12 @@ func logConnectionState(e *LogEvent, old, new connectionState) {
 // Log packets
 
 func logPacket(e *LogEvent, s *packet) {
-	e.Message = s.log(e.Message)
+	e.Data = s.log(e.Data)
 }
 
 func logParameters(e *LogEvent, p *Parameters) {
 	e.addField("owner", "remote") // Log peer's parameters only
-	e.Message = p.log(e.Message)
+	e.Data = p.log(e.Data)
 }
 
 // Log frames
@@ -178,58 +180,58 @@ func logParameters(e *LogEvent, p *Parameters) {
 func logFrame(e *LogEvent, f frame) {
 	switch f := f.(type) {
 	case *paddingFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *pingFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *ackFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *resetStreamFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *stopSendingFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *cryptoFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *newTokenFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *streamFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *maxDataFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *maxStreamDataFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *maxStreamsFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *dataBlockedFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *streamDataBlockedFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *streamsBlockedFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *newConnectionIDFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *retireConnectionIDFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *pathChallengeFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *pathResponseFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *connectionCloseFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *handshakeDoneFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	case *datagramFrame:
-		e.Message = f.log(e.Message)
+		e.Data = f.log(e.Data)
 	}
 }
 
 // Recovery
 
 func logRecovery(e *LogEvent, s *lossRecovery) {
-	e.Message = s.log(e.Message)
+	e.Data = s.log(e.Data)
 }
 
 func logLossTimer(e *LogEvent, s *lossRecovery) {
-	e.Message = s.logLossTimer(e.Message, e.Time)
+	e.Data = s.logLossTimer(e.Data, e.Time)
 }
 
 func logStreamClosed(e *LogEvent, id uint64) {

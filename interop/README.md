@@ -21,6 +21,10 @@ https://github.com/marten-seemann/quic-interop-runner/
 docker pull martenseemann/quic-network-simulator-endpoint
 docker pull martenseemann/quic-network-simulator
 docker pull martenseemann/quic-interop-iperf-endpoint
+
+# Install Wireshark
+# Enable IPv6 if needed: modprobe ip6table_nat
+
 # Build image
 ./build-docker.sh
 # or with debug
@@ -35,7 +39,6 @@ python3 -m venv venv
 pip install -r requirements.txt
 ./certs.sh . 1
 # Add quiwi to implementations.json: "quiwi":{"image":"nqviet/quic-interop:latest","url":"https://github.com/goburrow/quic","role":"both"}
-# Install Wireshark
 # Run test cases
 ./run.py -d -s quiwi -c quiwi
 ```

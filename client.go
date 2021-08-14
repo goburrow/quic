@@ -45,7 +45,6 @@ func (s *Client) Serve() error {
 		if n > 0 {
 			p.data = p.buf[:n]
 			p.addr = addr
-			s.logger.log(levelTrace, "datagrams_received addr=%s byte_length=%d raw=%x", addr, n, p.data)
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -59,10 +58,15 @@ func (s *Client) Serve() error {
 func (s *Client) recv(p *packet) {
 	_, err := p.header.Decode(p.data, cidLength)
 	if err != nil {
-		s.logger.log(levelDebug, "packet_dropped addr=%s packet_size=%d trigger=header_decrypt_error message=%v", p.addr, len(p.data), err)
+		s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
+			zv("addr", p.addr), zx("raw", p.data))
+		s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
+			zv("addr", p.addr), zi("packet_size", len(p.data)), zs("trigger", "header_parse_error"), ze("message", err))
 		freePacket(p)
 		return
 	}
+	s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
+		zx("cid", p.header.DCID), zv("addr", p.addr), zx("raw", p.data))
 	s.peersMu.RLock()
 	if s.closing {
 		// Server is closing
@@ -72,7 +76,8 @@ func (s *Client) recv(p *packet) {
 	c := s.peers[string(p.header.DCID)]
 	s.peersMu.RUnlock()
 	if c == nil {
-		s.logger.log(levelDebug, "packet_dropped addr=%s trigger=unknown_connection_id %s", p.addr, &p.header)
+		s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
+			zx("cid", p.header.DCID), zv("addr", p.addr), zs("trigger", "unknown_connection_id"), zv("", &p.header))
 		freePacket(p)
 	} else {
 		c.recvCh <- p
@@ -101,7 +106,8 @@ func (s *Client) Connect(addr string) error {
 	s.peers[string(c.scid)] = c
 	s.peersMu.Unlock()
 	// Send initial packet
-	s.logger.log(levelInfo, "connection_started vantage_point=client cid=%x addr=%v", c.scid, c.addr)
+	s.logger.log(levelInfo, zs("", "connectivity:connection_started"),
+		zx("cid", c.scid), zv("addr", c.addr), zs("vantage_point", "client"))
 	if err = s.sendConn(c); err != nil {
 		s.peersMu.Lock()
 		delete(s.peers, string(c.scid))
