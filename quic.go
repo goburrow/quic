@@ -41,6 +41,8 @@ const (
 	cidLength = 16 // must be less than transport.MaxCIDLength
 	// bufferSize is the size of the global buffers for sending and receiving UDP datagrams.
 	bufferSize = 1500
+
+	keyUnavailableTrigger = "key_unavailable"
 )
 
 // Handler defines interface to handle QUIC connection states.
@@ -62,9 +64,10 @@ func (s noopHandler) Serve(*Conn, []transport.Event) {}
 // Conn is not safe for concurrent use.
 // Its methods would only be called inside the Handler callback.
 type Conn struct {
-	conn *transport.Conn
-	addr net.Addr
-	scid []byte
+	conn    *transport.Conn
+	addr    net.Addr
+	udpAddr net.UDPAddr
+	scid    []byte
 
 	streams  map[uint64]*Stream // async streams
 	datagram *Datagram          // async datagram
@@ -100,6 +103,10 @@ func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn, isClient bo
 
 		nextStreamIDBidi: 0, // client by default
 		nextStreamIDUni:  2, // client by default
+	}
+	if addr, ok := c.addr.(*net.UDPAddr); ok {
+		c.udpAddr = *addr
+		c.addr = &c.udpAddr
 	}
 	if !isClient {
 		c.nextStreamIDBidi++
@@ -462,6 +469,7 @@ type localConn struct {
 	closeCh   chan struct{}
 
 	handler Handler
+	cidGen  CIDGenerator
 	logger  logger
 }
 
@@ -471,6 +479,7 @@ func (s *localConn) init(config *transport.Config) {
 	s.closeCh = make(chan struct{})
 	s.closeCond.L = &s.peersMu
 	s.handler = noopHandler{}
+	s.cidGen = newCIDGenerator(config)
 }
 
 // SetHandler sets QUIC connection callbacks.
@@ -479,6 +488,7 @@ func (s *localConn) SetHandler(v Handler) {
 }
 
 // SetLogger sets transaction logger.
+// It is safe to change connection logger at any time.
 func (s *localConn) SetLogger(level int, w io.Writer) {
 	s.logger.setLevel(logLevel(level))
 	s.logger.setWriter(w)
@@ -489,6 +499,13 @@ func (s *localConn) SetListener(conn net.PacketConn) {
 	s.socket = conn
 }
 
+// SetCIDGenerator sets generator for connection ids.
+// By default, it generates random IDs from Reader in crypto/rand.
+// If transport.Config.TLS.Rand is available, it will use that source instead.
+func (s *localConn) SetCIDGenerator(cidGen CIDGenerator) {
+	s.cidGen = cidGen
+}
+
 // LocalAddr returns the local network address.
 func (s *localConn) LocalAddr() net.Addr {
 	if s.socket == nil {
@@ -497,15 +514,46 @@ func (s *localConn) LocalAddr() net.Addr {
 	return s.socket.LocalAddr()
 }
 
+func (s *localConn) readFrom(p *packet) error {
+	if socket, ok := s.socket.(*net.UDPConn); ok {
+		// Use UDP directly to reduce memory allocations
+		n, addr, err := socket.ReadFromUDP(p.buf[:])
+		if err != nil {
+			return err
+		}
+		p.data = p.buf[:n]
+		p.udpAddr = *addr
+		p.addr = &p.udpAddr
+	} else {
+		n, addr, err := s.socket.ReadFrom(p.buf[:])
+		if err != nil {
+			return err
+		}
+		p.data = p.buf[:n]
+		p.addr = addr
+	}
+	return nil
+}
+
+func (s *localConn) writeTo(p *packet) error {
+	var err error
+	if socket, ok := s.socket.(*net.UDPConn); ok {
+		_, err = socket.WriteToUDP(p.data, p.addr.(*net.UDPAddr))
+	} else {
+		_, err = s.socket.WriteTo(p.data, p.addr)
+	}
+	return err
+}
+
 // handleConn handles data sending to the connection c.
 // Each connection is run in its own goroutine.
 func (s *localConn) handleConn(c *Conn) {
 	defer s.connClosed(c)
 	established := false
 	for !c.conn.IsClosed() {
-		s.pollConn(c)
+		s.connPoll(c)
 		if established {
-			s.serveConn(c)
+			s.connServe(c)
 		} else {
 			// First time state switched to active
 			if c.conn.HandshakeComplete() {
@@ -517,23 +565,23 @@ func (s *localConn) handleConn(c *Conn) {
 					s.peersMu.Unlock()
 				}
 				established = true
-				s.serveConn(c)
+				s.connServe(c)
 			}
 		}
-		err := s.sendConn(c)
+		err := s.connSend(c)
 		if err != nil && established {
-			s.serveConn(c)
+			s.connServe(c)
 		}
 	}
 }
 
-func (s *localConn) pollConn(c *Conn) {
+func (s *localConn) connPoll(c *Conn) {
 	c.setTimeoutTimer()
 	defer c.stopTimeoutTimer()
 	select {
 	case p := <-c.recvCh:
 		// Got packet
-		err := s.recvConn(c, p)
+		err := s.connRecv(c, p)
 		if err != nil {
 			return
 		}
@@ -551,15 +599,15 @@ func (s *localConn) pollConn(c *Conn) {
 		return
 	}
 	// Maybe another packets arrived too while we processed the first one.
-	s.pollConnNoDelay(c, 3)
+	s.connPollNoDelay(c, 3)
 }
 
-func (s *localConn) pollConnNoDelay(c *Conn, count int) int {
+func (s *localConn) connPollNoDelay(c *Conn, count int) int {
 	packets := 0
 	for ; count > 0; count-- {
 		select {
 		case p := <-c.recvCh:
-			err := s.recvConn(c, p)
+			err := s.connRecv(c, p)
 			if err != nil {
 				return -1
 			}
@@ -575,8 +623,7 @@ func (s *localConn) pollConnNoDelay(c *Conn, count int) int {
 	return packets
 }
 
-func (s *localConn) recvConn(c *Conn, p *packet) error {
-	const keyUnavailableTrigger = "key_unavailable"
+func (s *localConn) connRecv(c *Conn, p *packet) error {
 	_, err := c.conn.Write(p.data)
 	if err != nil {
 		if trigger := transport.IsPacketDropped(err); trigger != "" {
@@ -603,42 +650,48 @@ func (s *localConn) recvConn(c *Conn, p *packet) error {
 	}
 	freePacket(p)
 	// Re process previous undecryptable packets.
-	if p = c.dequeuePacket(); p != nil {
-		s.logger.log(levelDebug, zs("", "transport:packet_restored"),
-			zx("cid", c.scid), zv("", &p.header))
-		_, err = c.conn.Write(p.data)
-		if err != nil {
-			if trigger := transport.IsPacketDropped(err); trigger != "" {
-				if trigger == keyUnavailableTrigger {
-					c.queuePacket(p)
-					s.logger.log(levelDebug, zs("", "transport:packet_buffered"),
-						zx("cid", c.scid), zv("", &p.header))
-				} else {
-					freePacket(p)
-				}
-				return nil
-			}
-			// Close connection when receive failed
-			s.logger.log(levelError, zs("", "generic:error"),
-				zx("cid", c.scid), zs("message", "receive_failed"), ze("", err))
-			if err, ok := err.(*transport.Error); ok {
-				c.setClosing(err.Code, err.Reason)
-			} else {
-				c.setClosing(transport.InternalError, "")
-			}
-		}
-		freePacket(p)
-	}
+	s.connDeq(c)
 	return nil
 }
 
-// sendConn returns additional received packets when waiting.
-func (s *localConn) sendConn(c *Conn) error {
+func (s *localConn) connDeq(c *Conn) {
+	p := c.dequeuePacket()
+	if p == nil {
+		return
+	}
+	s.logger.log(levelDebug, zs("", "transport:packet_restored"),
+		zx("cid", c.scid), zv("", &p.header))
+	_, err := c.conn.Write(p.data)
+	if err != nil {
+		if trigger := transport.IsPacketDropped(err); trigger != "" {
+			if trigger == keyUnavailableTrigger {
+				c.queuePacket(p)
+				s.logger.log(levelDebug, zs("", "transport:packet_buffered"),
+					zx("cid", c.scid), zv("", &p.header))
+			} else {
+				freePacket(p)
+			}
+			return
+		}
+		// Close connection when receive failed
+		s.logger.log(levelError, zs("", "generic:error"),
+			zx("cid", c.scid), zs("message", "receive_failed"), ze("", err))
+		if err, ok := err.(*transport.Error); ok {
+			c.setClosing(err.Code, err.Reason)
+		} else {
+			c.setClosing(transport.InternalError, "")
+		}
+	}
+	freePacket(p)
+}
+
+// connSend returns additional received packets when waiting.
+func (s *localConn) connSend(c *Conn) error {
 	p := newPacket()
 	defer freePacket(p)
-	buf := p.buf[:]
+	p.addr = c.addr
 	for {
-		n, err := c.conn.Read(buf)
+		n, err := c.conn.Read(p.buf[:])
 		if err != nil {
 			// Close connection when send failed
 			s.logger.log(levelError, zs("", "generic:error"),
@@ -658,9 +711,10 @@ func (s *localConn) sendConn(c *Conn) error {
 		delay := c.conn.Delay()
 		if delay > 0 {
 			// Process incoming packets or commands while waiting until the time for sending this packet.
-			s.pollConnNoDelay(c, 1+int(delay/time.Millisecond))
+			s.connPollNoDelay(c, 1+int(delay/time.Millisecond))
 		}
-		n, err = s.socket.WriteTo(buf[:n], c.addr)
+		p.data = p.buf[:n]
+		err = s.writeTo(p)
 		if err != nil {
 			s.logger.log(levelError, zs("", "generic:error"),
 				zx("cid", c.scid), zv("addr", c.addr), zs("message", "send_failed"), ze("", err))
@@ -668,11 +722,11 @@ func (s *localConn) sendConn(c *Conn) error {
 			return err
 		}
 		s.logger.log(levelTrace, zs("", "transport:datagrams_sent"),
-			zx("cid", c.scid), zv("addr", c.addr), zx("raw", buf[:n]))
+			zx("cid", c.scid), zv("addr", c.addr), zx("raw", p.data))
 	}
 }
 
-func (s *localConn) serveConn(c *Conn) {
+func (s *localConn) connServe(c *Conn) {
 	c.readEvents()
 	if len(c.events) > 0 {
 		s.logger.log(levelDebug, zs("", "generic:debug"),
@@ -689,7 +743,7 @@ func (s *localConn) connClosed(c *Conn) {
 	if err == nil {
 		err = state.LocalError
 	}
-	s.serveConn(c)
+	s.connServe(c)
 	if err == nil {
 		s.logger.log(levelInfo, zs("", "connectivity:connection_closed"),
 			zx("cid", c.scid), zv("addr", c.addr))
@@ -740,17 +794,6 @@ func (s *localConn) close(timeout time.Duration) {
 	}
 }
 
-// rand uses tls.Config.Rand if available.
-func (s *localConn) rand(b []byte) error {
-	var err error
-	if s.config.TLS != nil && s.config.TLS.Rand != nil {
-		_, err = io.ReadFull(s.config.TLS.Rand, b)
-	} else {
-		_, err = rand.Read(b)
-	}
-	return err
-}
-
 type command uint8
 
 const (
@@ -771,9 +814,10 @@ type connCommand struct {
 }
 
 type packet struct {
-	data   []byte // Always points to buf
-	addr   net.Addr
-	header transport.Header
+	data    []byte // Always points to buf
+	addr    net.Addr
+	udpAddr net.UDPAddr
+	header  transport.Header
 
 	buf [bufferSize]byte
 }
@@ -791,6 +835,40 @@ func newPacket() *packet {
 func freePacket(p *packet) {
 	p.data = nil
 	p.addr = nil
+	p.udpAddr = net.UDPAddr{}
 	p.header = transport.Header{}
 	packetPool.Put(p)
+}
+
+// CIDGenerator generates connection ID.
+type CIDGenerator interface {
+	// GenerateCID generate a new connection ID given the address,
+	// source and destination connection ID provided in the initial packet.
+	NewCID() ([]byte, error)
+	// CIDLength returns the length of generated connection id.
+	CIDLength() int
+}
+
+type cidGenerator struct {
+	reader io.Reader
+}
+
+func newCIDGenerator(config *transport.Config) *cidGenerator {
+	reader := rand.Reader
+	if config.TLS != nil && config.TLS.Rand != nil {
+		reader = config.TLS.Rand
+	}
+	return &cidGenerator{
+		reader: reader,
+	}
+}
+
+func (s *cidGenerator) NewCID() ([]byte, error) {
+	cid := make([]byte, cidLength)
+	_, err := io.ReadFull(s.reader, cid)
+	return cid, err
+}
+
+func (s *cidGenerator) CIDLength() int {
+	return cidLength
 }

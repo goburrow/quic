@@ -61,11 +61,9 @@ func (s *Server) Serve() error {
 		zv("addr", s.socket.LocalAddr()))
 	for {
 		p := newPacket()
-		n, addr, err := s.socket.ReadFrom(p.buf[:])
-		if n > 0 {
+		err := s.readFrom(p)
+		if len(p.data) > 0 {
 			// Process returned data first before considering error
-			p.data = p.buf[:n]
-			p.addr = addr
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -84,7 +82,7 @@ func (s *Server) Serve() error {
 }
 
 func (s *Server) recv(p *packet) {
-	_, err := p.header.Decode(p.data, cidLength)
+	_, err := p.header.Decode(p.data, s.cidGen.CIDLength())
 	if err != nil {
 		s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
 			zv("addr", p.addr), zx("raw", p.data))
@@ -139,7 +137,8 @@ func (s *Server) negotiate(addr net.Addr, h *transport.Header) {
 		return
 	}
 	p.data = p.buf[:n]
-	n, err = s.socket.WriteTo(p.data, addr)
+	p.addr = addr
+	err = s.writeTo(p)
 	if err != nil {
 		s.logger.log(levelError, zs("", "generic:error"),
 			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "version_negotiation_failed"), ze("", err))
@@ -155,29 +154,30 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	p := newPacket()
 	defer freePacket(p)
 	// newCID is a new DCID client should send in next Initial packet
-	var newCID [cidLength]byte
-	if err := s.rand(newCID[:]); err != nil {
+	newCID, err := s.cidGen.NewCID()
+	if err != nil {
 		s.logger.log(levelError, zs("", "generic:error"),
 			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
 	token := s.addrValid.GenerateToken(addr, h.DCID)
 	// Header => Retry: DCID => ODCID, SCID => DCID, newCID => SCID
-	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
+	n, err := transport.Retry(p.buf[:], h.SCID, newCID, h.DCID, token)
 	if err != nil {
 		s.logger.log(levelError, zs("", "generic:error"),
 			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
 	p.data = p.buf[:n]
-	n, err = s.socket.WriteTo(p.data, addr)
+	p.addr = addr
+	err = s.writeTo(p)
 	if err != nil {
 		s.logger.log(levelError, zs("", "generic:error"),
 			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
 	s.logger.log(levelDebug, zs("", "transport:packet_sent"),
-		zx("cid", h.DCID), zv("addr", addr), zs("packet_type", "retry"), zx("dcid", h.SCID), zx("scid", newCID[:]), zx("odcid", h.DCID), zx("token", token))
+		zx("cid", h.DCID), zv("addr", addr), zs("packet_type", "retry"), zx("dcid", h.SCID), zx("scid", newCID), zx("odcid", h.DCID), zx("token", token))
 	s.logger.log(levelTrace, zs("", "transport:datagrams_sent"),
 		zx("cid", h.DCID), zv("addr", addr), zx("raw", p.data))
 }
@@ -257,11 +257,14 @@ func (s *Server) handleNewConn(p *packet) {
 func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
 	// Generate id for new connection since short packets don't include CID length so
 	// we use a fixed length for all connections
-	scid := make([]byte, cidLength)
-	if len(oscid) == cidLength {
+	var scid []byte
+	var err error
+	if len(oscid) == s.cidGen.CIDLength() {
+		scid = make([]byte, len(oscid))
 		copy(scid, oscid)
 	} else {
-		if err := s.rand(scid); err != nil {
+		scid, err = s.cidGen.NewCID()
+		if err != nil {
 			return nil, err
 		}
 	}
