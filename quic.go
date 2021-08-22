@@ -94,7 +94,6 @@ type Conn struct {
 func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn, isClient bool) *Conn {
 	c := &Conn{
 		scid: scid,
-		addr: addr,
 		conn: conn,
 
 		streams: make(map[uint64]*Stream),
@@ -104,9 +103,11 @@ func newRemoteConn(addr net.Addr, scid []byte, conn *transport.Conn, isClient bo
 		nextStreamIDBidi: 0, // client by default
 		nextStreamIDUni:  2, // client by default
 	}
-	if addr, ok := c.addr.(*net.UDPAddr); ok {
-		c.udpAddr = *addr
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		c.udpAddr = *udpAddr
 		c.addr = &c.udpAddr
+	} else {
+		c.addr = addr
 	}
 	if !isClient {
 		c.nextStreamIDBidi++
@@ -469,7 +470,7 @@ type localConn struct {
 	closeCh   chan struct{}
 
 	handler Handler
-	cidGen  CIDGenerator
+	cidIss  CIDIssuer
 	logger  logger
 }
 
@@ -479,7 +480,7 @@ func (s *localConn) init(config *transport.Config) {
 	s.closeCh = make(chan struct{})
 	s.closeCond.L = &s.peersMu
 	s.handler = noopHandler{}
-	s.cidGen = newCIDGenerator(config)
+	s.cidIss = newCIDIssuer(config)
 }
 
 // SetHandler sets QUIC connection callbacks.
@@ -499,11 +500,11 @@ func (s *localConn) SetListener(conn net.PacketConn) {
 	s.socket = conn
 }
 
-// SetCIDGenerator sets generator for connection ids.
+// SetCIDIssuer sets generator for connection ids.
 // By default, it generates random IDs from Reader in crypto/rand.
 // If transport.Config.TLS.Rand is available, it will use that source instead.
-func (s *localConn) SetCIDGenerator(cidGen CIDGenerator) {
-	s.cidGen = cidGen
+func (s *localConn) SetCIDIssuer(cidIss CIDIssuer) {
+	s.cidIss = cidIss
 }
 
 // LocalAddr returns the local network address.
@@ -512,37 +513,6 @@ func (s *localConn) LocalAddr() net.Addr {
 		return nil
 	}
 	return s.socket.LocalAddr()
-}
-
-func (s *localConn) readFrom(p *packet) error {
-	if socket, ok := s.socket.(*net.UDPConn); ok {
-		// Use UDP directly to reduce memory allocations
-		n, addr, err := socket.ReadFromUDP(p.buf[:])
-		if err != nil {
-			return err
-		}
-		p.data = p.buf[:n]
-		p.udpAddr = *addr
-		p.addr = &p.udpAddr
-	} else {
-		n, addr, err := s.socket.ReadFrom(p.buf[:])
-		if err != nil {
-			return err
-		}
-		p.data = p.buf[:n]
-		p.addr = addr
-	}
-	return nil
-}
-
-func (s *localConn) writeTo(p *packet) error {
-	var err error
-	if socket, ok := s.socket.(*net.UDPConn); ok {
-		_, err = socket.WriteToUDP(p.data, p.addr.(*net.UDPAddr))
-	} else {
-		_, err = s.socket.WriteTo(p.data, p.addr)
-	}
-	return err
 }
 
 // handleConn handles data sending to the connection c.
@@ -689,7 +659,6 @@ func (s *localConn) connDeq(c *Conn) {
 func (s *localConn) connSend(c *Conn) error {
 	p := newPacket()
 	defer freePacket(p)
-	p.addr = c.addr
 	for {
 		n, err := c.conn.Read(p.buf[:])
 		if err != nil {
@@ -713,8 +682,7 @@ func (s *localConn) connSend(c *Conn) error {
 			// Process incoming packets or commands while waiting until the time for sending this packet.
 			s.connPollNoDelay(c, 1+int(delay/time.Millisecond))
 		}
-		p.data = p.buf[:n]
-		err = s.writeTo(p)
+		_, err = s.socket.WriteTo(p.buf[:n], c.addr)
 		if err != nil {
 			s.logger.log(levelError, zs("", "generic:error"),
 				zx("cid", c.scid), zv("addr", c.addr), zs("message", "send_failed"), ze("", err))
@@ -840,35 +808,57 @@ func freePacket(p *packet) {
 	packetPool.Put(p)
 }
 
-// CIDGenerator generates connection ID.
-type CIDGenerator interface {
-	// GenerateCID generate a new connection ID given the address,
-	// source and destination connection ID provided in the initial packet.
+func readPacket(p *packet, conn net.PacketConn) error {
+	if udpConn, ok := conn.(*net.UDPConn); ok {
+		// Use UDP directly to reduce memory allocations
+		n, addr, err := udpConn.ReadFromUDP(p.buf[:])
+		if err != nil {
+			return err
+		}
+		p.data = p.buf[:n]
+		p.udpAddr = *addr
+		p.addr = &p.udpAddr
+	} else {
+		n, addr, err := conn.ReadFrom(p.buf[:])
+		if err != nil {
+			return err
+		}
+		p.data = p.buf[:n]
+		p.addr = addr
+	}
+	return nil
+}
+
+// CIDIssuer generates connection ID.
+type CIDIssuer interface {
+	// NewCID generates a new connection ID.
 	NewCID() ([]byte, error)
-	// CIDLength returns the length of generated connection id.
+	// CIDLength returns the length of generated connection id which is needed
+	// to decode short-header packets.
+	// Currently, only constant length is supported.
 	CIDLength() int
 }
 
-type cidGenerator struct {
+type cidIssuer struct {
 	reader io.Reader
 }
 
-func newCIDGenerator(config *transport.Config) *cidGenerator {
+func newCIDIssuer(config *transport.Config) *cidIssuer {
 	reader := rand.Reader
 	if config.TLS != nil && config.TLS.Rand != nil {
 		reader = config.TLS.Rand
 	}
-	return &cidGenerator{
+	return &cidIssuer{
 		reader: reader,
 	}
 }
 
-func (s *cidGenerator) NewCID() ([]byte, error) {
+func (s *cidIssuer) NewCID() ([]byte, error) {
 	cid := make([]byte, cidLength)
 	_, err := io.ReadFull(s.reader, cid)
 	return cid, err
 }
 
-func (s *cidGenerator) CIDLength() int {
+func (s *cidIssuer) CIDLength() int {
 	return cidLength
 }

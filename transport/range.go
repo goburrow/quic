@@ -404,26 +404,18 @@ func newDataBuffer(size int) []byte {
 	for i := 1; i < len(dataBufferSizes); i++ {
 		n := dataBufferSizes[i]
 		if size <= n {
-			var buf *dataBuffer
 			d := dataBufferPools[i].Get()
 			if d == nil {
-				d = dataBufferPools[0].Get()
-				if d == nil {
-					buf = &dataBuffer{}
-				} else {
-					buf = d.(*dataBuffer)
-				}
-				buf.data = make([]byte, n)
-			} else {
-				buf = d.(*dataBuffer)
+				data := make([]byte, n)
+				return data[:size]
 			}
+			buf := d.(*dataBuffer)
 			b := buf.data[:size]
 			buf.data = nil
 			dataBufferPools[0].Put(buf)
 			return b
 		}
 	}
-	// TODO: Split the data to still use buffer pool
 	debug("data is too large for buffer pools: %v", size)
 	return make([]byte, size)
 }

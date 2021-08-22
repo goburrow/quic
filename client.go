@@ -41,7 +41,7 @@ func (s *Client) Serve() error {
 	}
 	for {
 		p := newPacket()
-		err := s.readFrom(p)
+		err := readPacket(p, s.socket)
 		if len(p.data) > 0 {
 			s.recv(p)
 		} else {
@@ -54,7 +54,7 @@ func (s *Client) Serve() error {
 }
 
 func (s *Client) recv(p *packet) {
-	_, err := p.header.Decode(p.data, s.cidGen.CIDLength())
+	_, err := p.header.Decode(p.data, s.cidIss.CIDLength())
 	if err != nil {
 		s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
 			zv("addr", p.addr), zx("raw", p.data))
@@ -126,11 +126,11 @@ func (s *Client) Close() error {
 }
 
 func (s *Client) newConn(addr net.Addr) (*Conn, error) {
-	scid, err := s.cidGen.NewCID()
+	scid, err := s.cidIss.NewCID()
 	if err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
-	dcid, err := s.cidGen.NewCID()
+	dcid, err := s.cidIss.NewCID()
 	if err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
