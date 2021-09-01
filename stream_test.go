@@ -520,6 +520,9 @@ func BenchmarkStream(b *testing.B) {
 		}
 	}))
 
+	b.ResetTimer()
+	b.ReportAllocs()
+
 	//c.SetLogger(int(levelDebug), os.Stdout)
 	err := c.Connect(s.LocalAddr().String())
 	if err != nil {

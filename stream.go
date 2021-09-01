@@ -74,14 +74,13 @@ func newStream(conn *Conn, id uint64) *Stream {
 // Write writes data to the connection stream.
 // The function is blocked until all data are put into stream buffer or timeout.
 func (s *Stream) Write(b []byte) (int, error) {
-	s.wrMu.Lock()
-	defer s.wrMu.Unlock()
-
 	select {
 	case <-s.closeCh:
 		// This connection or stream is already closed.
 		return 0, s.closeErr
 	default:
+		s.wrMu.Lock()
+		defer s.wrMu.Unlock()
 		return s.writeLocked(b)
 	}
 }

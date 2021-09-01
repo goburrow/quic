@@ -139,13 +139,13 @@ func (s *codec) offset() int {
 
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-16
 func varintLen(v uint64) int {
-	if v>>14 == 0 {
-		if v>>6 == 0 {
+	if v < 1<<14 {
+		if v < 1<<6 {
 			return 1
 		}
 		return 2
 	}
-	if v>>30 == 0 {
+	if v < 1<<30 {
 		return 4
 	}
 	return 8
@@ -220,13 +220,13 @@ func getVarint(b []byte, v *uint64) int {
 }
 
 func packetNumberLen(v uint64) int {
-	if v>>16 == 0 {
-		if v>>8 == 0 {
+	if v < 1<<16 {
+		if v < 1<<8 {
 			return 1
 		}
 		return 2
 	}
-	if v>>24 == 0 {
+	if v < 1<<24 {
 		return 3
 	}
 	return 4

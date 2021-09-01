@@ -14,7 +14,8 @@ const (
 	EventStreamComplete  = "stream_complete"  // All sending data has been acked.
 	EventStreamClosed    = "stream_closed"    // Stream is fully closed and no longer available.
 
-	EventDatagramWritable = "datagram_writable" // Datagram is supported by peer.
+	EventDatagramOpen     = "datagram_open"     // Datagram is supported by peer.
+	EventDatagramWritable = "datagram_writable" // Datagram buffer is writable.
 	EventDatagramReadable = "datagram_readable" // Received datagram.
 )
 
@@ -98,11 +99,18 @@ func newEventStreamClosed(id uint64) Event {
 	}
 }
 
-// newEventDatagramWritable creates an event when peer accepts DATAGRAM.
-func newEventDatagramWritable(max uint64) Event {
+// newEventDatagramOpen creates an event when peer accepts DATAGRAM.
+func newEventDatagramOpen(max uint64) Event {
+	return Event{
+		Type: EventDatagramOpen,
+		Data: max,
+	}
+}
+
+// newEventDatagramWritable creates an event where DATAGRAM is available for sending.
+func newEventDatagramWritable() Event {
 	return Event{
 		Type: EventDatagramWritable,
-		Data: max,
 	}
 }
 

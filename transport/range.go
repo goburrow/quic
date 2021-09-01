@@ -401,13 +401,21 @@ func (s *rangeBufferList) String() string {
 // newDataBuffer returns a slice from buffer pools if its size is eligible.
 // This buffer is used in stream data and datagram.
 func newDataBuffer(size int) []byte {
-	for i, n := range dataBufferSizes {
+	for i := 1; i < len(dataBufferSizes); i++ {
+		n := dataBufferSizes[i]
 		if size <= n {
-			b := dataBufferPools[i].Get().([]byte)
-			return b[:size]
+			d := dataBufferPools[i].Get()
+			if d == nil {
+				data := make([]byte, n)
+				return data[:size]
+			}
+			buf := d.(*dataBuffer)
+			b := buf.data[:size]
+			buf.data = nil
+			dataBufferPools[0].Put(buf)
+			return b
 		}
 	}
-	// TODO: Split the data to still use buffer pool
 	debug("data is too large for buffer pools: %v", size)
 	return make([]byte, size)
 }
@@ -416,9 +424,18 @@ func newDataBuffer(size int) []byte {
 // This is used when stream or datagram frame is acknowledged or lost.
 func freeDataBuffer(b []byte) {
 	size := cap(b)
-	for i, n := range dataBufferSizes {
+	for i := 1; i < len(dataBufferSizes); i++ {
+		n := dataBufferSizes[i]
 		if size == n {
-			dataBufferPools[i].Put(b[:n])
+			var buf *dataBuffer
+			d := dataBufferPools[0].Get()
+			if d == nil {
+				buf = &dataBuffer{}
+			} else {
+				buf = d.(*dataBuffer)
+			}
+			buf.data = b[:n]
+			dataBufferPools[i].Put(buf)
 			return
 		}
 	}
@@ -426,23 +443,17 @@ func freeDataBuffer(b []byte) {
 }
 
 var dataBufferSizes = [...]int{
+	0, // For buffer container only
 	1 << 10,
 	2 << 10,
 	4 << 10,
 	8 << 10,
 }
 
-var dataBufferPools = [...]sync.Pool{
-	{
-		New: func() interface{} { return make([]byte, 1<<10) },
-	},
-	{
-		New: func() interface{} { return make([]byte, 2<<10) },
-	},
-	{
-		New: func() interface{} { return make([]byte, 4<<10) },
-	},
-	{
-		New: func() interface{} { return make([]byte, 8<<10) },
-	},
+var dataBufferPools = [len(dataBufferSizes)]sync.Pool{}
+
+// dataBuffer contains data for recycling.
+// The bytes slice should not be put to sync.Pool directly as it will cause allocations.
+type dataBuffer struct {
+	data []byte
 }

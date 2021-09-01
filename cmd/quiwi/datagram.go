@@ -105,6 +105,8 @@ type datagramClientHandler struct {
 func (s *datagramClientHandler) Serve(c *quic.Conn, events []transport.Event) {
 	for _, e := range events {
 		switch e.Type {
+		case transport.EventDatagramOpen:
+			s.handleDatagramOpen(c)
 		case transport.EventDatagramWritable:
 			err := s.handleDatagramWritable(c)
 			if err != nil {
@@ -124,12 +126,9 @@ func (s *datagramClientHandler) Serve(c *quic.Conn, events []transport.Event) {
 	}
 }
 
-func (s *datagramClientHandler) handleDatagramWritable(c *quic.Conn) error {
-	if len(s.data) > 0 {
-		_, err := c.DatagramWrite([]byte(s.data))
-		if err != nil {
-			return err
-		}
+func (s *datagramClientHandler) handleDatagramOpen(c *quic.Conn) {
+	if len(s.data) == 0 {
+		return
 	}
 	// Read from stdin and send each line in a datagram.
 	go func(dgram *quic.Datagram) {
@@ -144,6 +143,16 @@ func (s *datagramClientHandler) handleDatagramWritable(c *quic.Conn) error {
 			}
 		}
 	}(c.Datagram())
+}
+
+func (s *datagramClientHandler) handleDatagramWritable(c *quic.Conn) error {
+	if len(s.data) > 0 {
+		_, err := c.DatagramWrite([]byte(s.data))
+		s.data = ""
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

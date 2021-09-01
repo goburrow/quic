@@ -251,7 +251,7 @@ func TestDatagram(t *testing.T) {
 		}()
 		n, err := io.Copy(dg, dg)
 		if n == 0 || err != net.ErrClosed {
-			t.Errorf("server datagram copy: %v %#v", n, err)
+			t.Errorf("server datagram copy: %v %v", n, err)
 			return
 		}
 	}
@@ -283,7 +283,7 @@ func TestDatagram(t *testing.T) {
 		t.Logf("server events: %v", events)
 		for _, e := range events {
 			switch e.Type {
-			case transport.EventDatagramWritable:
+			case transport.EventDatagramOpen:
 				dg := conn.Datagram()
 				go recvFn(dg)
 			}
@@ -293,7 +293,7 @@ func TestDatagram(t *testing.T) {
 		t.Logf("client events: %v", events)
 		for _, e := range events {
 			switch e.Type {
-			case transport.EventDatagramWritable:
+			case transport.EventDatagramOpen:
 				dg := conn.Datagram()
 				go sendFn(dg)
 			}

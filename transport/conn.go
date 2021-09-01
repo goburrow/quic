@@ -1006,7 +1006,7 @@ func (s *Conn) setPeerParams(params *Parameters, now time.Time) {
 	// Datagram
 	if s.peerParams.MaxDatagramFramePayloadSize > 0 {
 		s.datagram.setMaxSend(s.peerParams.MaxDatagramFramePayloadSize)
-		s.addEvent(newEventDatagramWritable(s.peerParams.MaxDatagramFramePayloadSize))
+		s.addEvent(newEventDatagramOpen(s.peerParams.MaxDatagramFramePayloadSize))
 	}
 	s.logParametersSet(params, now)
 }
@@ -1927,6 +1927,9 @@ func (s *Conn) addStreamEvents(events []Event) []Event {
 }
 
 func (s *Conn) addDatagramEvents(events []Event) []Event {
+	if s.datagram.isWritable() {
+		events = append(events, newEventDatagramWritable())
+	}
 	if s.datagram.isReadable() {
 		events = append(events, newEventDatagramReadable())
 	}

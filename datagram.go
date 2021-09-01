@@ -65,13 +65,12 @@ func newDatagram(conn *Conn) *Datagram {
 
 // Write writes data to the stream.
 func (s *Datagram) Write(b []byte) (int, error) {
-	s.wrMu.Lock()
-	defer s.wrMu.Unlock()
-
 	select {
 	case <-s.closeCh:
 		return 0, s.closeErr
 	default:
+		s.wrMu.Lock()
+		defer s.wrMu.Unlock()
 		return s.writeLocked(b)
 	}
 }

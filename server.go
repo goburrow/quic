@@ -18,7 +18,7 @@ import (
 type Server struct {
 	localConn
 
-	addrValid AddressValidator
+	addrVer AddressVerifier
 }
 
 // NewServer creates a new QUIC server.
@@ -28,9 +28,9 @@ func NewServer(config *transport.Config) *Server {
 	return s
 }
 
-// SetAddressValidator sets validation for QUIC connections address.
-func (s *Server) SetAddressValidator(v AddressValidator) {
-	s.addrValid = v
+// SetAddressVerifier sets validation for QUIC connections address.
+func (s *Server) SetAddressVerifier(v AddressVerifier) {
+	s.addrVer = v
 }
 
 // ListenAndServe starts listening on UDP network address addr and
@@ -61,11 +61,9 @@ func (s *Server) Serve() error {
 		zv("addr", s.socket.LocalAddr()))
 	for {
 		p := newPacket()
-		n, addr, err := s.socket.ReadFrom(p.buf[:])
-		if n > 0 {
+		err := readPacket(p, s.socket)
+		if len(p.data) > 0 {
 			// Process returned data first before considering error
-			p.data = p.buf[:n]
-			p.addr = addr
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -84,7 +82,7 @@ func (s *Server) Serve() error {
 }
 
 func (s *Server) recv(p *packet) {
-	_, err := p.header.Decode(p.data, cidLength)
+	_, err := p.header.Decode(p.data, s.cidIss.CIDLength())
 	if err != nil {
 		s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
 			zv("addr", p.addr), zx("raw", p.data))
@@ -155,15 +153,19 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 	p := newPacket()
 	defer freePacket(p)
 	// newCID is a new DCID client should send in next Initial packet
-	var newCID [cidLength]byte
-	if err := s.rand(newCID[:]); err != nil {
+	newCID, err := s.cidIss.NewCID()
+	if err != nil {
 		s.logger.log(levelError, zs("", "generic:error"),
 			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
 		return
 	}
-	token := s.addrValid.GenerateToken(addr, h.DCID)
+	token := s.addrVer.NewToken(addr, newCID, h.DCID)
+	if len(token) == 0 {
+		// Ignore.
+		return
+	}
 	// Header => Retry: DCID => ODCID, SCID => DCID, newCID => SCID
-	n, err := transport.Retry(p.buf[:], h.SCID, newCID[:], h.DCID, token)
+	n, err := transport.Retry(p.buf[:], h.SCID, newCID, h.DCID, token)
 	if err != nil {
 		s.logger.log(levelError, zs("", "generic:error"),
 			zx("cid", h.DCID), zv("addr", addr), zv("", h), zs("message", "retry_failed"), ze("", err))
@@ -177,13 +179,9 @@ func (s *Server) retry(addr net.Addr, h *transport.Header) {
 		return
 	}
 	s.logger.log(levelDebug, zs("", "transport:packet_sent"),
-		zx("cid", h.DCID), zv("addr", addr), zs("packet_type", "retry"), zx("dcid", h.SCID), zx("scid", newCID[:]), zx("odcid", h.DCID), zx("token", token))
+		zx("cid", h.DCID), zv("addr", addr), zs("packet_type", "retry"), zx("dcid", h.SCID), zx("scid", newCID), zx("odcid", h.DCID), zx("token", token))
 	s.logger.log(levelTrace, zs("", "transport:datagrams_sent"),
 		zx("cid", h.DCID), zv("addr", addr), zx("raw", p.data))
-}
-
-func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
-	return s.addrValid.ValidateToken(addr, token)
 }
 
 // handleNewConn creates a new connection and handles packets sent to this connection.
@@ -192,23 +190,17 @@ func (s *Server) verifyToken(addr net.Addr, token []byte) []byte {
 // server can continue process other packets.
 func (s *Server) handleNewConn(p *packet) {
 	var scid, odcid []byte
-	if s.addrValid != nil {
+	if s.addrVer != nil && s.addrVer.IsActive(p.addr) {
 		// Retry token
-		if len(p.header.Token) == 0 {
+		odcid = s.addrVer.VerifyToken(p.addr, p.header.DCID, p.header.Token)
+		if len(odcid) == 0 {
 			s.logger.log(levelDebug, zs("", "transport:packet_dropped"),
 				zv("addr", p.addr), zv("", &p.header), zs("trigger", "retry_required"))
 			s.retry(p.addr, &p.header)
 			freePacket(p)
 			return
 		}
-		odcid = s.verifyToken(p.addr, p.header.Token)
-		if len(odcid) == 0 {
-			s.logger.log(levelInfo, zs("", "transport:packet_dropped"),
-				zv("addr", p.addr), zv("", &p.header), zs("trigger", "invalid_token"))
-			freePacket(p)
-			return
-		}
-		// Reuse the SCID sent in Retry
+		// Use SCID originally from retry packet as it is verified.
 		scid = p.header.DCID
 	}
 	c, err := s.newConn(p.addr, scid, odcid)
@@ -257,11 +249,15 @@ func (s *Server) handleNewConn(p *packet) {
 func (s *Server) newConn(addr net.Addr, oscid, odcid []byte) (*Conn, error) {
 	// Generate id for new connection since short packets don't include CID length so
 	// we use a fixed length for all connections
-	scid := make([]byte, cidLength)
-	if len(oscid) == cidLength {
+	var scid []byte
+	var err error
+	if len(oscid) > 0 {
+		// scid is verified, just make a copy.
+		scid = make([]byte, len(oscid))
 		copy(scid, oscid)
 	} else {
-		if err := s.rand(scid); err != nil {
+		scid, err = s.cidIss.NewCID()
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -295,37 +291,39 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// AddressValidator generates and validates server retry token.
+// AddressVerifier generates and validates server retry token.
 // https://www.rfc-editor.org/rfc/rfc9000.html#token-integrity
-type AddressValidator interface {
-	// GenerateToken creates a new token from given addr and odcid.
-	GenerateToken(addr net.Addr, odcid []byte) []byte
-	// ValidateToken returns odcid when the address and token pair is valid,
+type AddressVerifier interface {
+	IsActive(addr net.Addr) bool
+	// NewToken creates a new token from given address, retry source connection ID
+	// and original destination connection ID.
+	NewToken(addr net.Addr, rscid, odcid []byte) []byte
+	// VerifyToken returns odcid when the address and token pair is valid,
 	// empty slice otherwise.
-	ValidateToken(addr net.Addr, token []byte) []byte
+	VerifyToken(addr net.Addr, dcid, token []byte) []byte
 }
 
-// NewAddressValidator returns a simple implementation of AddressValidator.
+// NewAddressVerifier returns a simple implementation of AddressValidator.
 // It encrypts client original CID into token which is valid for 10 seconds.
-func NewAddressValidator() AddressValidator {
-	s, err := newAddressValidator()
+func NewAddressVerifier() AddressVerifier {
+	s, err := newAddressVerifier()
 	if err != nil {
 		panic(err)
 	}
 	return s
 }
 
-// addressValidator implements AddressValidator.
+// addressVerifier implements AddressValidator.
 // The token include ODCID encrypted using AES-GSM AEAD with a randomly-generated key.
-type addressValidator struct {
+type addressVerifier struct {
 	aead   cipher.AEAD
-	nonce  []byte // First 4 bytes is current time
+	nonce  []byte
 	timeFn func() time.Time
 }
 
 // NewAddressValidator creates a new AddressValidator or returns error when failed to
 // generate secret or AEAD.
-func newAddressValidator() (*addressValidator, error) {
+func newAddressVerifier() (*addressVerifier, error) {
 	var key [16]byte
 	_, err := rand.Read(key[:])
 	if err != nil {
@@ -344,44 +342,173 @@ func newAddressValidator() (*addressValidator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &addressValidator{
+	return &addressVerifier{
 		aead:   aead,
 		nonce:  nonce,
 		timeFn: time.Now,
 	}, nil
 }
 
-// Generate encrypts odcid using current time as nonce and addr as additional data.
-func (s *addressValidator) GenerateToken(addr net.Addr, odcid []byte) []byte {
-	now := s.timeFn().Unix()
-	nonce := make([]byte, len(s.nonce))
-	binary.BigEndian.PutUint32(nonce, uint32(now))
-	copy(nonce[4:], s.nonce[4:])
+func (s *addressVerifier) IsActive(addr net.Addr) bool {
+	return true
+}
 
-	token := make([]byte, 4+len(odcid)+s.aead.Overhead())
-	binary.BigEndian.PutUint32(token, uint32(now))
-	s.aead.Seal(token[4:4], nonce, odcid, []byte(addr.String()))
+// NewToken encrypts expiry time which odcid as nonce and rscid and addr as associated data.
+//
+// 	Non-Shared-State Retry Service Token {
+// 	  Token Type (1) = 0,
+// 	  ODCIL (7) = 8..20,
+// 	  Original Destination Connection ID (64..160),
+// 	  Opaque Data (..),
+// 	}
+//
+// https://quicwg.org/load-balancers/draft-ietf-quic-load-balancers.html#section-7.2.2
+func (s *addressVerifier) NewToken(addr net.Addr, rscid, odcid []byte) []byte {
+	bodyLen := 1 + len(odcid)
+	// Expiry time is encrypted in opaque data
+	tokenLen := bodyLen + 8 + s.aead.Overhead()
+	// Allocate extra bytes for nonce and associated data
+	ipAddr := []byte(addr.String())
+	b := make([]byte, tokenLen+len(s.nonce)+len(rscid)+len(ipAddr))
+
+	token := b[:tokenLen]
+	token[0] = uint8(len(odcid))
+	token[0] &= 0x7f // Ensure token type is '0'
+	copy(token[1:], odcid)
+	expiry := s.timeFn().Add(10 * time.Second).Unix()
+	binary.BigEndian.PutUint64(token[bodyLen:], uint64(expiry))
+
+	nonce := b[tokenLen : tokenLen+len(s.nonce)]
+	copy(nonce, s.nonce)
+	for i := range odcid {
+		nonce[i%len(nonce)] ^= odcid[i]
+	}
+
+	data := b[tokenLen+len(nonce):]
+	copy(data, rscid)
+	copy(data[len(rscid):], ipAddr)
+
+	s.aead.Seal(token[bodyLen:bodyLen], nonce, token[bodyLen:bodyLen+8], data)
 	return token
 }
 
-// Validate decrypts token and returns odcid.
-func (s *addressValidator) ValidateToken(addr net.Addr, token []byte) []byte {
-	if len(token) < 4 {
+// VerifyToken decrypts token and returns odcid.
+func (s *addressVerifier) VerifyToken(addr net.Addr, dcid, token []byte) []byte {
+	if len(token) < 1 {
 		return nil
 	}
-	const validity = 10 // Second
+	odcil := int(token[0] & 0x7f)
+	if len(token) != 1+odcil+8+s.aead.Overhead() {
+		return nil
+	}
+	odcid := token[1 : 1+odcil]
+	ipAddr := []byte(addr.String())
+	b := make([]byte, 8+len(s.nonce)+len(dcid)+len(ipAddr))
+
+	nonce := b[8 : 8+len(s.nonce)]
+	copy(nonce, s.nonce)
+	for i := range odcid {
+		nonce[i%len(nonce)] ^= odcid[i]
+	}
+
+	data := b[8+len(nonce):]
+	copy(data, dcid)
+	copy(data[len(dcid):], ipAddr)
+
+	expiry, err := s.aead.Open(b[:0], nonce, token[1+odcil:], data)
+	if err != nil || len(expiry) != 8 {
+		return nil
+	}
+	expiryTime := int64(binary.BigEndian.Uint64(expiry))
 	now := s.timeFn().Unix()
-	issued := int64(binary.BigEndian.Uint32(token))
-	if issued < now-validity || issued > now {
-		// TODO: Fix overflow when time > MAX_U32
+	if expiryTime < now {
 		return nil
 	}
-	nonce := make([]byte, len(s.nonce))
-	copy(nonce, token[:4])
-	copy(nonce[4:], s.nonce[4:])
-	odcid, err := s.aead.Open(nil, nonce, token[4:], []byte(addr.String()))
-	if err != nil {
-		return nil
+	// Return a copy of odcid from token
+	b = make([]byte, len(odcid))
+	copy(b, odcid)
+	return b
+}
+
+type serverCIDIssuer struct {
+	serverID []byte
+}
+
+// NewServerCIDIssuer returns a new CIDIssuer that creates CID using Plaintext Algorithm.
+// Server ID is encoded in CID using QUIC varint encoding.
+// https://quicwg.org/load-balancers/draft-ietf-quic-load-balancers.html#section-5.1
+func NewServerCIDIssuer(id uint64) CIDIssuer {
+	return &serverCIDIssuer{
+		serverID: encodeServerID(id),
 	}
-	return odcid
+}
+
+func (s *serverCIDIssuer) NewCID() ([]byte, error) {
+	cid := make([]byte, cidLength)
+	cid[0] = 0x3f & cidLength
+	n := copy(cid[1:], s.serverID)
+	_, err := rand.Read(cid[1+n:])
+	return cid, err
+}
+
+func (s *serverCIDIssuer) CIDLength() int {
+	return cidLength
+}
+
+func encodeServerID(id uint64) []byte {
+	var b []byte
+	if id < 1<<6 {
+		b = make([]byte, 1)
+		b[0] = uint8(id)
+	} else if id < 1<<14 {
+		b = make([]byte, 2)
+		b[1] = uint8(id)
+		b[0] = uint8(id>>8) | 0x40
+	} else if id < 1<<30 {
+		b = make([]byte, 4)
+		b[3] = uint8(id)
+		b[2] = uint8(id >> 8)
+		b[1] = uint8(id >> 16)
+		b[0] = uint8(id>>24) | 0x80
+	} else {
+		b = make([]byte, 8)
+		b[7] = uint8(id)
+		b[6] = uint8(id >> 8)
+		b[5] = uint8(id >> 16)
+		b[4] = uint8(id >> 24)
+		b[3] = uint8(id >> 32)
+		b[2] = uint8(id >> 40)
+		b[1] = uint8(id >> 48)
+		b[0] = uint8(id>>56) | 0xc0
+	}
+	return b
+}
+
+func decodeServerID(b []byte) (uint64, int) {
+	switch b[0] >> 6 {
+	case 0:
+		id := uint64(b[0] & 0x3f)
+		return id, 1
+	case 1:
+		if len(b) < 2 {
+			return 0, 0
+		}
+		id := uint64(b[1]) | uint64(b[0]&0x3f)<<8
+		return id, 2
+	case 2:
+		if len(b) < 4 {
+			return 0, 0
+		}
+		id := uint64(b[3]) | uint64(b[2])<<8 | uint64(b[1])<<16 | uint64(b[0]&0x3f)<<24
+		return id, 4
+	case 3:
+		if len(b) < 8 {
+			return 0, 0
+		}
+		id := uint64(b[7]) | uint64(b[6])<<8 | uint64(b[5])<<16 | uint64(b[4])<<24 |
+			uint64(b[3])<<32 | uint64(b[2])<<40 | uint64(b[1])<<48 | uint64(b[0]&0x3f)<<56
+		return id, 8
+	default:
+		panic("unreachable")
+	}
 }

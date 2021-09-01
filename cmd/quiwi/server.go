@@ -83,7 +83,7 @@ func (serverCommand) Run(args []string) error {
 	})
 	if *enableRetry {
 		// Stateless retry
-		server.SetAddressValidator(quic.NewAddressValidator())
+		server.SetAddressVerifier(quic.NewAddressVerifier())
 	}
 	// Logging
 	if *qlogPath == "" {

@@ -41,10 +41,8 @@ func (s *Client) Serve() error {
 	}
 	for {
 		p := newPacket()
-		n, addr, err := s.socket.ReadFrom(p.buf[:])
-		if n > 0 {
-			p.data = p.buf[:n]
-			p.addr = addr
+		err := readPacket(p, s.socket)
+		if len(p.data) > 0 {
 			s.recv(p)
 		} else {
 			freePacket(p)
@@ -56,7 +54,7 @@ func (s *Client) Serve() error {
 }
 
 func (s *Client) recv(p *packet) {
-	_, err := p.header.Decode(p.data, cidLength)
+	_, err := p.header.Decode(p.data, s.cidIss.CIDLength())
 	if err != nil {
 		s.logger.log(levelTrace, zs("", "transport:datagrams_received"),
 			zv("addr", p.addr), zx("raw", p.data))
@@ -108,7 +106,7 @@ func (s *Client) Connect(addr string) error {
 	// Send initial packet
 	s.logger.log(levelInfo, zs("", "connectivity:connection_started"),
 		zx("cid", c.scid), zv("addr", c.addr), zs("vantage_point", "client"))
-	if err = s.sendConn(c); err != nil {
+	if err = s.connSend(c); err != nil {
 		s.peersMu.Lock()
 		delete(s.peers, string(c.scid))
 		s.peersMu.Unlock()
@@ -128,12 +126,12 @@ func (s *Client) Close() error {
 }
 
 func (s *Client) newConn(addr net.Addr) (*Conn, error) {
-	scid := make([]byte, cidLength)
-	if err := s.rand(scid); err != nil {
+	scid, err := s.cidIss.NewCID()
+	if err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
-	dcid := make([]byte, cidLength)
-	if err := s.rand(dcid); err != nil {
+	dcid, err := s.cidIss.NewCID()
+	if err != nil {
 		return nil, fmt.Errorf("generate connection id: %v", err)
 	}
 	conn, err := transport.Connect(scid, dcid, s.config)

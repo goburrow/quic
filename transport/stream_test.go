@@ -653,7 +653,7 @@ func BenchmarkStreamSend(b *testing.B) {
 	b.ReportAllocs()
 	s := Stream{}
 	s.init(true, true)
-	s.flow.init(1<<30, 1<<30)
+	s.flow.init(1<<60, 1<<60)
 	data := make([]byte, 100)
 	for i := 0; i < b.N; i++ {
 		n, err := s.Write(data)

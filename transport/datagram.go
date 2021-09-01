@@ -56,6 +56,10 @@ func (s *Datagram) popSend(max int) []byte {
 	return s.send.pop()
 }
 
+func (s *Datagram) isWritable() bool {
+	return s.maxSend > 0 && !s.send.full()
+}
+
 // isReadable returns true if the datagram has any data to read.
 func (s *Datagram) isReadable() bool {
 	return s.recv.avail() > 0
@@ -133,6 +137,10 @@ func (s *datagramBuffer) avail() int {
 		return len(s.data[s.r])
 	}
 	return 0
+}
+
+func (s *datagramBuffer) full() bool {
+	return s.r == s.w && s.r < len(s.data) && s.data[s.r] != nil
 }
 
 func (s *datagramBuffer) String() string {
